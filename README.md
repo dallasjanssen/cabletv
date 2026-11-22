@@ -3,19 +3,60 @@
 A personal, sideloaded Android and Android TV app that pulls together:
 
 - **Live TV** from an Xtream Codes IPTV login (or any M3U playlist URL)
-- **Program guide** from the provider's short EPG
-- **On Demand** from your Jellyfin server
+- **TV Guide** with a full program grid, from the provider's XMLTV feed or your own XMLTV URL
+- **On Demand** from your Jellyfin server: movies, shows, search, genres, resume, and next up
 
-The look is a 2005 to 2010 cable box: green LED text, amber channel numbers, scan lines, a channel banner that slides up when you change channels, and number-key channel entry.
+The look is a 2000s cable guide: a deep navy grid, light blue info panels, a yellow highlight on the selected program, and a colored button legend along the bottom.
+
+## Features
+
+### Live TV
+- Full-screen playback with a channel banner showing the program now and next, with progress
+- Channel list panel (press LEFT) with group filters, search by name or number, and favorites
+- Favorites (press Y, or tap the + and * in the list)
+- Number entry, channel up and down, and LAST to jump back to the previous channel
+- Audio and subtitle menu (press MENU)
+- Automatic reconnects when a stream drops, with a manual RETRY when it gives up
+
+### TV Guide
+- Three-hour grid with a half-hour time header and a marker for the current time
+- Info panel with the selected program's title, time, rating, and description
+- Live preview of the channel that is tuned
+- Left and right move across programs, up and down move across channels
+- Page Up and Page Down (or the rewind and fast forward keys) move three hours at a time
+- BLUE jumps to now, GREEN reloads the guide
+- Guide data is cached for six hours on the device
+
+### On Demand (Jellyfin)
+- Home with Continue Watching, Next Up, and Recently Added
+- Movies and Shows tabs with genre filters and paging
+- Search across movies and shows
+- Detail pages with Play, Resume, and Start Over, and season and episode lists
+- Player controls: play and pause, 10 second and 1 minute seeks, audio and subtitle menu
+- Automatic next episode, and CH+ and CH- to skip between episodes
+- Watch progress is reported back to Jellyfin, so Continue Watching stays accurate
+- If the TV cannot decode a file, the app asks Jellyfin to transcode it to H.264 and AAC (can be turned off in Settings)
+
+### Settings
+- Connection test buttons for Live TV, the playlist, the guide, and On Demand
+- Reload guide button
+- Transcode fallback switch
 
 ## Remote and keyboard controls
 
 | Action | Remote |
 | --- | --- |
 | Channel up / down | CH+ / CH- or D-pad up / down |
+| Open channel list | D-pad left |
 | Jump to a channel | Type the number (up to 4 digits) |
+| Last channel | LAST (or the TV's last channel key) |
 | Show channel banner | OK / center button |
-| Back to menu | Back |
+| Favorite the current channel | Y button (gamepad style remotes), or tap + in the channel list |
+| Audio and subtitles | MENU |
+| Open the guide | GUIDE |
+| Back | Back |
+
+In the guide, use the D-pad to move, OK to watch, and the colored keys listed at the bottom of the screen.
 
 ## Build and install (Android Studio)
 
@@ -23,6 +64,8 @@ The look is a 2005 to 2010 cable box: green LED text, amber channel numbers, sca
 2. Open the `CableTV` folder. Let Gradle sync finish. Accept any prompt to create the Gradle wrapper.
 3. Phone: pick your phone at the top and press Run.
 4. Android TV: build the APK with **Build > Build Bundle(s) / APK(s) > Build APK(s)**. The file is at `app/build/outputs/apk/debug/app-debug.apk`.
+
+To run the logic tests (parsers and channel logic), run **Build > Test** or `./gradlew test`.
 
 ### Installing on the TV
 
@@ -38,15 +81,45 @@ adb install -r app-debug.apk
 
 Replace the IP with your TV's address. Accept the debugging prompt on the TV the first time.
 
+## Project layout
+
+```
+app/src/main/java/com/dallas/cabletv/
+  CableViewModel.kt      shared state: settings, channels, favorites, guide, connection tests
+  MainActivity.kt
+  data/
+    Models.kt            channels, programs, On Demand items, settings
+    ChannelLogic.kt      filtering, channel stepping, guide time math (pure, tested)
+    M3uParser.kt         playlist parser (pure, tested)
+    XmlTvParser.kt       streaming guide parser (pure, tested)
+    EpgRepository.kt     guide download, disk cache, lookups
+    XtreamClient.kt      Xtream Codes API: channels, guide, XMLTV feed
+    JellyfinClient.kt    Jellyfin API: library, search, resume, progress reports, transcodes
+    ChannelSource.kt     picks Xtream or M3U as the live source
+    SettingsStore.kt     encrypted credentials, plain favorites and last channel
+  ui/
+    Theme.kt             palette and shared widgets
+    App.kt               main menu and screen routing
+    LiveTv.kt            full-screen live TV, channel list, banner
+    Guide.kt             program grid and info panel
+    OnDemand.kt          Jellyfin browser and player
+    Playback.kt          the single shared player: reconnects, transcode fallback, tracks
+    Overlays.kt          audio and subtitle menu, signal messages
+    Settings.kt          settings screen with connection tests
+    Format.kt            time and duration formatting
+```
+
 ## Security notes
 
 - Credentials are stored with AES-256 encryption through Android's EncryptedSharedPreferences.
 - The Jellyfin password is used once to sign in and is not stored. The app keeps the access token only.
+- The guide cache on the device is kept in the app's private cache folder. If you use an XMLTV URL that contains a password, that password is in the cache file.
 - Nothing secret belongs in source files. Do not commit real credentials to a repository.
 
-## Known limits (v1)
+## Known limits
 
-- Jellyfin playback uses direct streams. If the TV cannot decode a file's codec, that title will fail. Transcoding can be added later.
-- The guide shows the current and next program only. It does not render a full grid timeline yet.
-- M3U-only sources have no guide data unless the playlist's channels map to guide entries. Xtream gives the best experience.
-- Watch progress is not reported back to Jellyfin yet.
+- Live TV reconnects use a short backoff (up to five tries). A channel the provider has taken down will still show NO SIGNAL.
+- The guide shows only what the provider publishes. Some providers publish only a few hours ahead.
+- M3U-only sources have no guide data unless you give an XMLTV URL in Settings.
+- The preview in the guide shows the channel that is tuned, not the channel under the cursor. Moving the cursor does not change streams, so the provider's connection limit is not used up while browsing.
+- Subtitle and audio menus show the tracks the stream exposes. Some streams expose none.

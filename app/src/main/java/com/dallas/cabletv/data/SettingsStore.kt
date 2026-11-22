@@ -1,6 +1,7 @@
 package com.dallas.cabletv.data
 
 import android.content.Context
+import android.content.SharedPreferences
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 
@@ -10,7 +11,7 @@ import androidx.security.crypto.MasterKey
  */
 class SettingsStore(context: Context) {
 
-    private val prefs = EncryptedSharedPreferences.create(
+    private val prefs: SharedPreferences = EncryptedSharedPreferences.create(
         context,
         "cabletv_secure_prefs",
         MasterKey.Builder(context).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build(),
@@ -23,9 +24,11 @@ class SettingsStore(context: Context) {
         xtreamUser = prefs.getString(K_XU, "").orEmpty(),
         xtreamPass = prefs.getString(K_XP, "").orEmpty(),
         m3uUrl = prefs.getString(K_M3U, "").orEmpty(),
+        epgUrl = prefs.getString(K_EPG, "").orEmpty(),
         jellyfinServer = prefs.getString(K_JS, "").orEmpty(),
         jellyfinToken = prefs.getString(K_JT, "").orEmpty(),
-        jellyfinUserId = prefs.getString(K_JU, "").orEmpty()
+        jellyfinUserId = prefs.getString(K_JU, "").orEmpty(),
+        jellyfinTranscodeFallback = prefs.getBoolean(K_JTF, true)
     )
 
     fun save(s: Settings) {
@@ -34,9 +37,11 @@ class SettingsStore(context: Context) {
             .putString(K_XU, s.xtreamUser)
             .putString(K_XP, s.xtreamPass)
             .putString(K_M3U, s.m3uUrl)
+            .putString(K_EPG, s.epgUrl)
             .putString(K_JS, s.jellyfinServer)
             .putString(K_JT, s.jellyfinToken)
             .putString(K_JU, s.jellyfinUserId)
+            .putBoolean(K_JTF, s.jellyfinTranscodeFallback)
             .apply()
     }
 
@@ -45,8 +50,37 @@ class SettingsStore(context: Context) {
         const val K_XU = "xtream_user"
         const val K_XP = "xtream_pass"
         const val K_M3U = "m3u_url"
+        const val K_EPG = "epg_url"
         const val K_JS = "jellyfin_server"
         const val K_JT = "jellyfin_token"
         const val K_JU = "jellyfin_user_id"
+        const val K_JTF = "jellyfin_transcode_fallback"
+    }
+}
+
+/**
+ * Non-secret UI state: favorites, last channel, and Jellyfin resume hints.
+ * Kept in plain preferences because none of it is sensitive.
+ */
+class AppStateStore(context: Context) {
+
+    private val prefs = context.getSharedPreferences("cabletv_app_state", Context.MODE_PRIVATE)
+
+    fun favorites(): Set<String> = prefs.getStringSet(K_FAV, emptySet()).orEmpty().toSet()
+
+    fun setFavorites(ids: Set<String>) {
+        prefs.edit().putStringSet(K_FAV, ids).apply()
+    }
+
+    /** Channel id of the channel that was on before the current one. */
+    fun lastChannelId(): String? = prefs.getString(K_LAST, null)
+
+    fun setLastChannelId(id: String?) {
+        prefs.edit().putString(K_LAST, id).apply()
+    }
+
+    private companion object {
+        const val K_FAV = "favorites"
+        const val K_LAST = "last_channel"
     }
 }

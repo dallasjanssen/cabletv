@@ -3,13 +3,17 @@ package com.dallas.cabletv.data
 import android.util.Base64
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.Response
+import org.json.JSONArray
 import org.json.JSONObject
+import java.io.InputStream
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
 /**
  * Talks to an Xtream Codes style IPTV panel using its JSON API.
- * Channels, categories and the short guide all come from player_api.php.
+ * Channels and categories come from player_api.php. The full guide comes from
+ * xmltv.php, and the short per-channel guide is a fallback.
  */
 class XtreamClient(server: String, private val user: String, private val pass: String) {
 
@@ -17,20 +21,25 @@ class XtreamClient(server: String, private val user: String, private val pass: S
 
     private val http = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
         .build()
 
     private fun enc(value: String): String = URLEncoder.encode(value, "UTF-8")
 
     private fun creds(): String = "username=${enc(user)}&password=${enc(pass)}"
 
-    private fun get(url: String): String {
+    private fun open(url: String): Response {
         val req = Request.Builder().url(url).header("User-Agent", "CableTV/1.0").build()
-        http.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) error("HTTP ${resp.code}")
-            return resp.body?.string() ?: error("Empty response from provider")
+        val resp = http.newCall(req).execute()
+        if (!resp.isSuccessful) {
+            resp.close()
+            error("HTTP ${resp.code}")
         }
+        return resp
     }
+
+    private fun get(url: String): String =
+        open(url).use { resp -> resp.body?.string() ?: error("Empty response from provider") }
 
     private fun api(action: String? = null, extra: String = ""): String {
         val sb = StringBuilder("$base/player_api.php?${creds()}")
@@ -44,13 +53,13 @@ class XtreamClient(server: String, private val user: String, private val pass: S
 
     fun liveChannels(): List<LiveChannel> {
         val categories = mutableMapOf<String, String>()
-        val cats = org.json.JSONArray(api("get_live_categories"))
+        val cats = JSONArray(api("get_live_categories"))
         for (i in 0 until cats.length()) {
             val c = cats.getJSONObject(i)
             categories[c.optString("category_id")] = c.optString("category_name")
         }
 
-        val arr = org.json.JSONArray(api("get_live_streams"))
+        val arr = JSONArray(api("get_live_streams"))
         return (0 until arr.length()).map { i ->
             val o = arr.getJSONObject(i)
             val id = o.optString("stream_id")
@@ -66,6 +75,12 @@ class XtreamClient(server: String, private val user: String, private val pass: S
         }.sortedBy { it.number }
     }
 
+    /** Streams the full XMLTV guide. The caller must close the stream. */
+    fun xmltvStream(): InputStream {
+        val resp = open("$base/xmltv.php?${creds()}")
+        return resp.body?.byteStream() ?: error("Empty guide from provider")
+    }
+
     fun nowNext(streamId: String): NowNext {
         val listings = JSONObject(api("get_short_epg", "stream_id=$streamId&limit=2"))
             .optJSONArray("epg_listings") ?: return NowNext(null, null)
@@ -75,7 +90,8 @@ class XtreamClient(server: String, private val user: String, private val pass: S
             Program(
                 title = decodeB64(o.optString("title")),
                 start = o.optLong("start_timestamp") * 1000L,
-                end = o.optLong("stop_timestamp") * 1000L
+                end = o.optLong("stop_timestamp") * 1000L,
+                description = decodeB64(o.optString("description")).takeIf { it.isNotBlank() }
             )
         }
 
