@@ -30,51 +30,76 @@ import coil.compose.AsyncImage
 import com.dallas.cabletv.data.JellyfinClient
 import com.dallas.cabletv.data.Settings
 import com.dallas.cabletv.data.VodItem
+import com.dallas.cabletv.data.XtreamClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 @Composable
 fun OnDemandScreen(settings: Settings, onExit: () -> Unit) {
-    if (settings.hasJellyfin) {
+    if (settings.hasJellyfin || settings.hasXtream) {
         JellyfinBrowser(settings, onExit)
     } else {
         Column(Modifier.fillMaxSize()) {
             CableHeader(title = "ON DEMAND", onBack = onExit)
             EmptyState(
-                title = "Jellyfin is not connected",
-                body = "Add your server in Settings to browse your library.",
+                title = "No on-demand source yet",
+                body = "Add a Jellyfin server or use a provider login in Settings.",
                 modifier = Modifier.weight(1f)
             )
         }
     }
 }
 
+/** Shows Jellyfin and provider titles side by side. Either source can be missing. */
 @Composable
 private fun JellyfinBrowser(settings: Settings, onExit: () -> Unit) {
     val client = remember(settings) {
         JellyfinClient(settings.jellyfinServer, settings.jellyfinToken, settings.jellyfinUserId)
     }
+    val xtream = remember(settings) {
+        if (settings.hasXtream) {
+            XtreamClient(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass)
+        } else {
+            null
+        }
+    }
     val scope = rememberCoroutineScope()
 
     var resume by remember { mutableStateOf<List<VodItem>>(emptyList()) }
     var recent by remember { mutableStateOf<List<VodItem>>(emptyList()) }
+    var providerMovies by remember { mutableStateOf<List<VodItem>>(emptyList()) }
+    var providerSeries by remember { mutableStateOf<List<VodItem>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
     var loadError by remember { mutableStateOf<String?>(null) }
     var series by remember { mutableStateOf<VodItem?>(null) }
     var episodes by remember { mutableStateOf<List<VodItem>>(emptyList()) }
     var playing by remember { mutableStateOf<VodItem?>(null) }
 
-    LaunchedEffect(client) {
+    // Each source loads on its own, so a failure in one still shows the other.
+    LaunchedEffect(settings) {
         loading = true
-        withContext(Dispatchers.IO) {
-            runCatching { client.continueWatching() to client.recentlyAdded() }
-        }
-            .onSuccess { (r, n) ->
-                resume = r
-                recent = n
+        loadError = null
+        if (settings.hasJellyfin) {
+            withContext(Dispatchers.IO) {
+                runCatching { client.continueWatching() to client.recentlyAdded() }
             }
-            .onFailure { loadError = it.message ?: "Could not reach Jellyfin" }
+                .onSuccess { (r, n) ->
+                    resume = r
+                    recent = n
+                }
+                .onFailure { loadError = it.message ?: "Could not reach Jellyfin" }
+        }
+        if (xtream != null) {
+            withContext(Dispatchers.IO) {
+                runCatching { xtream.vodMovies() to xtream.vodSeries() }
+            }
+                .onSuccess { (m, s) ->
+                    providerMovies = m
+                    providerSeries = s
+                }
+                .onFailure { loadError = loadError ?: (it.message ?: "Could not reach your provider") }
+        }
         loading = false
     }
 
@@ -107,11 +132,19 @@ private fun JellyfinBrowser(settings: Settings, onExit: () -> Unit) {
                     loadError = loadError,
                     resume = resume,
                     recent = recent,
+                    providerMovies = providerMovies,
+                    providerSeries = providerSeries,
                     onSelect = { item ->
                         if (item.type == "Series") {
                             scope.launch {
                                 val eps = withContext(Dispatchers.IO) {
-                                    runCatching { client.episodes(item.id) }.getOrDefault(emptyList())
+                                    runCatching {
+                                        if (item.source == "xtream") {
+                                            xtream?.seriesEpisodes(item.id).orEmpty()
+                                        } else {
+                                            client.episodes(item.id)
+                                        }
+                                    }.getOrDefault(emptyList())
                                 }
                                 episodes = eps
                                 series = item
@@ -132,27 +165,31 @@ private fun Library(
     loadError: String?,
     resume: List<VodItem>,
     recent: List<VodItem>,
+    providerMovies: List<VodItem>,
+    providerSeries: List<VodItem>,
     onSelect: (VodItem) -> Unit
 ) {
+    val nothingYet = resume.isEmpty() && recent.isEmpty() &&
+        providerMovies.isEmpty() && providerSeries.isEmpty()
+
     Column(
         Modifier
             .fillMaxSize()
-            .padding(start = 48.dp, end = 48.dp, top = 40.dp)
+            .padding(start = 48.dp, end = 48.dp, top = 32.dp)
     ) {
-        Spacer(Modifier.height(8.dp))
         when {
             loading -> EmptyState(
                 title = "Loading your library...",
                 modifier = Modifier.weight(1f)
             )
-            loadError != null -> EmptyState(
-                title = "Couldn't reach Jellyfin",
+            nothingYet && loadError != null -> EmptyState(
+                title = "Couldn't reach your sources",
                 body = loadError,
                 modifier = Modifier.weight(1f)
             )
-            resume.isEmpty() && recent.isEmpty() -> EmptyState(
+            nothingYet -> EmptyState(
                 title = "Nothing here yet",
-                body = "Add media to your Jellyfin library and it will show up here.",
+                body = "Add media to Jellyfin or your provider and it will show up here.",
                 modifier = Modifier.weight(1f)
             )
             else -> LazyColumn(
@@ -160,10 +197,27 @@ private fun Library(
                 verticalArrangement = Arrangement.spacedBy(36.dp),
                 contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 40.dp)
             ) {
+                if (loadError != null) {
+                    item {
+                        Text(
+                            text = loadError,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = Cable.Accent
+                        )
+                    }
+                }
                 if (resume.isNotEmpty()) {
                     item { PosterRow("Continue watching", resume, onSelect) }
                 }
-                item { PosterRow("Recently added", recent, onSelect) }
+                if (recent.isNotEmpty()) {
+                    item { PosterRow("Recently added", recent, onSelect) }
+                }
+                if (providerMovies.isNotEmpty()) {
+                    item { PosterRow("New movies", providerMovies, onSelect) }
+                }
+                if (providerSeries.isNotEmpty()) {
+                    item { PosterRow("New series", providerSeries, onSelect) }
+                }
             }
         }
     }
@@ -175,13 +229,13 @@ private fun PosterRow(title: String, list: List<VodItem>, onSelect: (VodItem) ->
         Text(
             text = title,
             style = MaterialTheme.typography.titleLarge,
-            color = Cable.Ink
+            color = Cable.Led
         )
         LazyRow(
             horizontalArrangement = Arrangement.spacedBy(28.dp),
             contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 6.dp, vertical = 10.dp)
         ) {
-            items(list, key = { it.id }) { vod ->
+            items(list, key = { it.source + it.type + it.id }) { vod ->
                 PosterCard(vod) { onSelect(vod) }
             }
         }
@@ -199,7 +253,7 @@ private fun PosterCard(vod: VodItem, onClick: () -> Unit) {
             modifier = Modifier
                 .width(184.dp)
                 .height(276.dp),
-            shape = RoundedCornerShape(16.dp),
+            shape = RoundedCornerShape(8.dp),
             focusScale = 1.05f
         ) {
             AsyncImage(
@@ -243,7 +297,7 @@ private fun SeriesDetail(
     Row(
         Modifier
             .fillMaxSize()
-            .padding(horizontal = 48.dp, vertical = 40.dp),
+            .padding(horizontal = 48.dp, vertical = 32.dp),
         horizontalArrangement = Arrangement.spacedBy(48.dp)
     ) {
         Column(
@@ -252,7 +306,7 @@ private fun SeriesDetail(
                 .fillMaxHeight(),
             verticalArrangement = Arrangement.spacedBy(20.dp)
         ) {
-            OutlinedButton(onClick = onBack) { Text("Back to library") }
+            OutlinedButton(onClick = onBack) { Text("BACK TO LIBRARY") }
             AsyncImage(
                 model = series.posterUrl,
                 contentDescription = series.name,
@@ -260,15 +314,8 @@ private fun SeriesDetail(
                 modifier = Modifier
                     .width(280.dp)
                     .height(420.dp)
-                    .clip(RoundedCornerShape(16.dp))
+                    .clip(RoundedCornerShape(8.dp))
                     .background(Cable.SurfaceHi)
-            )
-            Text(
-                text = series.name,
-                style = MaterialTheme.typography.titleLarge,
-                color = Cable.Ink,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis
             )
             series.year?.let {
                 Text(
@@ -295,9 +342,9 @@ private fun SeriesDetail(
                 )
             }
             Text(
-                text = "Episodes",
+                text = "EPISODES",
                 style = MaterialTheme.typography.titleLarge,
-                color = Cable.Ink
+                color = Cable.Accent
             )
             if (episodes.isEmpty()) {
                 EmptyState(
@@ -336,7 +383,7 @@ private fun EpisodeRow(
     FocusSurface(
         onClick = onClick,
         modifier = rowModifier,
-        shape = RoundedCornerShape(14.dp),
+        shape = RoundedCornerShape(8.dp),
         focusScale = 1f
     ) {
         Row(
@@ -357,7 +404,7 @@ private fun EpisodeRow(
             Text(
                 text = "PLAY",
                 style = MaterialTheme.typography.labelLarge,
-                color = Cable.Accent
+                color = Cable.Led
             )
         }
     }

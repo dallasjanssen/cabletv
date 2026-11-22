@@ -28,7 +28,11 @@ data class VodItem(
     val overview: String?,
     val posterUrl: String,
     val streamUrl: String,
-    val type: String
+    val type: String,
+    /** Where the item comes from: "jellyfin" or "xtream". Decides how episodes load. */
+    val source: String = "jellyfin",
+    /** Date added, used to sort provider titles newest first. */
+    val addedAt: Long = 0L
 )
 
 data class Settings(

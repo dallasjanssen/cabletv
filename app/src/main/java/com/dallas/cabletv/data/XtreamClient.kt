@@ -66,6 +66,80 @@ class XtreamClient(server: String, private val user: String, private val pass: S
         }.sortedBy { it.number }
     }
 
+    /** Newest movies on the provider, by the date the panel added them. */
+    fun vodMovies(limit: Int = 60): List<VodItem> {
+        val arr = org.json.JSONArray(api("get_vod_streams"))
+        return (0 until arr.length()).map { i ->
+            val o = arr.getJSONObject(i)
+            val id = o.optString("stream_id")
+            val ext = o.optString("container_extension").ifBlank { "mp4" }
+            VodItem(
+                id = id,
+                name = o.optString("name"),
+                year = null,
+                overview = null,
+                posterUrl = o.optString("stream_icon"),
+                streamUrl = "$base/movie/${enc(user)}/${enc(pass)}/$id.$ext",
+                type = "Movie",
+                source = "xtream",
+                addedAt = o.optLong("added")
+            )
+        }.sortedByDescending { it.addedAt }.take(limit)
+    }
+
+    /** Newest series on the provider. Episodes load separately when one is opened. */
+    fun vodSeries(limit: Int = 60): List<VodItem> {
+        val arr = org.json.JSONArray(api("get_series"))
+        return (0 until arr.length()).map { i ->
+            val o = arr.getJSONObject(i)
+            VodItem(
+                id = o.optString("series_id"),
+                name = o.optString("name"),
+                year = o.optString("releaseDate").take(4).toIntOrNull(),
+                overview = o.optString("plot").takeIf { it.isNotBlank() },
+                posterUrl = o.optString("cover"),
+                streamUrl = "",
+                type = "Series",
+                source = "xtream",
+                addedAt = o.optLong("last_modified")
+            )
+        }.sortedByDescending { it.addedAt }.take(limit)
+    }
+
+    /** Episodes of one series, in season and episode order. */
+    fun seriesEpisodes(seriesId: String): List<VodItem> {
+        val info = JSONObject(api("get_series_info", "series_id=$seriesId"))
+        val bySeason = info.optJSONObject("episodes") ?: return emptyList()
+        val keyed = mutableListOf<Triple<Int, Int, VodItem>>()
+        val seasons = bySeason.keys()
+        while (seasons.hasNext()) {
+            val seasonKey = seasons.next()
+            val list = bySeason.optJSONArray(seasonKey) ?: continue
+            val season = seasonKey.toIntOrNull() ?: 0
+            for (i in 0 until list.length()) {
+                val e = list.getJSONObject(i)
+                val id = e.optString("id")
+                val ext = e.optString("container_extension").ifBlank { "mp4" }
+                val number = e.optInt("episode_num", 0)
+                val title = e.optString("title")
+                val item = VodItem(
+                    id = id,
+                    name = "S$season E$number  $title",
+                    year = null,
+                    overview = null,
+                    posterUrl = "",
+                    streamUrl = "$base/series/${enc(user)}/${enc(pass)}/$id.$ext",
+                    type = "Episode",
+                    source = "xtream"
+                )
+                keyed += Triple(season, number, item)
+            }
+        }
+        return keyed
+            .sortedWith(compareBy<Triple<Int, Int, VodItem>>({ it.first }, { it.second }))
+            .map { it.third }
+    }
+
     fun nowNext(streamId: String): NowNext {
         val listings = JSONObject(api("get_short_epg", "stream_id=$streamId&limit=2"))
             .optJSONArray("epg_listings") ?: return NowNext(null, null)

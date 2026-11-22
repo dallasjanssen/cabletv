@@ -93,7 +93,7 @@ fun CableApp(store: SettingsStore) {
             Screen.Home -> HomeMenu(
                 channelCount = channels.size,
                 liveReady = settings.hasLiveSource,
-                jellyfinReady = settings.hasJellyfin,
+                onDemandReady = settings.hasJellyfin || settings.hasXtream,
                 onOpen = navigate
             )
             // Full-bleed screens draw their own header, so playback can hide it.
@@ -143,7 +143,7 @@ fun CableApp(store: SettingsStore) {
 private fun HomeMenu(
     channelCount: Int,
     liveReady: Boolean,
-    jellyfinReady: Boolean,
+    onDemandReady: Boolean,
     onOpen: (Screen) -> Unit
 ) {
     val firstButton = remember { FocusRequester() }
@@ -152,7 +152,7 @@ private fun HomeMenu(
     val entries = listOf(
         Screen.LiveTv to (if (liveReady) "$channelCount CHANNELS" else "NOT SET UP"),
         Screen.Guide to (if (liveReady) "NOW AND NEXT" else "NEEDS A LIVE SOURCE"),
-        Screen.OnDemand to (if (jellyfinReady) "CONNECTED" else "NOT SET UP"),
+        Screen.OnDemand to (if (onDemandReady) "CONNECTED" else "NOT SET UP"),
         Screen.Settings to "SOURCES AND LOGIN"
     )
     val labels = listOf("LIVE TV", "PROGRAM GUIDE", "ON DEMAND", "SETTINGS")
@@ -317,7 +317,7 @@ private fun SettingsScreen(current: Settings, onSave: (Settings) -> Unit, onExit
 
         SettingsCard(
             title = "ON DEMAND",
-            subtitle = "Jellyfin server. The password signs you in and is not stored."
+            subtitle = "Jellyfin server, optional. Provider movies and series use the Live TV login."
         ) {
             CableField("Server URL", js) { js = it }
             CableField("Username (only to sign in again)", ju) { ju = it }
