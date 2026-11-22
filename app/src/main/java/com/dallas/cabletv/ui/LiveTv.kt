@@ -9,6 +9,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
@@ -324,6 +326,10 @@ private fun UpNextCard(program: Program) {
     }
 }
 
+private const val ALL_GROUP = "All"
+
+private fun groupOf(ch: LiveChannel): String = ch.group.ifBlank { "Other" }
+
 @Composable
 fun GuideScreen(
     channels: List<LiveChannel>,
@@ -333,6 +339,17 @@ fun GuideScreen(
     val cache = remember { mutableStateMapOf<String, NowNext>() }
     val gate = remember { Semaphore(3) } // limit guide requests so the provider is not flooded
     val firstRow = remember { FocusRequester() }
+
+    val groups = remember(channels) {
+        listOf(ALL_GROUP) + channels.map(::groupOf).distinct().sorted()
+    }
+    var selectedGroup by remember { mutableStateOf(ALL_GROUP) }
+    LaunchedEffect(groups) {
+        if (selectedGroup !in groups) selectedGroup = ALL_GROUP
+    }
+    val visible = remember(channels, selectedGroup) {
+        if (selectedGroup == ALL_GROUP) channels else channels.filter { groupOf(it) == selectedGroup }
+    }
 
     LaunchedEffect(channels.size) {
         if (channels.isNotEmpty()) runCatching { firstRow.requestFocus() }
@@ -360,22 +377,54 @@ fun GuideScreen(
                 modifier = Modifier.weight(1f)
             )
         } else {
+            LazyRow(
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 4.dp)
+            ) {
+                items(groups, key = { it }) { group ->
+                    CategoryChip(label = group, selected = group == selectedGroup) {
+                        selectedGroup = group
+                    }
+                }
+            }
+            Spacer(Modifier.height(20.dp))
             LazyColumn(
                 Modifier.weight(1f),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
                 contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 4.dp)
             ) {
-                itemsIndexed(channels, key = { _, c -> c.id }) { idx, ch ->
+                itemsIndexed(visible, key = { _, c -> c.id }) { idx, ch ->
                     GuideRow(
                         ch = ch,
                         cache = cache,
                         epg = epg,
                         gate = gate,
                         focusRequester = if (idx == 0) firstRow else null
-                    ) { onWatch(idx) }
+                    ) {
+                        // Tune using the index in the full list, not the filtered one.
+                        onWatch(channels.indexOfFirst { it.id == ch.id })
+                    }
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun CategoryChip(label: String, selected: Boolean, onClick: () -> Unit) {
+    FocusSurface(
+        onClick = onClick,
+        shape = RoundedCornerShape(50),
+        focusScale = 1.06f
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelLarge,
+            color = if (selected) Cable.Canvas else Cable.Ink,
+            modifier = Modifier
+                .background(if (selected) Cable.Accent else Cable.SurfaceHi)
+                .padding(horizontal = 24.dp, vertical = 12.dp)
+        )
     }
 }
 
