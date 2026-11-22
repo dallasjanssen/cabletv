@@ -57,7 +57,14 @@ private fun titleOf(screen: Screen): String = when (screen) {
 @Composable
 fun CableApp(store: SettingsStore) {
     var settings by remember { mutableStateOf(store.load()) }
-    var screen by remember { mutableStateOf(Screen.Home) }
+    // Read once per launch. The app opens straight into live TV on the last channel.
+    val lastChannelId = remember { store.lastChannelId() }
+    var screen by remember {
+        mutableStateOf(
+            if (settings.hasLiveSource && lastChannelId != null) Screen.LiveTv else Screen.Home
+        )
+    }
+    var restoredChannel by remember { mutableStateOf(false) }
     var channels by remember { mutableStateOf<List<LiveChannel>>(emptyList()) }
     var channelsLoading by remember { mutableStateOf(false) }
     var channelError by remember { mutableStateOf<String?>(null) }
@@ -83,6 +90,15 @@ fun CableApp(store: SettingsStore) {
         channelsLoading = false
     }
 
+    // Once the channel list arrives, tune to the channel that was playing last time.
+    LaunchedEffect(channels) {
+        if (!restoredChannel && channels.isNotEmpty()) {
+            restoredChannel = true
+            val idx = lastChannelId?.let { id -> channels.indexOfFirst { it.id == id } } ?: -1
+            if (idx >= 0) tuneIndex = idx
+        }
+    }
+
     BackHandler(enabled = screen != Screen.Home) { screen = Screen.Home }
 
     val goHome: () -> Unit = { screen = Screen.Home }
@@ -104,7 +120,11 @@ fun CableApp(store: SettingsStore) {
                 error = channelError,
                 startIndex = tuneIndex,
                 epg = xtream,
-                onExit = goHome
+                onExit = goHome,
+                onChannelChanged = { ch ->
+                    store.saveLastChannelId(ch.id)
+                    tuneIndex = channels.indexOfFirst { it.id == ch.id }.coerceAtLeast(0)
+                }
             )
             else -> Column(Modifier.fillMaxSize()) {
                 CableHeader(title = titleOf(screen), onBack = goHome)

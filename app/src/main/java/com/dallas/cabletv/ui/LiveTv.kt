@@ -59,7 +59,8 @@ fun LiveTvScreen(
     error: String?,
     startIndex: Int,
     epg: XtreamClient?,
-    onExit: () -> Unit
+    onExit: () -> Unit,
+    onChannelChanged: (LiveChannel) -> Unit = {}
 ) {
     val context = LocalContext.current
     val player = remember { ExoPlayer.Builder(context).build() }
@@ -93,6 +94,11 @@ fun LiveTvScreen(
         player.setMediaItem(MediaItem.fromUri(current.streamUrl))
         player.prepare()
         player.playWhenReady = true
+    }
+
+    // Report every channel change, so the next launch can return to it.
+    LaunchedEffect(current?.id) {
+        if (current != null) onChannelChanged(current)
     }
 
     // Refresh now and next for the channel on screen.

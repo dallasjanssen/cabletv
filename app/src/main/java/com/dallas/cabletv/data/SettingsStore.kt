@@ -40,7 +40,15 @@ class SettingsStore(context: Context) {
             .apply()
     }
 
+    /** The channel that was on screen last, so the app can return to it at launch. */
+    fun lastChannelId(): String? = prefs.getString(K_LAST_CHANNEL, null)?.takeIf { it.isNotBlank() }
+
+    fun saveLastChannelId(id: String) {
+        prefs.edit().putString(K_LAST_CHANNEL, id).apply()
+    }
+
     private companion object {
+        const val K_LAST_CHANNEL = "last_channel_id"
         const val K_XS = "xtream_server"
         const val K_XU = "xtream_user"
         const val K_XP = "xtream_pass"
