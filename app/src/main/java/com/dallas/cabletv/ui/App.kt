@@ -10,7 +10,11 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -751,25 +755,80 @@ private fun StatusLine(text: String) {
     )
 }
 
+/**
+ * A settings field. Moving over it with the remote only highlights it, so the keyboard
+ * stays closed. OK starts editing and opens the keyboard. Done or Back finishes editing
+ * and returns the highlight to the field.
+ */
 @Composable
 private fun CableField(label: String, value: String, secret: Boolean = false, onChange: (String) -> Unit) {
-    OutlinedTextField(
-        value = value,
-        onValueChange = onChange,
-        label = { Text(label) },
-        singleLine = true,
-        visualTransformation = if (secret) PasswordVisualTransformation() else VisualTransformation.None,
-        keyboardOptions = KeyboardOptions(
-            keyboardType = if (secret) KeyboardType.Password else KeyboardType.Text
-        ),
-        modifier = Modifier.fillMaxWidth(),
-        textStyle = CableFieldStyle,
-        colors = OutlinedTextFieldDefaults.colors(
-            focusedBorderColor = Cable.Led,
-            unfocusedBorderColor = Cable.Track,
-            focusedLabelColor = Cable.Led,
-            unfocusedLabelColor = Cable.Ink3,
-            cursorColor = Cable.Led
-        )
-    )
+    var editing by remember { mutableStateOf(false) }
+    val row = remember { FocusRequester() }
+    val input = remember { FocusRequester() }
+    val scope = rememberCoroutineScope()
+
+    fun finish() {
+        editing = false
+        scope.launch {
+            withFrameNanos { }
+            runCatching { row.requestFocus() }
+        }
+    }
+
+    BackHandler(enabled = editing) { finish() }
+    LaunchedEffect(editing) {
+        if (editing) {
+            withFrameNanos { }
+            runCatching { input.requestFocus() }
+        }
+    }
+
+    FocusSurface(
+        onClick = { editing = true },
+        modifier = Modifier.fillMaxWidth().focusRequester(row),
+        shape = RoundedCornerShape(6.dp),
+        focusScale = 1f
+    ) {
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .background(Cable.Surface)
+                .padding(horizontal = 20.dp, vertical = 12.dp)
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelMedium,
+                color = Cable.Ink3
+            )
+            Spacer(Modifier.height(4.dp))
+            if (editing) {
+                BasicTextField(
+                    value = value,
+                    onValueChange = onChange,
+                    singleLine = true,
+                    textStyle = CableFieldStyle,
+                    cursorBrush = SolidColor(Cable.Led),
+                    visualTransformation = if (secret) PasswordVisualTransformation() else VisualTransformation.None,
+                    keyboardOptions = KeyboardOptions(
+                        keyboardType = if (secret) KeyboardType.Password else KeyboardType.Text,
+                        imeAction = ImeAction.Done
+                    ),
+                    keyboardActions = KeyboardActions(onDone = { finish() }),
+                    modifier = Modifier.fillMaxWidth().focusRequester(input)
+                )
+            } else {
+                Text(
+                    text = when {
+                        value.isEmpty() -> "Not set"
+                        secret -> "*".repeat(value.length.coerceAtMost(24))
+                        else -> value
+                    },
+                    style = CableFieldStyle,
+                    color = if (value.isEmpty()) Cable.Ink3 else Cable.Ink,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+    }
 }
