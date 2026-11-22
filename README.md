@@ -67,7 +67,28 @@ In the guide, use the D-pad to move, OK to watch, and the colored keys listed at
 
 To run the logic tests (parsers and channel logic), run **Build > Test** or `./gradlew test` (with Java 17 or newer).
 
-### Installing on the TV
+### Release builds and signing
+
+A debug build (`./gradlew assembleDebug`) is signed with the throwaway debug key and is for your own use. A release build (`./gradlew assembleRelease`) is signed with your own keystore. Keep that keystore and its passwords private, and back them up: if you lose the keystore, you can never publish an update that installs over the old app.
+
+Create a keystore once:
+
+```
+keytool -genkeypair -v -keystore cabletv-release.jks -alias cabletv -keyalg RSA -keysize 2048 -validity 10000
+```
+
+Then set these environment variables before building. The keystore path is relative to the `app` folder, or absolute:
+
+| Variable | Value |
+| --- | --- |
+| `CABLETV_KEYSTORE_PATH` | Path to the `.jks` file |
+| `CABLETV_KEYSTORE_PASSWORD` | Keystore password |
+| `CABLETV_KEY_ALIAS` | Key alias, for example `cabletv` |
+| `CABLETV_KEY_PASSWORD` | Key password |
+
+The same names also work as Gradle properties in `~/.gradle/gradle.properties`. If none are set, the release build is produced unsigned, and debug builds are unaffected. Keystore files are excluded from git by `.gitignore`.
+
+## Installing on the TV
 
 1. On the TV, open **Settings > Device Preferences > About** (or **System > About** on some models) and select **Build** seven times to unlock Developer options.
 2. Open **Developer options** and turn on **USB debugging** or **Network debugging** (ADB).
