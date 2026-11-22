@@ -23,13 +23,15 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install SDK components
+      - name: Install Android SDK components
+        # The GitHub Ubuntu image already includes the Android SDK and its command line tools.
         run: |
-          yes | sdkmanager --licenses > /dev/null
-          sdkmanager "platforms;android-34" "build-tools;34.0.0" "platform-tools"
+          SDKMANAGER="$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -n 1)"
+          if [ -z "$SDKMANAGER" ]; then SDKMANAGER="$(command -v sdkmanager)"; fi
+          echo "Using $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" "platforms;android-34" "build-tools;34.0.0" "platform-tools"
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
