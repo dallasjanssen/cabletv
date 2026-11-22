@@ -4,12 +4,13 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -24,6 +25,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import coil.compose.AsyncImage
@@ -40,7 +43,7 @@ fun OnDemandScreen(settings: Settings, onExit: () -> Unit) {
     if (settings.hasJellyfin || settings.hasXtream) {
         JellyfinBrowser(settings, onExit)
     } else {
-        Column(Modifier.fillMaxSize()) {
+        Column(Modifier.fillMaxSize().scanlines()) {
             CableHeader(title = "ON DEMAND", onBack = onExit)
             EmptyState(
                 title = "No on-demand source yet",
@@ -75,6 +78,14 @@ private fun JellyfinBrowser(settings: Settings, onExit: () -> Unit) {
     var series by remember { mutableStateOf<VodItem?>(null) }
     var episodes by remember { mutableStateOf<List<VodItem>>(emptyList()) }
     var playing by remember { mutableStateOf<VodItem?>(null) }
+
+    // Where focus goes when the library comes back: the card last picked, and the episode last played.
+    var focusKey by remember { mutableStateOf<String?>(null) }
+    var lastEpisodeId by remember { mutableStateOf<String?>(null) }
+    val focusRequester = remember { FocusRequester() }
+    // Scroll positions live here, so they survive a trip to playback and back.
+    val libraryState = rememberLazyListState()
+    val rowStates = remember { mutableMapOf<String, LazyListState>() }
 
     // Each source loads on its own, so a failure in one still shows the other.
     LaunchedEffect(settings) {
@@ -113,18 +124,22 @@ private fun JellyfinBrowser(settings: Settings, onExit: () -> Unit) {
     // Every other view keeps the header, and its back button steps out one level.
     when {
         nowPlaying != null -> VodPlayer(nowPlaying.streamUrl)
-        openSeries != null -> Column(Modifier.fillMaxSize()) {
+        openSeries != null -> Column(Modifier.fillMaxSize().scanlines()) {
             CableHeader(title = openSeries.name.uppercase(), onBack = { series = null })
             Box(Modifier.weight(1f).fillMaxWidth()) {
                 SeriesDetail(
                     series = openSeries,
                     episodes = episodes,
-                    onPlay = { playing = it },
+                    focusEpisodeId = lastEpisodeId,
+                    onPlay = {
+                        lastEpisodeId = it.id
+                        playing = it
+                    },
                     onBack = { series = null }
                 )
             }
         }
-        else -> Column(Modifier.fillMaxSize()) {
+        else -> Column(Modifier.fillMaxSize().scanlines()) {
             CableHeader(title = "ON DEMAND", onBack = onExit)
             Box(Modifier.weight(1f).fillMaxWidth()) {
                 Library(
@@ -134,7 +149,12 @@ private fun JellyfinBrowser(settings: Settings, onExit: () -> Unit) {
                     recent = recent,
                     providerMovies = providerMovies,
                     providerSeries = providerSeries,
-                    onSelect = { item ->
+                    focusKey = focusKey,
+                    focusRequester = focusRequester,
+                    listState = libraryState,
+                    rowStates = rowStates,
+                    onSelect = { key, item ->
+                        focusKey = key
                         if (item.type == "Series") {
                             scope.launch {
                                 val eps = withContext(Dispatchers.IO) {
@@ -167,10 +187,27 @@ private fun Library(
     recent: List<VodItem>,
     providerMovies: List<VodItem>,
     providerSeries: List<VodItem>,
-    onSelect: (VodItem) -> Unit
+    focusKey: String?,
+    focusRequester: FocusRequester,
+    listState: LazyListState,
+    rowStates: MutableMap<String, LazyListState>,
+    onSelect: (String, VodItem) -> Unit
 ) {
-    val nothingYet = resume.isEmpty() && recent.isEmpty() &&
-        providerMovies.isEmpty() && providerSeries.isEmpty()
+    val rows = listOfNotNull(
+        resume.takeIf { it.isNotEmpty() }?.let { "Continue watching" to it },
+        recent.takeIf { it.isNotEmpty() }?.let { "Recently added" to it },
+        providerMovies.takeIf { it.isNotEmpty() }?.let { "New movies" to it },
+        providerSeries.takeIf { it.isNotEmpty() }?.let { "New series" to it }
+    )
+
+    // The card that should hold focus: the last one picked, otherwise the first card on screen.
+    val target = focusKey ?: rows.firstOrNull()?.let { (title, list) -> "$title|${list.first().id}" }
+    LaunchedEffect(target, loading) {
+        if (!loading && target != null) {
+            withFrameNanos { }
+            runCatching { focusRequester.requestFocus() }
+        }
+    }
 
     Column(
         Modifier
@@ -182,18 +219,19 @@ private fun Library(
                 title = "Loading your library...",
                 modifier = Modifier.weight(1f)
             )
-            nothingYet && loadError != null -> EmptyState(
+            rows.isEmpty() && loadError != null -> EmptyState(
                 title = "Couldn't reach your sources",
                 body = loadError,
                 modifier = Modifier.weight(1f)
             )
-            nothingYet -> EmptyState(
+            rows.isEmpty() -> EmptyState(
                 title = "Nothing here yet",
                 body = "Add media to Jellyfin or your provider and it will show up here.",
                 modifier = Modifier.weight(1f)
             )
             else -> LazyColumn(
                 Modifier.weight(1f),
+                state = listState,
                 verticalArrangement = Arrangement.spacedBy(36.dp),
                 contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 40.dp)
             ) {
@@ -206,17 +244,15 @@ private fun Library(
                         )
                     }
                 }
-                if (resume.isNotEmpty()) {
-                    item { PosterRow("Continue watching", resume, onSelect) }
-                }
-                if (recent.isNotEmpty()) {
-                    item { PosterRow("Recently added", recent, onSelect) }
-                }
-                if (providerMovies.isNotEmpty()) {
-                    item { PosterRow("New movies", providerMovies, onSelect) }
-                }
-                if (providerSeries.isNotEmpty()) {
-                    item { PosterRow("New series", providerSeries, onSelect) }
+                items(rows, key = { it.first }) { (title, list) ->
+                    PosterRow(
+                        title = title,
+                        list = list,
+                        target = target,
+                        focusRequester = focusRequester,
+                        rowState = rowStates.getOrPut(title) { LazyListState() },
+                        onSelect = { vod -> onSelect("$title|${vod.id}", vod) }
+                    )
                 }
             }
         }
@@ -224,7 +260,14 @@ private fun Library(
 }
 
 @Composable
-private fun PosterRow(title: String, list: List<VodItem>, onSelect: (VodItem) -> Unit) {
+private fun PosterRow(
+    title: String,
+    list: List<VodItem>,
+    target: String?,
+    focusRequester: FocusRequester,
+    rowState: LazyListState,
+    onSelect: (VodItem) -> Unit
+) {
     Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
         Text(
             text = title,
@@ -232,25 +275,31 @@ private fun PosterRow(title: String, list: List<VodItem>, onSelect: (VodItem) ->
             color = Cable.Led
         )
         LazyRow(
+            state = rowState,
             horizontalArrangement = Arrangement.spacedBy(28.dp),
             contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 6.dp, vertical = 10.dp)
         ) {
-            items(list, key = { it.source + it.type + it.id }) { vod ->
-                PosterCard(vod) { onSelect(vod) }
+            items(list, key = { it.id }) { vod ->
+                val holdsFocus = target == "$title|${vod.id}"
+                PosterCard(
+                    vod = vod,
+                    modifier = if (holdsFocus) Modifier.focusRequester(focusRequester) else Modifier,
+                    onClick = { onSelect(vod) }
+                )
             }
         }
     }
 }
 
 @Composable
-private fun PosterCard(vod: VodItem, onClick: () -> Unit) {
+private fun PosterCard(vod: VodItem, modifier: Modifier, onClick: () -> Unit) {
     Column(
         Modifier.width(184.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         FocusSurface(
             onClick = onClick,
-            modifier = Modifier
+            modifier = modifier
                 .width(184.dp)
                 .height(276.dp),
             shape = RoundedCornerShape(8.dp),
@@ -286,12 +335,19 @@ private fun PosterCard(vod: VodItem, onClick: () -> Unit) {
 private fun SeriesDetail(
     series: VodItem,
     episodes: List<VodItem>,
+    focusEpisodeId: String?,
     onPlay: (VodItem) -> Unit,
     onBack: () -> Unit
 ) {
     val firstEpisode = remember { FocusRequester() }
-    LaunchedEffect(episodes.size) {
-        if (episodes.isNotEmpty()) runCatching { firstEpisode.requestFocus() }
+    // Focus returns to the episode last played, or the first one for a new series.
+    val targetId = focusEpisodeId?.takeIf { id -> episodes.any { it.id == id } }
+        ?: episodes.firstOrNull()?.id
+    LaunchedEffect(targetId) {
+        if (targetId != null) {
+            withFrameNanos { }
+            runCatching { firstEpisode.requestFocus() }
+        }
     }
 
     Row(
@@ -306,14 +362,15 @@ private fun SeriesDetail(
                 .fillMaxHeight(),
             verticalArrangement = Arrangement.spacedBy(20.dp)
         ) {
-            OutlinedButton(onClick = onBack) { Text("BACK TO LIBRARY") }
+            CableButton(label = "BACK TO LIBRARY", onClick = onBack)
+            // The poster takes whatever height is left, so it never pushes the year off screen.
             AsyncImage(
                 model = series.posterUrl,
                 contentDescription = series.name,
                 contentScale = ContentScale.Crop,
                 modifier = Modifier
                     .width(280.dp)
-                    .height(420.dp)
+                    .weight(1f)
                     .clip(RoundedCornerShape(8.dp))
                     .background(Cable.SurfaceHi)
             )
@@ -357,10 +414,10 @@ private fun SeriesDetail(
                     verticalArrangement = Arrangement.spacedBy(10.dp),
                     contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 4.dp)
                 ) {
-                    itemsIndexed(episodes, key = { _, ep -> ep.id }) { idx, ep ->
+                    items(episodes, key = { it.id }) { ep ->
                         EpisodeRow(
                             episode = ep,
-                            focusRequester = if (idx == 0) firstEpisode else null
+                            focusRequester = if (ep.id == targetId) firstEpisode else null
                         ) { onPlay(ep) }
                     }
                 }
@@ -410,25 +467,56 @@ private fun EpisodeRow(
     }
 }
 
+/**
+ * Full-screen playback. The player takes focus so the remote's play, pause and
+ * seek keys work, and a message appears if the stream will not start.
+ */
 @Composable
 private fun VodPlayer(url: String) {
     val context = LocalContext.current
     val player = remember { ExoPlayer.Builder(context).build() }
+    var failed by remember { mutableStateOf(false) }
 
     DisposableEffect(player) {
-        onDispose { player.release() }
+        val listener = object : Player.Listener {
+            override fun onPlayerError(e: PlaybackException) {
+                failed = true
+            }
+        }
+        player.addListener(listener)
+        onDispose {
+            player.removeListener(listener)
+            player.release()
+        }
     }
 
     LaunchedEffect(url) {
+        failed = false
         player.setMediaItem(MediaItem.fromUri(url))
         player.prepare()
         player.playWhenReady = true
     }
 
-    AndroidView(
-        factory = { ctx -> PlayerView(ctx).also { it.player = player } },
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color.Black)
-    )
+    Box(Modifier.fillMaxSize().background(Color.Black)) {
+        AndroidView(
+            factory = { ctx ->
+                PlayerView(ctx).apply {
+                    useController = true
+                    isFocusable = true
+                    isFocusableInTouchMode = true
+                    requestFocus()
+                }.also { it.player = player }
+            },
+            modifier = Modifier.fillMaxSize()
+        )
+        if (failed) {
+            EmptyState(
+                title = "This title will not play",
+                body = "The stream may use a format this TV cannot decode. Press BACK to return.",
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Cable.Canvas.copy(alpha = 0.8f))
+            )
+        }
+    }
 }

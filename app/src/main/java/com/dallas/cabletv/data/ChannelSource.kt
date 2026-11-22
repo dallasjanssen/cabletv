@@ -47,7 +47,8 @@ object M3uParser {
                 line.isNotEmpty() && !line.startsWith("#") -> {
                     val n = out.size + 1
                     out += LiveChannel(
-                        id = attrs.nz("tvg-id") ?: line,
+                        // Playlists often repeat tvg-id (HD and SD copies), so the list position keeps IDs unique.
+                        id = "$n|$line",
                         number = attrs["tvg-chno"]?.toIntOrNull() ?: n,
                         name = title.ifBlank { attrs.nz("tvg-name") ?: "Channel $n" },
                         logo = attrs.nz("tvg-logo"),

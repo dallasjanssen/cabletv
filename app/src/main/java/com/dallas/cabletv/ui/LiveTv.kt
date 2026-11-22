@@ -6,6 +6,7 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.*
@@ -73,7 +74,7 @@ fun LiveTvScreen(
     var bannerTick by remember { mutableIntStateOf(0) }
     var digits by remember { mutableStateOf("") }
     var nowNext by remember { mutableStateOf<NowNext?>(null) }
-    // The mini guide opens with the left button. Up and down browse, OK tunes, right or Back closes.
+    // Left opens the channel list. Up and down browse it, OK tunes, right or Back closes it.
     var showMiniGuide by remember { mutableStateOf(false) }
     var guideHighlight by remember { mutableIntStateOf(0) }
     BackHandler(enabled = showMiniGuide) { showMiniGuide = false }
@@ -93,24 +94,29 @@ fun LiveTvScreen(
         }
     }
 
-    // Tune the player whenever the channel changes.
+    // Tune the player whenever the channel changes. A short wait means holding a
+    // key only loads the channel you stop on, not every one on the way.
     LaunchedEffect(current?.streamUrl) {
         if (current == null) return@LaunchedEffect
+        delay(300)
         playerError = null
         player.setMediaItem(MediaItem.fromUri(current.streamUrl))
         player.prepare()
         player.playWhenReady = true
     }
 
-    // Report every channel change, so the next launch can return to it.
+    // Report the channel on screen, so the next launch can return to it.
     LaunchedEffect(current?.id) {
-        if (current != null) onChannelChanged(current)
+        if (current == null) return@LaunchedEffect
+        delay(500)
+        onChannelChanged(current)
     }
 
     // Refresh now and next for the channel on screen.
     LaunchedEffect(current?.id) {
         nowNext = null
         if (current == null || epg == null) return@LaunchedEffect
+        delay(300)
         nowNext = withContext(Dispatchers.IO) { runCatching { epg.nowNext(current.id) }.getOrNull() }
     }
 
@@ -152,19 +158,31 @@ fun LiveTvScreen(
         flashBanner()
     }
 
-    fun handleMiniGuideKey(code: Int) {
+    // Consumes only the keys the list uses. Everything else, Back and volume included, goes to the system.
+    fun handleMiniGuideKey(code: Int): Boolean {
         val last = (channels.size - 1).coerceAtLeast(0)
-        when (code) {
-            KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_CHANNEL_UP ->
+        return when (code) {
+            KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_CHANNEL_UP -> {
                 guideHighlight = (guideHighlight - 1).coerceAtLeast(0)
-            KeyEvent.KEYCODE_DPAD_DOWN, KeyEvent.KEYCODE_CHANNEL_DOWN ->
+                true
+            }
+            KeyEvent.KEYCODE_DPAD_DOWN, KeyEvent.KEYCODE_CHANNEL_DOWN -> {
                 guideHighlight = (guideHighlight + 1).coerceAtMost(last)
-            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> pickGuideChannel(guideHighlight)
-            KeyEvent.KEYCODE_DPAD_RIGHT -> showMiniGuide = false
+                true
+            }
+            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
+                pickGuideChannel(guideHighlight)
+                true
+            }
+            KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                showMiniGuide = false
+                true
+            }
+            else -> false
         }
     }
 
-    LaunchedEffect(Unit) { focus.requestFocus() }
+    LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
 
     Box(
         Modifier
@@ -175,15 +193,16 @@ fun LiveTvScreen(
             .onPreviewKeyEvent { ev ->
                 if (ev.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                 val code = ev.nativeKeyEvent.keyCode
-                if (showMiniGuide) {
-                    handleMiniGuideKey(code)
-                    return@onPreviewKeyEvent true
-                }
+                if (showMiniGuide) return@onPreviewKeyEvent handleMiniGuideKey(code)
                 when (code) {
                     KeyEvent.KEYCODE_DPAD_LEFT -> {
-                        guideHighlight = index
-                        showMiniGuide = true
-                        true
+                        if (channels.isEmpty()) {
+                            false
+                        } else {
+                            guideHighlight = index
+                            showMiniGuide = true
+                            true
+                        }
                     }
                     KeyEvent.KEYCODE_CHANNEL_UP, KeyEvent.KEYCODE_DPAD_UP -> {
                         tune(1)
@@ -336,9 +355,9 @@ private fun ChannelBanner(channel: LiveChannel, nn: NowNext?) {
 
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    text = "UP / DOWN   Change channel      0-9   Jump to number      BACK   Menu",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = Cable.Ink3
+                    text = "UP / DOWN  Change channel    LEFT  Channel list    0-9  Jump to number    BACK  Menu",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Cable.Ink2
                 )
             }
 
@@ -379,10 +398,12 @@ private fun MiniGuide(
         )
         LazyColumn(Modifier.weight(1f), state = listState) {
             itemsIndexed(channels, key = { _, c -> c.id }) { idx, ch ->
+                val selected = idx == highlight
                 Row(
                     Modifier
                         .fillMaxWidth()
-                        .background(if (idx == highlight) Cable.SurfaceHi else Color.Transparent)
+                        .background(if (selected) Cable.SurfaceHi else Color.Transparent)
+                        .border(2.dp, if (selected) Cable.Led else Color.Transparent)
                         .clickable { onPick(idx) }
                         .padding(horizontal = 28.dp, vertical = 14.dp),
                     verticalAlignment = Alignment.CenterVertically
@@ -461,8 +482,12 @@ fun GuideScreen(
         if (selectedGroup == ALL_GROUP) channels else channels.filter { groupOf(it) == selectedGroup }
     }
 
+    // Wait one frame so the first row exists before focus moves onto it.
     LaunchedEffect(channels.size) {
-        if (channels.isNotEmpty()) runCatching { firstRow.requestFocus() }
+        if (channels.isNotEmpty()) {
+            withFrameNanos { }
+            runCatching { firstRow.requestFocus() }
+        }
     }
 
     Column(
@@ -490,7 +515,7 @@ fun GuideScreen(
         } else {
             LazyRow(
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 4.dp)
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 6.dp)
             ) {
                 items(groups, key = { it }) { group ->
                     CategoryChip(label = group, selected = group == selectedGroup) {
@@ -599,7 +624,7 @@ private fun GuideRow(
                     Text(
                         text = now.title,
                         style = MaterialTheme.typography.bodyMedium,
-                        color = Cable.Ink2,
+                        color = Cable.Led,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )

@@ -5,21 +5,14 @@ import android.net.Uri
 import android.provider.Settings as AndroidSettings
 import android.view.KeyEvent
 import androidx.activity.compose.BackHandler
-import androidx.compose.ui.platform.LocalContext
-import com.dallas.cabletv.BuildConfig
-import com.dallas.cabletv.data.AppUpdater
-import java.io.File
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
@@ -33,14 +26,14 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
-import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
+import com.dallas.cabletv.BuildConfig
+import com.dallas.cabletv.data.AppUpdater
 import com.dallas.cabletv.data.ChannelSource
 import com.dallas.cabletv.data.JellyfinClient
 import com.dallas.cabletv.data.LiveChannel
@@ -50,6 +43,7 @@ import com.dallas.cabletv.data.XtreamClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 
 enum class Screen { Home, LiveTv, Guide, OnDemand, Settings }
 
@@ -71,6 +65,12 @@ fun CableApp(store: SettingsStore) {
             if (settings.hasLiveSource && lastChannelId != null) Screen.LiveTv else Screen.Home
         )
     }
+    // The screen the user came from, so Back returns there instead of always going home.
+    var previous by remember { mutableStateOf(Screen.Home) }
+    var channels by remember { mutableStateOf<List<LiveChannel>>(emptyList()) }
+    var channelsLoading by remember { mutableStateOf(false) }
+    var channelError by remember { mutableStateOf<String?>(null) }
+    var tuneIndex by remember { mutableIntStateOf(0) }
     var restoredChannel by remember { mutableStateOf(false) }
 
     val context = LocalContext.current
@@ -78,6 +78,41 @@ fun CableApp(store: SettingsStore) {
     var update by remember { mutableStateOf<AppUpdater.Release?>(null) }
     var updateMessage by remember { mutableStateOf<String?>(null) }
     var updateBusy by remember { mutableStateOf(false) }
+
+    val xtream = remember(settings) {
+        if (settings.hasXtream) {
+            XtreamClient(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass)
+        } else {
+            null
+        }
+    }
+
+    // Reload the channel list whenever the live source settings change.
+    LaunchedEffect(settings) {
+        channels = emptyList()
+        channelError = null
+        if (!settings.hasLiveSource) return@LaunchedEffect
+        channelsLoading = true
+        withContext(Dispatchers.IO) { runCatching { ChannelSource.load(settings) } }
+            .onSuccess { channels = it }
+            .onFailure { channelError = it.message ?: "Could not load channels" }
+        channelsLoading = false
+    }
+
+    // Until the saved channel is found, live TV starts on it directly, so channel 1 never plays first.
+    // The index is always kept inside the list, so a shorter list after a settings change cannot go blank.
+    val startIndex = if (!restoredChannel && channels.isNotEmpty()) {
+        (lastChannelId?.let { id -> channels.indexOfFirst { it.id == id } } ?: -1).coerceAtLeast(0)
+    } else {
+        tuneIndex.coerceIn(0, (channels.size - 1).coerceAtLeast(0))
+    }
+
+    LaunchedEffect(channels) {
+        if (!restoredChannel && channels.isNotEmpty()) {
+            restoredChannel = true
+            tuneIndex = startIndex
+        }
+    }
 
     // Asks GitHub for a newer build. A manual check always reports back, an automatic one stays quiet.
     fun checkForUpdate(manual: Boolean) {
@@ -116,9 +151,7 @@ fun CableApp(store: SettingsStore) {
         updateMessage = "Downloading build ${release.versionCode}..."
         updateScope.launch {
             val result = withContext(Dispatchers.IO) {
-                runCatching {
-                    AppUpdater.download(release, File(context.cacheDir, "updates"))
-                }
+                runCatching { AppUpdater.download(release, File(context.cacheDir, "updates")) }
             }
             updateBusy = false
             result
@@ -131,52 +164,26 @@ fun CableApp(store: SettingsStore) {
     }
 
     LaunchedEffect(Unit) { checkForUpdate(manual = false) }
-    var channels by remember { mutableStateOf<List<LiveChannel>>(emptyList()) }
-    var channelsLoading by remember { mutableStateOf(false) }
-    var channelError by remember { mutableStateOf<String?>(null) }
-    var tuneIndex by remember { mutableIntStateOf(0) }
 
-    val xtream = remember(settings) {
-        if (settings.hasXtream) {
-            XtreamClient(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass)
-        } else {
-            null
-        }
+    val navigate: (Screen) -> Unit = { target ->
+        previous = screen
+        screen = target
+    }
+    val goBack: () -> Unit = {
+        screen = previous
+        previous = Screen.Home
     }
 
-    // Reload the channel list whenever the live source settings change.
-    LaunchedEffect(settings) {
-        channels = emptyList()
-        channelError = null
-        if (!settings.hasLiveSource) return@LaunchedEffect
-        channelsLoading = true
-        withContext(Dispatchers.IO) { runCatching { ChannelSource.load(settings) } }
-            .onSuccess { channels = it }
-            .onFailure { channelError = it.message ?: "Could not load channels" }
-        channelsLoading = false
-    }
+    BackHandler(enabled = screen != Screen.Home) { goBack() }
 
-    // Once the channel list arrives, tune to the channel that was playing last time.
-    LaunchedEffect(channels) {
-        if (!restoredChannel && channels.isNotEmpty()) {
-            restoredChannel = true
-            val idx = lastChannelId?.let { id -> channels.indexOfFirst { it.id == id } } ?: -1
-            if (idx >= 0) tuneIndex = idx
-        }
-    }
-
-    BackHandler(enabled = screen != Screen.Home) { screen = Screen.Home }
-
-    val goHome: () -> Unit = { screen = Screen.Home }
-    val navigate: (Screen) -> Unit = { screen = it }
-
-    // Scan lines are part of the menu look only. Live video is shown clean.
-    Box(
+    // Scan lines are part of the menu look. Live video and playback are shown clean.
+    val scanlineModifier = if (screen == Screen.LiveTv || screen == Screen.OnDemand) {
         Modifier
-            .fillMaxSize()
-            .background(Cable.Canvas)
-            .then(if (screen == Screen.LiveTv) Modifier else Modifier.scanlines())
-    ) {
+    } else {
+        Modifier.scanlines()
+    }
+
+    Box(Modifier.fillMaxSize().background(Cable.Canvas).then(scanlineModifier)) {
         when (screen) {
             Screen.Home -> HomeMenu(
                 channelCount = channels.size,
@@ -185,22 +192,22 @@ fun CableApp(store: SettingsStore) {
                 updateAvailable = update != null,
                 onOpen = navigate
             )
-            // Full-bleed screens draw their own header, so playback can hide it.
-            Screen.OnDemand -> OnDemandScreen(settings = settings, onExit = goHome)
+            // Full-bleed screens draw their own scan lines, so playback can stay clean.
+            Screen.OnDemand -> OnDemandScreen(settings = settings, onExit = goBack)
             Screen.LiveTv -> LiveTvScreen(
                 channels = channels,
                 loading = channelsLoading,
                 error = channelError,
-                startIndex = tuneIndex,
+                startIndex = startIndex,
                 epg = xtream,
-                onExit = goHome,
+                onExit = goBack,
                 onChannelChanged = { ch ->
                     store.saveLastChannelId(ch.id)
                     tuneIndex = channels.indexOfFirst { it.id == ch.id }.coerceAtLeast(0)
                 }
             )
             else -> Column(Modifier.fillMaxSize()) {
-                CableHeader(title = titleOf(screen), onBack = goHome)
+                CableHeader(title = titleOf(screen), onBack = goBack)
                 Box(Modifier.weight(1f).fillMaxWidth()) {
                     when (screen) {
                         Screen.Guide -> GuideScreen(
@@ -208,6 +215,7 @@ fun CableApp(store: SettingsStore) {
                             epg = xtream,
                             onWatch = { idx ->
                                 tuneIndex = idx
+                                previous = Screen.Guide
                                 screen = Screen.LiveTv
                             }
                         )
@@ -216,9 +224,10 @@ fun CableApp(store: SettingsStore) {
                             onSave = { updated ->
                                 store.save(updated)
                                 settings = updated
+                                previous = Screen.Home
                                 screen = Screen.Home
                             },
-                            onExit = goHome,
+                            onExit = goBack,
                             update = update,
                             updateMessage = updateMessage,
                             updateBusy = updateBusy,
@@ -259,7 +268,6 @@ private fun HomeMenu(
     Column(
         Modifier
             .fillMaxSize()
-            .focusable()
             .onPreviewKeyEvent { ev ->
                 if (ev.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                 when (val code = ev.nativeKeyEvent.keyCode) {
@@ -270,8 +278,8 @@ private fun HomeMenu(
                     else -> false
                 }
             }
-            .padding(horizontal = 48.dp, vertical = 40.dp),
-        verticalArrangement = Arrangement.spacedBy(24.dp)
+            .padding(horizontal = 48.dp, vertical = 32.dp),
+        verticalArrangement = Arrangement.spacedBy(20.dp)
     ) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
             Text(
@@ -281,17 +289,17 @@ private fun HomeMenu(
             )
             Text(
                 text = if (updateAvailable) "UPDATE READY IN SETTINGS" else "PRESS 1-4",
-                style = MaterialTheme.typography.labelMedium,
-                color = Cable.Ink3,
+                style = MaterialTheme.typography.bodyMedium,
+                color = if (updateAvailable) Cable.Accent else Cable.Ink3,
                 modifier = Modifier.padding(top = 14.dp)
             )
         }
 
         Column(
             Modifier.weight(1f).fillMaxWidth(),
-            verticalArrangement = Arrangement.spacedBy(24.dp)
+            verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            Row(Modifier.weight(1f).fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(24.dp)) {
+            Row(Modifier.weight(1f).fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
                 MenuButton(
                     number = 1,
                     label = labels[0],
@@ -305,7 +313,7 @@ private fun HomeMenu(
                     modifier = Modifier.weight(1f).fillMaxHeight()
                 ) { onOpen(entries[1].first) }
             }
-            Row(Modifier.weight(1f).fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(24.dp)) {
+            Row(Modifier.weight(1f).fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
                 MenuButton(
                     number = 3,
                     label = labels[2],
@@ -323,6 +331,7 @@ private fun HomeMenu(
     }
 }
 
+/** A home menu card. The number sits beside the label so everything fits on a 1080p screen. */
 @Composable
 private fun MenuButton(
     number: Int,
@@ -338,34 +347,35 @@ private fun MenuButton(
         shape = shape,
         focusScale = 1.03f
     ) {
-        Column(
+        Row(
             Modifier
                 .fillMaxSize()
                 .background(Cable.Surface)
                 .border(2.dp, Cable.Accent.copy(alpha = 0.45f), shape)
-                .padding(28.dp),
-            verticalArrangement = Arrangement.SpaceBetween
+                .padding(horizontal = 28.dp, vertical = 16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(24.dp)
         ) {
             Text(
                 text = number.toString(),
-                style = TextStyle(
-                    fontFamily = FontFamily.Monospace,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 72.sp
-                ),
+                style = CableNumber,
                 color = Cable.Accent
             )
-            Column {
+            Column(Modifier.weight(1f)) {
                 Text(
                     text = label,
                     style = MaterialTheme.typography.titleLarge,
-                    color = Cable.Led
+                    color = Cable.Led,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
                 Spacer(Modifier.height(4.dp))
                 Text(
                     text = status,
                     style = MaterialTheme.typography.bodyMedium,
-                    color = Cable.Ink2
+                    color = Cable.Ink2,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
             }
         }
@@ -394,6 +404,56 @@ private fun SettingsScreen(
     var message by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
 
+    // Focus starts on SAVE, so the remote is never stuck inside a text field.
+    val saveFocus = remember { FocusRequester() }
+    LaunchedEffect(Unit) {
+        withFrameNanos { }
+        runCatching { saveFocus.requestFocus() }
+    }
+
+    fun save() {
+        busy = true
+        message = "Contacting servers..."
+        scope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    val xServer = xs.trim()
+                    if (xServer.isNotBlank() && xu.isNotBlank() && xp.isNotBlank()) {
+                        val ok = XtreamClient(xServer, xu.trim(), xp).login()
+                        check(ok) { "Live TV login failed. Check server, user and password." }
+                    }
+
+                    var token = current.jellyfinToken
+                    var userId = current.jellyfinUserId
+                    val jServer = js.trim()
+                    if (jServer.isBlank() || jServer != current.jellyfinServer) {
+                        token = ""
+                        userId = ""
+                    }
+                    if (jServer.isNotBlank() && ju.isNotBlank() && jp.isNotBlank()) {
+                        val (t, u) = JellyfinClient.login(jServer, ju.trim(), jp)
+                        token = t
+                        userId = u
+                    }
+
+                    Settings(
+                        xtreamServer = xServer,
+                        xtreamUser = xu.trim(),
+                        xtreamPass = xp,
+                        m3uUrl = m3u.trim(),
+                        jellyfinServer = jServer,
+                        jellyfinToken = token,
+                        jellyfinUserId = userId
+                    )
+                }
+            }
+            busy = false
+            result
+                .onSuccess { onSave(it) }
+                .onFailure { message = "Save failed: ${it.message}" }
+        }
+    }
+
     Column(
         Modifier
             .fillMaxSize()
@@ -406,6 +466,20 @@ private fun SettingsScreen(
             style = MaterialTheme.typography.bodyLarge,
             color = Cable.Ink2
         )
+
+        // Actions come first, so they are one press away and not below seven fields.
+        Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+            CableButton(
+                label = "SAVE",
+                primary = true,
+                enabled = !busy,
+                onClick = { save() },
+                modifier = Modifier.focusRequester(saveFocus)
+            )
+            CableButton(label = "CANCEL", onClick = onExit)
+        }
+
+        message?.let { StatusLine(it) }
 
         SettingsCard(
             title = "LIVE TV",
@@ -438,65 +512,16 @@ private fun SettingsScreen(
         ) {
             updateMessage?.let { StatusLine(it) }
             Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                OutlinedButton(enabled = !updateBusy, onClick = onCheckUpdate) { Text("CHECK") }
+                CableButton(label = "CHECK", enabled = !updateBusy, onClick = onCheckUpdate)
                 update?.let { release ->
-                    Button(enabled = !updateBusy, onClick = { onInstallUpdate(release) }) {
-                        Text("INSTALL BUILD ${release.versionCode}")
-                    }
+                    CableButton(
+                        label = "INSTALL BUILD ${release.versionCode}",
+                        primary = true,
+                        enabled = !updateBusy,
+                        onClick = { onInstallUpdate(release) }
+                    )
                 }
             }
-        }
-
-        message?.let { StatusLine(it) }
-
-        Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-            Button(
-                enabled = !busy,
-                onClick = {
-                    busy = true
-                    message = "Contacting servers..."
-                    scope.launch {
-                        val result = runCatching {
-                            withContext(Dispatchers.IO) {
-                                val xServer = xs.trim()
-                                if (xServer.isNotBlank() && xu.isNotBlank() && xp.isNotBlank()) {
-                                    val ok = XtreamClient(xServer, xu.trim(), xp).login()
-                                    check(ok) { "Live TV login failed. Check server, user and password." }
-                                }
-
-                                var token = current.jellyfinToken
-                                var userId = current.jellyfinUserId
-                                val jServer = js.trim()
-                                if (jServer.isBlank() || jServer != current.jellyfinServer) {
-                                    token = ""
-                                    userId = ""
-                                }
-                                if (jServer.isNotBlank() && ju.isNotBlank() && jp.isNotBlank()) {
-                                    val (t, u) = JellyfinClient.login(jServer, ju.trim(), jp)
-                                    token = t
-                                    userId = u
-                                }
-
-                                Settings(
-                                    xtreamServer = xServer,
-                                    xtreamUser = xu.trim(),
-                                    xtreamPass = xp,
-                                    m3uUrl = m3u.trim(),
-                                    jellyfinServer = jServer,
-                                    jellyfinToken = token,
-                                    jellyfinUserId = userId
-                                )
-                            }
-                        }
-                        busy = false
-                        result
-                            .onSuccess { onSave(it) }
-                            .onFailure { message = "Save failed: ${it.message}" }
-                    }
-                }
-            ) { Text("SAVE") }
-
-            OutlinedButton(onClick = onExit) { Text("CANCEL") }
         }
     }
 }
@@ -556,7 +581,7 @@ private fun CableField(label: String, value: String, secret: Boolean = false, on
             keyboardType = if (secret) KeyboardType.Password else KeyboardType.Text
         ),
         modifier = Modifier.fillMaxWidth(),
-        textStyle = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 20.sp, color = Cable.Ink),
+        textStyle = CableFieldStyle,
         colors = OutlinedTextFieldDefaults.colors(
             focusedBorderColor = Cable.Led,
             unfocusedBorderColor = Cable.Track,

@@ -15,6 +15,7 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.focus.onFocusChanged
@@ -26,6 +27,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
@@ -48,7 +50,7 @@ object Cable {
     val Live = Color(0xFFFF4D5E)
     val Ink = Color(0xFFE8F4FF)
     val Ink2 = Color(0xFFB8C8E6)
-    val Ink3 = Color(0xFF6A7FA6)
+    val Ink3 = Color(0xFF93A6C8)
     val Track = Color(0xFF1A2A4A)
 }
 
@@ -144,22 +146,56 @@ fun CableHeader(title: String, onBack: (() -> Unit)? = null) {
         verticalAlignment = Alignment.CenterVertically
     ) {
         if (onBack != null) {
-            TextButton(onClick = onBack) {
-                Text(
-                    text = "< BACK",
-                    color = Cable.Accent,
-                    style = MaterialTheme.typography.labelLarge
-                )
-            }
+            CableButton(label = "< BACK", onClick = onBack)
             Spacer(Modifier.width(16.dp))
         }
         Text(
             text = title,
             color = Cable.Led,
             style = MaterialTheme.typography.headlineMedium,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f)
         )
         Clock()
+    }
+}
+
+/** Large numerals on the home menu. */
+val CableNumber = TextStyle(fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold, fontSize = 56.sp)
+
+/** Text typed into settings fields. */
+val CableFieldStyle = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 20.sp, color = Cable.Ink)
+
+/**
+ * The one button style. It uses the same green focus ring as every other control,
+ * so the remote position is always clear. A primary button is filled green.
+ */
+@Composable
+fun CableButton(
+    label: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    primary: Boolean = false,
+    enabled: Boolean = true
+) {
+    val shape = RoundedCornerShape(6.dp)
+    FocusSurface(
+        onClick = { if (enabled) onClick() },
+        modifier = modifier.alpha(if (enabled) 1f else 0.4f),
+        shape = shape,
+        focusScale = 1.04f
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelLarge,
+            color = if (primary) Cable.Canvas else Cable.Led,
+            modifier = Modifier
+                .clip(shape)
+                .background(if (primary) Cable.Led else Cable.Surface)
+                .border(2.dp, Cable.Led.copy(alpha = 0.5f), shape)
+                .padding(horizontal = 24.dp, vertical = 12.dp)
+        )
     }
 }
 
@@ -168,7 +204,7 @@ fun Pill(
     text: String,
     color: Color,
     modifier: Modifier = Modifier,
-    textColor: Color = Color.White
+    textColor: Color = Cable.Ink
 ) {
     Text(
         text = text,
