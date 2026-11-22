@@ -12,7 +12,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -204,6 +204,16 @@ private fun HomeView(client: JellyfinClient, onSelect: (VodItem) -> Unit) {
     var recent by remember { mutableStateOf<List<VodItem>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
     var loadError by remember { mutableStateOf<String?>(null) }
+    // Focus goes to the first poster of the first non-empty row once the library has loaded.
+    val rowFocus = remember { FocusRequester() }
+    val firstRow = when {
+        resume.isNotEmpty() -> 0
+        nextUp.isNotEmpty() -> 1
+        else -> 2
+    }
+    LaunchedEffect(loading) {
+        if (!loading && loadError == null) runCatching { rowFocus.requestFocus() }
+    }
 
     LaunchedEffect(client) {
         loading = true
@@ -232,9 +242,9 @@ private fun HomeView(client: JellyfinClient, onSelect: (VodItem) -> Unit) {
                 .padding(24.dp),
             verticalArrangement = Arrangement.spacedBy(24.dp)
         ) {
-            if (resume.isNotEmpty()) PosterRow("CONTINUE WATCHING", resume, onSelect)
-            if (nextUp.isNotEmpty()) PosterRow("NEXT UP", nextUp, onSelect)
-            PosterRow("RECENTLY ADDED", recent, onSelect)
+            if (resume.isNotEmpty()) PosterRow("CONTINUE WATCHING", resume, onSelect, if (firstRow == 0) rowFocus else null)
+            if (nextUp.isNotEmpty()) PosterRow("NEXT UP", nextUp, onSelect, if (firstRow == 1) rowFocus else null)
+            PosterRow("RECENTLY ADDED", recent, onSelect, if (firstRow == 2) rowFocus else null)
         }
     }
 }
@@ -255,6 +265,11 @@ private fun BrowseView(client: JellyfinClient, tab: VodTab, onSelect: (VodItem) 
     // so a changed genre or search never mixes with results that were still loading.
     var generation by remember(tab) { mutableIntStateOf(0) }
     val gridState = rememberLazyGridState()
+    // The first poster takes focus when a list loads, but not while the user is typing a search.
+    val gridFocus = remember { FocusRequester() }
+    LaunchedEffect(tab, items.firstOrNull()?.id) {
+        if (tab != VodTab.Search && items.isNotEmpty()) runCatching { gridFocus.requestFocus() }
+    }
 
     LaunchedEffect(tab) {
         if (tab != VodTab.Search) {
@@ -327,12 +342,10 @@ private fun BrowseView(client: JellyfinClient, tab: VodTab, onSelect: (VodItem) 
 
     Column(Modifier.fillMaxSize().padding(horizontal = 16.dp, vertical = 8.dp)) {
         if (tab == VodTab.Search) {
-            OutlinedTextField(
+            TvSearchField(
                 value = query,
                 onValueChange = { query = it },
-                singleLine = true,
-                label = { Text("Search movies and shows") },
-                modifier = Modifier.fillMaxWidth()
+                label = "Search movies and shows"
             )
             Spacer(Modifier.height(8.dp))
         } else if (genres.isNotEmpty()) {
@@ -360,8 +373,11 @@ private fun BrowseView(client: JellyfinClient, tab: VodTab, onSelect: (VodItem) 
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                items(items, key = { it.id }) { item ->
-                    PosterCard(item) { onSelect(item) }
+                itemsIndexed(items, key = { _, item -> item.id }) { idx, item ->
+                    PosterCard(
+                        item = item,
+                        modifier = if (idx == 0) Modifier.focusRequester(gridFocus) else Modifier
+                    ) { onSelect(item) }
                 }
             }
         }
@@ -594,23 +610,31 @@ private fun EpisodeRow(ep: VodItem, onPlay: () -> Unit, onStartOver: () -> Unit)
 // ---- Shared poster views ----
 
 @Composable
-private fun PosterRow(title: String, list: List<VodItem>, onSelect: (VodItem) -> Unit) {
+private fun PosterRow(
+    title: String,
+    list: List<VodItem>,
+    onSelect: (VodItem) -> Unit,
+    focus: FocusRequester? = null
+) {
     Column {
         Text(title, color = CableColors.Led, fontWeight = FontWeight.Bold, fontSize = 20.sp)
         Spacer(Modifier.height(8.dp))
         LazyRow(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-            items(list, key = { it.id }) { item ->
-                PosterCard(item) { onSelect(item) }
+            itemsIndexed(list, key = { _, item -> item.id }) { idx, item ->
+                PosterCard(
+                    item = item,
+                    modifier = if (idx == 0 && focus != null) Modifier.focusRequester(focus) else Modifier
+                ) { onSelect(item) }
             }
         }
     }
 }
 
 @Composable
-private fun PosterCard(item: VodItem, onClick: () -> Unit) {
+private fun PosterCard(item: VodItem, modifier: Modifier = Modifier, onClick: () -> Unit) {
     var focused by remember { mutableStateOf(false) }
     Column(
-        Modifier
+        modifier
             .width(140.dp)
             .onFocusChanged { focused = it.isFocused }
             .border(3.dp, if (focused) CableColors.Selected else Color.Transparent)

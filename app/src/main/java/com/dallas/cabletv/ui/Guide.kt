@@ -22,6 +22,7 @@ import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -37,14 +38,18 @@ import com.dallas.cabletv.data.LiveChannel
 import com.dallas.cabletv.data.Program
 import kotlinx.coroutines.delay
 
-/** The guide shows three hours at a time, like the grid on the cable box. */
-private const val WINDOW_MS = 3L * 60 * 60 * 1000
-private const val WINDOW_MIN = 180f
 private const val ROW_HEIGHT_DP = 52
-private val CHANNEL_COL = 210.dp
+private const val HOUR_MS = 60 * 60 * 1000L
 
-/** One stretch of a row: either a program or a gap with no listing. */
-private class Segment(val program: Program?, val minutes: Float)
+/**
+ * One stretch of a row: a program, or a gap with no listing. [start] and [end] are the
+ * visible times. [key] identifies the segment when it is selected: a program's real start,
+ * or the visible start of a gap.
+ */
+private class Segment(val start: Long, val end: Long, val program: Program?) {
+    val key: Long get() = program?.start ?: start
+    val minutes: Float get() = (end - start) / 60_000f
+}
 
 private fun segmentsFor(programs: List<Program>, from: Long, to: Long): List<Segment> {
     val out = mutableListOf<Segment>()
@@ -52,14 +57,14 @@ private fun segmentsFor(programs: List<Program>, from: Long, to: Long): List<Seg
     for (p in programs) {
         if (p.end <= from || p.start >= to) continue
         val s = maxOf(p.start, cursor)
-        if (s > cursor) out += Segment(null, (s - cursor) / 60_000f)
+        if (s > cursor) out += Segment(cursor, s, null)
         val e = minOf(p.end, to)
         if (e > s) {
-            out += Segment(p, (e - s) / 60_000f)
+            out += Segment(s, e, p)
             cursor = e
         }
     }
-    if (cursor < to) out += Segment(null, (to - cursor) / 60_000f)
+    if (cursor < to) out += Segment(cursor, to, null)
     return out
 }
 
@@ -71,6 +76,12 @@ fun GuideScreen(vm: CableViewModel, onWatch: (LiveChannel) -> Unit, onLive: () -
     val playback = vm.playback
     val epg = vm.epg
 
+    // Phones get a shorter window and a narrower channel column, so half-hour cells stay usable.
+    val narrow = LocalConfiguration.current.screenWidthDp < 720
+    val windowMs = if (narrow) 90 * 60_000L else 180 * 60_000L
+    val windowMin = windowMs / 60_000f
+    val channelCol = if (narrow) 104.dp else 210.dp
+
     var nowMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
     LaunchedEffect(Unit) {
         while (true) {
@@ -80,7 +91,7 @@ fun GuideScreen(vm: CableViewModel, onWatch: (LiveChannel) -> Unit, onLive: () -
     }
 
     var windowStart by remember { mutableLongStateOf(ChannelLogic.floorToSlot(nowMs)) }
-    val windowEnd = windowStart + WINDOW_MS
+    val windowEnd = windowStart + windowMs
     var selChannelId by remember { mutableStateOf<String?>(null) }
     var selStart by remember { mutableLongStateOf(0L) }
     val listState = rememberLazyListState()
@@ -92,72 +103,73 @@ fun GuideScreen(vm: CableViewModel, onWatch: (LiveChannel) -> Unit, onLive: () -
         selChannel?.let { ch -> epg.programsFor(ch).firstOrNull { it.start == selStart } }
     }
 
-    /** Puts the cursor on a program, moving the three-hour window if needed. */
-    fun selectProgram(ch: LiveChannel, p: Program) {
+    fun segmentsIn(ch: LiveChannel, from: Long, to: Long): List<Segment> =
+        segmentsFor(epg.programsFor(ch), from, to)
+
+    /** Selects whatever is on screen at [time] for [ch]: a program, or a gap if nothing is listed. */
+    fun selectAt(ch: LiveChannel, time: Long) {
+        val segs = segmentsIn(ch, windowStart, windowEnd)
+        val seg = segs.firstOrNull { time >= it.start && time < it.end }
+            ?: segs.firstOrNull { it.end > time }
+            ?: segs.firstOrNull()
         selChannelId = ch.id
-        selStart = p.start
-        if (p.end <= windowStart || p.start >= windowEnd) {
-            windowStart = ChannelLogic.floorToSlot(p.start)
-        }
+        selStart = seg?.key ?: time
     }
 
-    fun selectNear(ch: LiveChannel, timeMs: Long) {
-        val progs = epg.programsFor(ch)
-        val p = progs.firstOrNull { it.contains(timeMs) }
-            ?: progs.firstOrNull { it.start >= timeMs }
-            ?: progs.lastOrNull()
-        if (p != null) selectProgram(ch, p) else selChannelId = ch.id
+    /** Clamps a window start between an hour before now and the end of the guide's listings. */
+    fun shiftedStart(candidate: Long): Long {
+        val earliest = ChannelLogic.floorToSlot(nowMs - HOUR_MS)
+        val latest = ChannelLogic.floorToSlot(nowMs + EpgRepository.LOOKAHEAD_MS - windowMs)
+        return ChannelLogic.floorToSlot(candidate).coerceIn(earliest, maxOf(earliest, latest))
     }
 
     fun moveRow(delta: Int) {
         if (channels.isEmpty()) return
-        // Keep the same time on the new row. A program that started before the window uses the window start.
-        val reference = maxOf(selStart, windowStart).takeIf { selStart > 0 } ?: nowMs
-        selectNear(channels[ChannelLogic.step(selIndex, delta, channels.size)], reference)
+        val next = channels[ChannelLogic.step(selIndex, delta, channels.size)]
+        selectAt(next, selStart.coerceIn(windowStart, windowEnd - 1))
     }
 
-    fun moveProgram(dir: Int) {
+    /** Moves to the next or previous program or gap on the same row, moving the window when it runs out. */
+    fun moveSegment(dir: Int) {
         val ch = selChannel ?: return
-        val progs = epg.programsFor(ch)
-        val cur = selProgram
-        if (cur == null) {
-            selectNear(ch, nowMs)
+        val segs = segmentsIn(ch, windowStart, windowEnd)
+        val idx = segs.indexOfFirst { it.key == selStart }
+        if (idx < 0) {
+            selectAt(ch, windowStart)
             return
         }
-        val target = if (dir > 0) progs.firstOrNull { it.start >= cur.end }
-        else progs.lastOrNull { it.end <= cur.start }
-        target?.let { selectProgram(ch, it) }
+        segs.getOrNull(idx + dir)?.let {
+            selStart = it.key
+            return
+        }
+        val newStart = shiftedStart(windowStart + dir * windowMs)
+        if (newStart == windowStart) return
+        windowStart = newStart
+        val next = segmentsIn(ch, newStart, newStart + windowMs)
+        selStart = (if (dir > 0) next.first() else next.last()).key
     }
 
     fun shiftWindow(deltaMs: Long) {
-        // Stay between an hour before now and the end of the guide's listings.
-        val earliest = ChannelLogic.floorToSlot(nowMs - 60 * 60 * 1000L)
-        val latest = ChannelLogic.floorToSlot(nowMs + EpgRepository.LOOKAHEAD_MS - WINDOW_MS)
-        windowStart = ChannelLogic.floorToSlot(windowStart + deltaMs).coerceIn(earliest, maxOf(earliest, latest))
+        windowStart = shiftedStart(windowStart + deltaMs)
     }
 
     fun jumpToNow() {
         windowStart = ChannelLogic.floorToSlot(nowMs)
-        selChannel?.let { selectNear(it, nowMs) }
+        selChannel?.let { selectAt(it, nowMs) }
     }
 
     // Start with the playing channel, or the first channel, once data arrives.
     LaunchedEffect(channels, guideVersion) {
         if (channels.isNotEmpty() && channels.none { it.id == selChannelId }) {
             val start = playback.liveChannel ?: channels.first()
-            selectNear(start, nowMs)
+            selectAt(start, nowMs)
         }
     }
 
-    // Keep the selected program on screen when the window moves.
+    // Keep the selection on screen when the window moves.
     LaunchedEffect(windowStart) {
         val ch = selChannel ?: return@LaunchedEffect
-        val visible = selProgram?.let { it.end > windowStart && it.start < windowEnd } ?: false
-        if (!visible) {
-            val p = epg.programsFor(ch).firstOrNull { it.contains(windowStart) }
-                ?: epg.programsFor(ch).firstOrNull { it.start >= windowStart }
-            p?.let { selStart = it.start }
-        }
+        if (selStart < windowStart || selStart >= windowEnd) selectAt(ch, windowStart)
     }
 
     // Scroll only when the selected row has left the screen, so moving does not jump the list.
@@ -186,14 +198,14 @@ fun GuideScreen(vm: CableViewModel, onWatch: (LiveChannel) -> Unit, onLive: () -
                 when (ev.nativeKeyEvent.keyCode) {
                     KeyEvent.KEYCODE_DPAD_UP -> { moveRow(-1); true }
                     KeyEvent.KEYCODE_DPAD_DOWN -> { moveRow(1); true }
-                    KeyEvent.KEYCODE_DPAD_RIGHT -> { moveProgram(1); true }
-                    KeyEvent.KEYCODE_DPAD_LEFT -> { moveProgram(-1); true }
+                    KeyEvent.KEYCODE_DPAD_RIGHT -> { moveSegment(1); true }
+                    KeyEvent.KEYCODE_DPAD_LEFT -> { moveSegment(-1); true }
                     KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
                         selChannel?.let(onWatch)
                         true
                     }
-                    KeyEvent.KEYCODE_PAGE_UP, KeyEvent.KEYCODE_MEDIA_REWIND -> { shiftWindow(-WINDOW_MS); true }
-                    KeyEvent.KEYCODE_PAGE_DOWN, KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> { shiftWindow(WINDOW_MS); true }
+                    KeyEvent.KEYCODE_PAGE_UP, KeyEvent.KEYCODE_MEDIA_REWIND -> { shiftWindow(-windowMs); true }
+                    KeyEvent.KEYCODE_PAGE_DOWN, KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> { shiftWindow(windowMs); true }
                     KeyEvent.KEYCODE_PROG_BLUE -> { jumpToNow(); true }
                     KeyEvent.KEYCODE_PROG_GREEN -> { vm.reloadGuide(force = true); true }
                     KeyEvent.KEYCODE_GUIDE -> { onLive(); true }
@@ -208,11 +220,16 @@ fun GuideScreen(vm: CableViewModel, onWatch: (LiveChannel) -> Unit, onLive: () -
         )
 
         BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
-            val pxPerMin = (maxWidth - CHANNEL_COL).value / WINDOW_MIN
+            val pxPerMin = (maxWidth - channelCol).value / windowMin
             fun minutesToDp(minutes: Float): Dp = (minutes * pxPerMin).dp
 
             Column(Modifier.fillMaxSize()) {
-                TimeHeader(windowStart = windowStart, slotWidth = minutesToDp(30f))
+                TimeHeader(
+                    windowStart = windowStart,
+                    windowMs = windowMs,
+                    channelCol = channelCol,
+                    slotWidth = minutesToDp(30f)
+                )
 
                 if (channels.isEmpty()) {
                     CenterMessage(guideStatus ?: "NO CHANNELS LOADED.")
@@ -226,15 +243,15 @@ fun GuideScreen(vm: CableViewModel, onWatch: (LiveChannel) -> Unit, onLive: () -
                                 guideVersion = guideVersion,
                                 windowStart = windowStart,
                                 windowEnd = windowEnd,
+                                channelCol = channelCol,
                                 selectedStart = if (ch.id == selChannelId) selStart else null,
                                 minutesToDp = ::minutesToDp,
-                                onCell = { program ->
-                                    if (program == null) {
-                                        selectNear(ch, windowStart)
-                                    } else if (ch.id == selChannelId && program.start == selStart) {
+                                onCell = { key, program ->
+                                    if (ch.id == selChannelId && key == selStart) {
                                         onWatch(ch)
                                     } else {
-                                        selectProgram(ch, program)
+                                        selChannelId = ch.id
+                                        selStart = key
                                     }
                                 }
                             )
@@ -245,7 +262,7 @@ fun GuideScreen(vm: CableViewModel, onWatch: (LiveChannel) -> Unit, onLive: () -
 
             // A thin marker for the current time.
             if (nowMs in windowStart until windowEnd) {
-                val nowX = CHANNEL_COL + minutesToDp(((nowMs - windowStart) / 60_000f))
+                val nowX = channelCol + minutesToDp((nowMs - windowStart) / 60_000f)
                 Box(
                     Modifier
                         .offset(x = nowX)
@@ -271,7 +288,7 @@ fun GuideScreen(vm: CableViewModel, onWatch: (LiveChannel) -> Unit, onLive: () -
         LegendBar {
             KeyLegend("OK", "WATCH", CableColors.Selected)
             KeyLegend("LEFT RIGHT", "PROGRAM", CableColors.Selected)
-            KeyLegend("PG UP/DN", "3 HOURS", CableColors.TimeBar)
+            KeyLegend("PG UP/DN", "MORE TIME", CableColors.TimeBar)
             KeyLegend("BLUE", "NOW", CableColors.TimeBar)
             KeyLegend("GREEN", "REFRESH", CableColors.Good)
         }
@@ -400,7 +417,7 @@ private fun InfoAndPreview(channel: LiveChannel?, program: Program?, playback: c
 }
 
 @Composable
-private fun TimeHeader(windowStart: Long, slotWidth: Dp) {
+private fun TimeHeader(windowStart: Long, windowMs: Long, channelCol: Dp, slotWidth: Dp) {
     Row(
         Modifier
             .fillMaxWidth()
@@ -410,14 +427,15 @@ private fun TimeHeader(windowStart: Long, slotWidth: Dp) {
     ) {
         Box(
             Modifier
-                .width(CHANNEL_COL)
+                .width(channelCol)
                 .fillMaxHeight()
                 .background(CableColors.PanelDeep),
             contentAlignment = Alignment.Center
         ) {
             Text(formatDay(windowStart), color = CableColors.Text, fontWeight = FontWeight.Bold, fontSize = 15.sp)
         }
-        for (i in 0 until 6) {
+        val slots = (windowMs / ChannelLogic.SLOT_MS).toInt()
+        for (i in 0 until slots) {
             val slot = windowStart + i * ChannelLogic.SLOT_MS
             Box(
                 Modifier
@@ -441,14 +459,16 @@ private fun GuideRow(
     guideVersion: Int,
     windowStart: Long,
     windowEnd: Long,
+    channelCol: Dp,
     selectedStart: Long?,
     minutesToDp: (Float) -> Dp,
-    onCell: (Program?) -> Unit
+    onCell: (key: Long, program: Program?) -> Unit
 ) {
-    val segments = remember(channel.id, guideVersion, windowStart) {
+    val segments = remember(channel.id, guideVersion, windowStart, windowEnd) {
         segmentsFor(epg.programsFor(channel), windowStart, windowEnd)
     }
     val rowBg = if (rowIndex % 2 == 0) CableColors.Cell else CableColors.CellAlt
+    val rowSelected = selectedStart != null
 
     Row(
         Modifier
@@ -458,9 +478,9 @@ private fun GuideRow(
         // The channel cell lights up for the selected row, even when the cursor sits on a gap with no listing.
         Row(
             Modifier
-                .width(CHANNEL_COL)
+                .width(channelCol)
                 .fillMaxHeight()
-                .background(if (selectedStart != null) CableColors.Highlight else CableColors.PanelDeep)
+                .background(if (rowSelected) CableColors.Highlight else CableColors.PanelDeep)
                 .padding(start = 6.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
@@ -469,7 +489,8 @@ private fun GuideRow(
                 color = CableColors.Text,
                 fontWeight = FontWeight.Bold,
                 fontSize = 17.sp,
-                modifier = Modifier.width(54.dp)
+                maxLines = 1,
+                modifier = Modifier.width(if (channelCol < 150.dp) 40.dp else 54.dp)
             )
             Text(
                 channel.name.uppercase(),
@@ -482,7 +503,7 @@ private fun GuideRow(
         }
         segments.forEach { seg ->
             val p = seg.program
-            val selected = p != null && selectedStart != null && p.start == selectedStart
+            val selected = selectedStart != null && seg.key == selectedStart
             Box(
                 Modifier
                     .width(minutesToDp(seg.minutes))
@@ -494,18 +515,25 @@ private fun GuideRow(
                             else -> rowBg
                         }
                     )
-                    .clickable { onCell(p) }
+                    .clickable { onCell(seg.key, p) }
                     .padding(horizontal = 8.dp),
                 contentAlignment = Alignment.CenterStart
             ) {
-                if (p != null) {
-                    Text(
+                when {
+                    p != null -> Text(
                         p.title,
                         color = if (selected) CableColors.OnSelected else CableColors.Text,
                         fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
                         fontSize = 15.sp,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
+                    )
+                    selected -> Text(
+                        "NO INFORMATION",
+                        color = CableColors.OnSelected,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 14.sp,
+                        maxLines = 1
                     )
                 }
             }

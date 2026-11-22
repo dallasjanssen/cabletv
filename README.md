@@ -61,11 +61,11 @@ In the guide, use the D-pad to move, OK to watch, and the colored keys listed at
 ## Build and install (Android Studio)
 
 1. Install Android Studio (Koala or newer).
-2. Open the `CableTV` folder. Let Gradle sync finish. Accept any prompt to create the Gradle wrapper.
+2. Open the `CableTV` folder. Let Gradle sync finish. The Gradle wrapper is included, so no extra setup is needed.
 3. Phone: pick your phone at the top and press Run.
 4. Android TV: build the APK with **Build > Build Bundle(s) / APK(s) > Build APK(s)**. The file is at `app/build/outputs/apk/debug/app-debug.apk`.
 
-To run the logic tests (parsers and channel logic), run **Build > Test** or `./gradlew test`.
+To run the logic tests (parsers and channel logic), run **Build > Test** or `./gradlew test` (with Java 17 or newer).
 
 ### Installing on the TV
 
@@ -119,7 +119,9 @@ app/src/main/java/com/dallas/cabletv/
 ## Known limits
 
 - Live TV reconnects use a short backoff (up to five tries). A channel the provider has taken down will still show NO SIGNAL.
-- The guide shows only what the provider publishes. Some providers publish only a few hours ahead.
+- On phones the guide shows 90 minutes at a time instead of three hours, to keep the cells readable.
+- The guide shows listings up to two days ahead, and only what the provider publishes.
 - M3U-only sources have no guide data unless you give an XMLTV URL in Settings.
 - The preview in the guide shows the channel that is tuned, not the channel under the cursor. Moving the cursor does not change streams, so the provider's connection limit is not used up while browsing.
 - Subtitle and audio menus show the tracks the stream exposes. Some streams expose none.
+- The Jellyfin transcode fallback and the device behavior need a check against a real server and TV. They could not be tested in the development environment.

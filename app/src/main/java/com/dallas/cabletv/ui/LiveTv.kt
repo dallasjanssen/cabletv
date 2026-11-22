@@ -460,12 +460,10 @@ private fun ChannelListPanel(
             }
         }
         Spacer(Modifier.height(8.dp))
-        OutlinedTextField(
+        TvSearchField(
             value = search,
             onValueChange = onSearch,
-            singleLine = true,
-            label = { Text("Search name or number") },
-            modifier = Modifier.fillMaxWidth()
+            label = "Search name or number"
         )
         Spacer(Modifier.height(8.dp))
         if (channels.isEmpty()) {
