@@ -44,10 +44,6 @@ fun OnDemandScreen(settings: Settings) {
                 .fillMaxSize()
                 .padding(horizontal = 48.dp, vertical = 40.dp)
         ) {
-            PageHeader(
-                title = "On demand",
-                subtitle = "Movies and shows from your Jellyfin server"
-            )
             EmptyState(
                 title = "Jellyfin is not connected",
                 body = "Add your server in Settings to browse your library.",
@@ -134,8 +130,7 @@ private fun Library(
             .fillMaxSize()
             .padding(start = 48.dp, end = 48.dp, top = 40.dp)
     ) {
-        PageHeader(title = "On demand", subtitle = "Pick something to watch")
-        Spacer(Modifier.height(32.dp))
+        Spacer(Modifier.height(8.dp))
         when {
             loading -> EmptyState(
                 title = "Loading your library...",

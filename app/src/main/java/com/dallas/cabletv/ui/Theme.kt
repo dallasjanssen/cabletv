@@ -9,17 +9,21 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -30,39 +34,41 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * Design tokens. Dark, low-glare surfaces with one cool accent so the
- * picture is always the brightest thing on screen.
+ * Phosphor palette from the original cable box: deep blue glass, green LED
+ * program text, amber numerals. Amber marks channel numbers and selection,
+ * green marks what is playing and the focus ring.
  */
 object Cable {
-    val Canvas = Color(0xFF0A0C11)
-    val Rail = Color(0xFF0E1117)
-    val Surface = Color(0xFF161B24)
-    val SurfaceHi = Color(0xFF232B3A)
-    val Accent = Color(0xFF5AB8FF)
+    val Canvas = Color(0xFF05070F)
+    val Rail = Color(0xFF0A1024)
+    val Surface = Color(0xFF0C1A36)
+    val SurfaceHi = Color(0xFF14306B)
+    val Accent = Color(0xFFFFB347)
+    val Led = Color(0xFF3DFF8C)
     val Live = Color(0xFFFF4D5E)
-    val Ink = Color(0xFFF3F5F9)
-    val Ink2 = Color(0xFFA7B0C2)
-    val Ink3 = Color(0xFF6B7487)
-    val Track = Color(0xFF2A3242)
+    val Ink = Color(0xFFE8F4FF)
+    val Ink2 = Color(0xFFB8C8E6)
+    val Ink3 = Color(0xFF6A7FA6)
+    val Track = Color(0xFF1A2A4A)
 }
 
-/** Sizes are tuned for a couch: nothing below 16sp. */
+/** Every style is monospace, like a character display. Sizes stay large for the couch. */
 private val CableTypography = Typography(
-    headlineLarge = TextStyle(fontSize = 48.sp, fontWeight = FontWeight.SemiBold, letterSpacing = (-0.5).sp),
-    headlineMedium = TextStyle(fontSize = 36.sp, fontWeight = FontWeight.SemiBold),
-    titleLarge = TextStyle(fontSize = 30.sp, fontWeight = FontWeight.SemiBold),
-    titleMedium = TextStyle(fontSize = 24.sp, fontWeight = FontWeight.Medium),
-    bodyLarge = TextStyle(fontSize = 24.sp, fontWeight = FontWeight.Normal),
-    bodyMedium = TextStyle(fontSize = 20.sp, fontWeight = FontWeight.Normal),
-    labelLarge = TextStyle(fontSize = 20.sp, fontWeight = FontWeight.SemiBold),
-    labelMedium = TextStyle(fontSize = 16.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 1.2.sp)
+    headlineLarge = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 48.sp, fontWeight = FontWeight.Bold),
+    headlineMedium = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 36.sp, fontWeight = FontWeight.Bold),
+    titleLarge = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 30.sp, fontWeight = FontWeight.Bold),
+    titleMedium = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 24.sp, fontWeight = FontWeight.Medium),
+    bodyLarge = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 24.sp, fontWeight = FontWeight.Normal),
+    bodyMedium = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 20.sp, fontWeight = FontWeight.Normal),
+    labelLarge = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 20.sp, fontWeight = FontWeight.Bold),
+    labelMedium = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 16.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.2.sp)
 )
 
 @Composable
 fun CableTheme(content: @Composable () -> Unit) {
     MaterialTheme(
         colorScheme = darkColorScheme(
-            primary = Cable.Accent,
+            primary = Cable.Led,
             onPrimary = Cable.Canvas,
             background = Cable.Canvas,
             onBackground = Cable.Ink,
@@ -77,10 +83,24 @@ fun CableTheme(content: @Composable () -> Unit) {
     )
 }
 
+/** Faint horizontal scan lines, like an old CRT. */
+fun Modifier.scanlines(): Modifier = this.drawWithContent {
+    drawContent()
+    var y = 0f
+    while (y < size.height) {
+        drawLine(
+            color = Color.Black.copy(alpha = 0.18f),
+            start = Offset(0f, y),
+            end = Offset(size.width, y),
+            strokeWidth = 1.5f
+        )
+        y += 4f
+    }
+}
+
 /**
  * The one focus treatment used everywhere. A focused item grows slightly and
- * gets a clear accent ring, so the remote's position is readable from across
- * the room. Works for D-pad, touch and mouse.
+ * gets a green ring, so the remote's position reads from across the room.
  */
 @Composable
 fun FocusSurface(
@@ -96,7 +116,7 @@ fun FocusSurface(
         label = "focusScale"
     )
     val ring by animateColorAsState(
-        targetValue = if (focused) Cable.Accent else Color.Transparent,
+        targetValue = if (focused) Cable.Led else Color.Transparent,
         label = "focusRing"
     )
     Box(
@@ -113,6 +133,36 @@ fun FocusSurface(
     )
 }
 
+/** Top bar for every screen: back on the left, title, then the clock. */
+@Composable
+fun CableHeader(title: String, onBack: (() -> Unit)? = null) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .background(Cable.Surface)
+            .padding(horizontal = 24.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        if (onBack != null) {
+            TextButton(onClick = onBack) {
+                Text(
+                    text = "< BACK",
+                    color = Cable.Accent,
+                    style = MaterialTheme.typography.labelLarge
+                )
+            }
+            Spacer(Modifier.width(16.dp))
+        }
+        Text(
+            text = title,
+            color = Cable.Led,
+            style = MaterialTheme.typography.headlineMedium,
+            modifier = Modifier.weight(1f)
+        )
+        Clock()
+    }
+}
+
 @Composable
 fun Pill(
     text: String,
@@ -125,9 +175,9 @@ fun Pill(
         style = MaterialTheme.typography.labelMedium,
         color = textColor,
         modifier = modifier
-            .clip(RoundedCornerShape(8.dp))
+            .clip(RoundedCornerShape(4.dp))
             .background(color)
-            .padding(horizontal = 12.dp, vertical = 4.dp)
+            .padding(horizontal = 10.dp, vertical = 4.dp)
     )
 }
 
@@ -136,33 +186,14 @@ fun ProgressLine(fraction: Float, modifier: Modifier = Modifier) {
     Box(
         modifier
             .height(6.dp)
-            .clip(RoundedCornerShape(3.dp))
             .background(Cable.Track)
     ) {
         Box(
             Modifier
                 .fillMaxWidth(fraction.coerceIn(0f, 1f))
                 .height(6.dp)
-                .background(Cable.Accent)
+                .background(Cable.Led)
         )
-    }
-}
-
-@Composable
-fun PageHeader(title: String, subtitle: String? = null, modifier: Modifier = Modifier) {
-    Column(modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        Text(
-            text = title,
-            style = MaterialTheme.typography.headlineLarge,
-            color = Cable.Ink
-        )
-        if (subtitle != null) {
-            Text(
-                text = subtitle,
-                style = MaterialTheme.typography.bodyLarge,
-                color = Cable.Ink2
-            )
-        }
     }
 }
 
@@ -176,7 +207,7 @@ fun EmptyState(title: String, body: String? = null, modifier: Modifier = Modifie
         Text(
             text = title,
             style = MaterialTheme.typography.titleLarge,
-            color = Cable.Ink,
+            color = Cable.Accent,
             textAlign = TextAlign.Center
         )
         if (body != null) {
@@ -206,8 +237,8 @@ fun Clock(modifier: Modifier = Modifier) {
     }
     Text(
         text = formatTime(now),
-        style = MaterialTheme.typography.labelLarge,
-        color = Cable.Ink2,
+        style = MaterialTheme.typography.titleMedium,
+        color = Cable.Accent,
         modifier = modifier
     )
 }

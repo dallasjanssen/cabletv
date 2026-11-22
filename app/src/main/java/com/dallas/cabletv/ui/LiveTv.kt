@@ -264,7 +264,7 @@ private fun ChannelBanner(channel: LiveChannel, nn: NowNext?) {
                         Text(
                             text = now.title,
                             style = MaterialTheme.typography.titleLarge,
-                            color = Cable.Ink,
+                            color = Cable.Led,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
@@ -360,15 +360,16 @@ fun GuideScreen(
             .fillMaxSize()
             .padding(horizontal = 48.dp, vertical = 40.dp)
     ) {
-        PageHeader(
-            title = "Program guide",
-            subtitle = if (epg == null) {
-                "Connect a live source to see what is on"
+        Text(
+            text = if (epg == null) {
+                "Connect a live source to see what is on."
             } else {
-                "What is on now, and what is next"
-            }
+                "What is on now, and what is next."
+            },
+            style = MaterialTheme.typography.bodyLarge,
+            color = Cable.Ink2
         )
-        Spacer(Modifier.height(28.dp))
+        Spacer(Modifier.height(20.dp))
 
         if (channels.isEmpty()) {
             EmptyState(

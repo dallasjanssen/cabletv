@@ -1,9 +1,10 @@
 package com.dallas.cabletv.ui
 
+import android.view.KeyEvent
 import androidx.activity.compose.BackHandler
-import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.border
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -21,10 +22,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.focus.onFocusChanged
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -40,17 +43,16 @@ import com.dallas.cabletv.data.XtreamClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.util.Calendar
 
 enum class Screen { Home, LiveTv, Guide, OnDemand, Settings }
 
-private val navItems = listOf(
-    Screen.Home to "Home",
-    Screen.LiveTv to "Live TV",
-    Screen.Guide to "Guide",
-    Screen.OnDemand to "On Demand",
-    Screen.Settings to "Settings"
-)
+private fun titleOf(screen: Screen): String = when (screen) {
+    Screen.Home -> "CABLE"
+    Screen.LiveTv -> "LIVE TV"
+    Screen.Guide -> "PROGRAM GUIDE"
+    Screen.OnDemand -> "ON DEMAND"
+    Screen.Settings -> "SETTINGS"
+}
 
 @Composable
 fun CableApp(store: SettingsStore) {
@@ -86,9 +88,15 @@ fun CableApp(store: SettingsStore) {
     val goHome: () -> Unit = { screen = Screen.Home }
     val navigate: (Screen) -> Unit = { screen = it }
 
-    Box(Modifier.fillMaxSize().background(Cable.Canvas)) {
+    Box(Modifier.fillMaxSize().background(Cable.Canvas).scanlines()) {
         when (screen) {
-            // Full-bleed playback has no navigation rail.
+            Screen.Home -> HomeMenu(
+                channelCount = channels.size,
+                liveReady = settings.hasLiveSource,
+                jellyfinReady = settings.hasJellyfin,
+                onOpen = navigate
+            )
+            // Full-bleed playback has its own header-free layout.
             Screen.LiveTv -> LiveTvScreen(
                 channels = channels,
                 loading = channelsLoading,
@@ -97,249 +105,173 @@ fun CableApp(store: SettingsStore) {
                 epg = xtream,
                 onExit = goHome
             )
-            else -> AppShell(current = screen, onNavigate = navigate) {
-                when (screen) {
-                    Screen.Home -> HomeScreen(
-                        channelCount = channels.size,
-                        liveReady = settings.hasLiveSource,
-                        jellyfinReady = settings.hasJellyfin,
-                        onOpen = navigate
-                    )
-                    Screen.Guide -> GuideScreen(
-                        channels = channels,
-                        epg = xtream,
-                        onWatch = { idx ->
-                            tuneIndex = idx
-                            screen = Screen.LiveTv
-                        }
-                    )
-                    Screen.OnDemand -> OnDemandScreen(settings = settings)
-                    Screen.Settings -> SettingsScreen(
-                        current = settings,
-                        onSave = { updated ->
-                            store.save(updated)
-                            settings = updated
-                            screen = Screen.Home
-                        },
-                        onExit = goHome
-                    )
-                    Screen.LiveTv -> Unit
+            else -> Column(Modifier.fillMaxSize()) {
+                CableHeader(title = titleOf(screen), onBack = goHome)
+                Box(Modifier.weight(1f).fillMaxWidth()) {
+                    when (screen) {
+                        Screen.Guide -> GuideScreen(
+                            channels = channels,
+                            epg = xtream,
+                            onWatch = { idx ->
+                                tuneIndex = idx
+                                screen = Screen.LiveTv
+                            }
+                        )
+                        Screen.OnDemand -> OnDemandScreen(settings = settings)
+                        Screen.Settings -> SettingsScreen(
+                            current = settings,
+                            onSave = { updated ->
+                                store.save(updated)
+                                settings = updated
+                                screen = Screen.Home
+                            },
+                            onExit = goHome
+                        )
+                        else -> Unit
+                    }
                 }
             }
         }
     }
 }
 
-/** Left navigation rail plus the page content. */
+/**
+ * The home screen is a numbered menu, like the front panel of the original
+ * box. Keys 1 to 4 on the remote open the matching section.
+ */
 @Composable
-fun AppShell(current: Screen, onNavigate: (Screen) -> Unit, content: @Composable () -> Unit) {
-    Row(Modifier.fillMaxSize()) {
-        NavRail(current = current, onNavigate = onNavigate)
-        Box(Modifier.weight(1f).fillMaxHeight()) {
-            content()
-        }
-    }
-}
-
-@Composable
-private fun NavRail(current: Screen, onNavigate: (Screen) -> Unit) {
-    Column(
-        Modifier
-            .width(248.dp)
-            .fillMaxHeight()
-            .background(Cable.Rail)
-            .padding(horizontal = 20.dp, vertical = 40.dp)
-    ) {
-        Text(
-            text = "Cable",
-            style = MaterialTheme.typography.headlineMedium,
-            color = Cable.Ink,
-            modifier = Modifier.padding(start = 12.dp, bottom = 32.dp)
-        )
-        navItems.forEach { (screen, label) ->
-            NavItem(label = label, selected = screen == current) { onNavigate(screen) }
-        }
-        Spacer(Modifier.weight(1f))
-        Clock(Modifier.padding(start = 12.dp))
-    }
-}
-
-@Composable
-private fun NavItem(label: String, selected: Boolean, onClick: () -> Unit) {
-    var focused by remember { mutableStateOf(false) }
-    val bg by animateColorAsState(
-        targetValue = if (focused) Cable.SurfaceHi else Color.Transparent,
-        label = "navBg"
-    )
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(12.dp))
-            .background(bg)
-            .onFocusChanged { focused = it.isFocused }
-            .clickable(onClick = onClick)
-            .padding(horizontal = 16.dp, vertical = 14.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Box(
-            Modifier
-                .size(width = 4.dp, height = 24.dp)
-                .clip(RoundedCornerShape(2.dp))
-                .background(if (selected) Cable.Accent else Color.Transparent)
-        )
-        Spacer(Modifier.width(18.dp))
-        Text(
-            text = label,
-            style = MaterialTheme.typography.titleMedium,
-            color = if (selected || focused) Cable.Ink else Cable.Ink2
-        )
-    }
-}
-
-@Composable
-private fun HomeScreen(
+private fun HomeMenu(
     channelCount: Int,
     liveReady: Boolean,
     jellyfinReady: Boolean,
     onOpen: (Screen) -> Unit
 ) {
-    val heroFocus = remember { FocusRequester() }
-    LaunchedEffect(Unit) { runCatching { heroFocus.requestFocus() } }
-    val greeting = remember { greetingNow() }
+    val firstButton = remember { FocusRequester() }
+    LaunchedEffect(Unit) { runCatching { firstButton.requestFocus() } }
+
+    val entries = listOf(
+        Screen.LiveTv to (if (liveReady) "$channelCount CHANNELS" else "NOT SET UP"),
+        Screen.Guide to (if (liveReady) "NOW AND NEXT" else "NEEDS A LIVE SOURCE"),
+        Screen.OnDemand to (if (jellyfinReady) "CONNECTED" else "NOT SET UP"),
+        Screen.Settings to "SOURCES AND LOGIN"
+    )
+    val labels = listOf("LIVE TV", "PROGRAM GUIDE", "ON DEMAND", "SETTINGS")
 
     Column(
         Modifier
             .fillMaxSize()
+            .focusable()
+            .onPreviewKeyEvent { ev ->
+                if (ev.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                when (val code = ev.nativeKeyEvent.keyCode) {
+                    in KeyEvent.KEYCODE_1..KeyEvent.KEYCODE_4 -> {
+                        onOpen(entries[code - KeyEvent.KEYCODE_1].first)
+                        true
+                    }
+                    else -> false
+                }
+            }
             .padding(horizontal = 48.dp, vertical = 40.dp),
-        verticalArrangement = Arrangement.spacedBy(32.dp)
+        verticalArrangement = Arrangement.spacedBy(24.dp)
     ) {
-        PageHeader(
-            title = greeting,
-            subtitle = "Pick up where you left off, or start something new."
-        )
-        Row(
-            Modifier.fillMaxWidth().weight(1f),
-            horizontalArrangement = Arrangement.spacedBy(24.dp)
-        ) {
-            LiveHeroTile(
-                channelCount = channelCount,
-                ready = liveReady,
-                modifier = Modifier
-                    .weight(1.6f)
-                    .fillMaxHeight()
-                    .focusRequester(heroFocus),
-                onClick = { onOpen(if (liveReady) Screen.LiveTv else Screen.Settings) }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text(
+                text = "CABLE TV",
+                style = MaterialTheme.typography.headlineLarge,
+                color = Cable.Led
             )
-            Column(
-                Modifier.weight(1f).fillMaxHeight(),
-                verticalArrangement = Arrangement.spacedBy(24.dp)
-            ) {
-                InfoTile(
-                    title = "Program guide",
-                    body = if (liveReady) "Now and next on every channel" else "Needs a live source",
-                    modifier = Modifier.weight(1f).fillMaxWidth()
-                ) { onOpen(Screen.Guide) }
-                InfoTile(
-                    title = "On demand",
-                    body = if (jellyfinReady) "Movies and shows from Jellyfin" else "Not connected yet",
-                    modifier = Modifier.weight(1f).fillMaxWidth()
-                ) { onOpen(Screen.OnDemand) }
-            }
+            Text(
+                text = "PRESS 1-4",
+                style = MaterialTheme.typography.labelMedium,
+                color = Cable.Ink3,
+                modifier = Modifier.padding(top = 14.dp)
+            )
         }
-    }
-}
 
-@Composable
-private fun LiveHeroTile(
-    channelCount: Int,
-    ready: Boolean,
-    modifier: Modifier,
-    onClick: () -> Unit
-) {
-    FocusSurface(
-        onClick = onClick,
-        modifier = modifier,
-        shape = RoundedCornerShape(24.dp),
-        focusScale = 1.02f
-    ) {
-        Box(
-            Modifier
-                .fillMaxSize()
-                .background(
-                    Brush.linearGradient(listOf(Color(0xFF1D4470), Color(0xFF0D1522)))
-                )
-                .padding(40.dp)
+        Column(
+            Modifier.weight(1f).fillMaxWidth(),
+            verticalArrangement = Arrangement.spacedBy(24.dp)
         ) {
-            Column(
-                Modifier.align(Alignment.BottomStart),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                Pill(text = "LIVE TV", color = Cable.Live)
-                Text(
-                    text = "Live TV",
-                    style = MaterialTheme.typography.headlineLarge,
-                    color = Cable.Ink
-                )
-                Text(
-                    text = if (ready) {
-                        "$channelCount channels ready"
-                    } else {
-                        "Add a live source in Settings to start watching"
-                    },
-                    style = MaterialTheme.typography.bodyLarge,
-                    color = Cable.Ink2
-                )
-                Spacer(Modifier.height(8.dp))
-                Pill(
-                    text = if (ready) "START WATCHING" else "OPEN SETTINGS",
-                    color = Cable.Accent,
-                    textColor = Cable.Canvas
-                )
+            Row(Modifier.weight(1f).fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(24.dp)) {
+                MenuButton(
+                    number = 1,
+                    label = labels[0],
+                    status = entries[0].second,
+                    modifier = Modifier.weight(1f).fillMaxHeight().focusRequester(firstButton)
+                ) { onOpen(entries[0].first) }
+                MenuButton(
+                    number = 2,
+                    label = labels[1],
+                    status = entries[1].second,
+                    modifier = Modifier.weight(1f).fillMaxHeight()
+                ) { onOpen(entries[1].first) }
+            }
+            Row(Modifier.weight(1f).fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(24.dp)) {
+                MenuButton(
+                    number = 3,
+                    label = labels[2],
+                    status = entries[2].second,
+                    modifier = Modifier.weight(1f).fillMaxHeight()
+                ) { onOpen(entries[2].first) }
+                MenuButton(
+                    number = 4,
+                    label = labels[3],
+                    status = entries[3].second,
+                    modifier = Modifier.weight(1f).fillMaxHeight()
+                ) { onOpen(entries[3].first) }
             }
         }
     }
 }
 
 @Composable
-private fun InfoTile(
-    title: String,
-    body: String,
+private fun MenuButton(
+    number: Int,
+    label: String,
+    status: String,
     modifier: Modifier,
     onClick: () -> Unit
 ) {
+    val shape = RoundedCornerShape(10.dp)
     FocusSurface(
         onClick = onClick,
         modifier = modifier,
-        shape = RoundedCornerShape(24.dp)
+        shape = shape,
+        focusScale = 1.03f
     ) {
         Column(
             Modifier
                 .fillMaxSize()
                 .background(Cable.Surface)
+                .border(2.dp, Cable.Accent.copy(alpha = 0.45f), shape)
                 .padding(28.dp),
-            verticalArrangement = Arrangement.Bottom
+            verticalArrangement = Arrangement.SpaceBetween
         ) {
             Text(
-                text = title,
-                style = MaterialTheme.typography.titleLarge,
-                color = Cable.Ink
+                text = number.toString(),
+                style = TextStyle(
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 72.sp
+                ),
+                color = Cable.Accent
             )
-            Spacer(Modifier.height(6.dp))
-            Text(
-                text = body,
-                style = MaterialTheme.typography.bodyMedium,
-                color = Cable.Ink2
-            )
+            Column {
+                Text(
+                    text = label,
+                    style = MaterialTheme.typography.titleLarge,
+                    color = Cable.Led
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    text = status,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Cable.Ink2
+                )
+            }
         }
     }
 }
-
-private fun greetingNow(): String =
-    when (Calendar.getInstance().get(Calendar.HOUR_OF_DAY)) {
-        in 5..11 -> "Good morning"
-        in 12..17 -> "Good afternoon"
-        else -> "Good evening"
-    }
 
 @Composable
 private fun SettingsScreen(current: Settings, onSave: (Settings) -> Unit, onExit: () -> Unit) {
@@ -358,16 +290,17 @@ private fun SettingsScreen(current: Settings, onSave: (Settings) -> Unit, onExit
         Modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
-            .padding(horizontal = 48.dp, vertical = 40.dp),
+            .padding(horizontal = 48.dp, vertical = 32.dp),
         verticalArrangement = Arrangement.spacedBy(20.dp)
     ) {
-        PageHeader(
-            title = "Settings",
-            subtitle = "Connect your sources. Credentials are encrypted on this device."
+        Text(
+            text = "Credentials are encrypted on this device.",
+            style = MaterialTheme.typography.bodyLarge,
+            color = Cable.Ink2
         )
 
         SettingsCard(
-            title = "Live TV",
+            title = "LIVE TV",
             subtitle = "Xtream Codes login. Used first when it is filled in."
         ) {
             CableField("Server URL", xs) { xs = it }
@@ -376,14 +309,14 @@ private fun SettingsScreen(current: Settings, onSave: (Settings) -> Unit, onExit
         }
 
         SettingsCard(
-            title = "Live TV playlist",
+            title = "LIVE TV PLAYLIST",
             subtitle = "M3U URL. Used only when no Xtream login is set."
         ) {
             CableField("Playlist URL", m3u) { m3u = it }
         }
 
         SettingsCard(
-            title = "On demand",
+            title = "ON DEMAND",
             subtitle = "Jellyfin server. The password signs you in and is not stored."
         ) {
             CableField("Server URL", js) { js = it }
@@ -438,9 +371,9 @@ private fun SettingsScreen(current: Settings, onSave: (Settings) -> Unit, onExit
                             .onFailure { message = "Save failed: ${it.message}" }
                     }
                 }
-            ) { Text("Save") }
+            ) { Text("SAVE") }
 
-            OutlinedButton(onClick = onExit) { Text("Cancel") }
+            OutlinedButton(onClick = onExit) { Text("CANCEL") }
         }
     }
 }
@@ -454,15 +387,16 @@ private fun SettingsCard(
     Column(
         Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(20.dp))
+            .clip(RoundedCornerShape(8.dp))
             .background(Cable.Surface)
-            .padding(28.dp),
+            .border(2.dp, Cable.Accent.copy(alpha = 0.35f), RoundedCornerShape(8.dp))
+            .padding(24.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
         Text(
             text = title,
             style = MaterialTheme.typography.titleLarge,
-            color = Cable.Ink
+            color = Cable.Accent
         )
         Text(
             text = subtitle,
@@ -479,9 +413,9 @@ private fun StatusLine(text: String) {
     Text(
         text = text,
         style = MaterialTheme.typography.bodyMedium,
-        color = Cable.Accent,
+        color = Cable.Led,
         modifier = Modifier
-            .clip(RoundedCornerShape(12.dp))
+            .clip(RoundedCornerShape(6.dp))
             .background(Cable.SurfaceHi)
             .padding(horizontal = 20.dp, vertical = 14.dp)
     )
@@ -499,13 +433,13 @@ private fun CableField(label: String, value: String, secret: Boolean = false, on
             keyboardType = if (secret) KeyboardType.Password else KeyboardType.Text
         ),
         modifier = Modifier.fillMaxWidth(),
-        textStyle = TextStyle(fontSize = 20.sp, fontWeight = FontWeight.Normal, color = Cable.Ink),
+        textStyle = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 20.sp, color = Cable.Ink),
         colors = OutlinedTextFieldDefaults.colors(
-            focusedBorderColor = Cable.Accent,
+            focusedBorderColor = Cable.Led,
             unfocusedBorderColor = Cable.Track,
-            focusedLabelColor = Cable.Accent,
+            focusedLabelColor = Cable.Led,
             unfocusedLabelColor = Cable.Ink3,
-            cursorColor = Cable.Accent
+            cursorColor = Cable.Led
         )
     )
 }

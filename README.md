@@ -6,7 +6,7 @@ A personal, sideloaded Android and Android TV app that pulls together:
 - **Program guide** from the provider's short EPG
 - **On Demand** from your Jellyfin server
 
-The interface is built for a television across the room: a dark, low-glare theme with one accent colour, large type, and a left navigation rail. The focused item grows and gets a bright ring so you always know where the remote is. Channel changes show a banner with the current and next program, and number-key channel entry works from anywhere in live TV.
+The look is a cable box from the 2000s: phosphor green program text, amber channel numbers, scan lines, and monospace type. The home screen is a numbered menu, and keys 1 to 4 open each section. The focused item grows and gets a green ring so you always know where the remote is. Channel changes show a banner with the current and next program, and number-key channel entry works from anywhere in live TV.
 
 ## Remote and keyboard controls
 
