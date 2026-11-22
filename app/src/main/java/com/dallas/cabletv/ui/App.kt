@@ -96,7 +96,8 @@ fun CableApp(store: SettingsStore) {
                 jellyfinReady = settings.hasJellyfin,
                 onOpen = navigate
             )
-            // Full-bleed playback has its own header-free layout.
+            // Full-bleed screens draw their own header, so playback can hide it.
+            Screen.OnDemand -> OnDemandScreen(settings = settings, onExit = goHome)
             Screen.LiveTv -> LiveTvScreen(
                 channels = channels,
                 loading = channelsLoading,
@@ -117,7 +118,6 @@ fun CableApp(store: SettingsStore) {
                                 screen = Screen.LiveTv
                             }
                         )
-                        Screen.OnDemand -> OnDemandScreen(settings = settings)
                         Screen.Settings -> SettingsScreen(
                             current = settings,
                             onSave = { updated ->

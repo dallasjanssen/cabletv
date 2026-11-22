@@ -35,15 +35,12 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 @Composable
-fun OnDemandScreen(settings: Settings) {
+fun OnDemandScreen(settings: Settings, onExit: () -> Unit) {
     if (settings.hasJellyfin) {
-        JellyfinBrowser(settings)
+        JellyfinBrowser(settings, onExit)
     } else {
-        Column(
-            Modifier
-                .fillMaxSize()
-                .padding(horizontal = 48.dp, vertical = 40.dp)
-        ) {
+        Column(Modifier.fillMaxSize()) {
+            CableHeader(title = "ON DEMAND", onBack = onExit)
             EmptyState(
                 title = "Jellyfin is not connected",
                 body = "Add your server in Settings to browse your library.",
@@ -54,7 +51,7 @@ fun OnDemandScreen(settings: Settings) {
 }
 
 @Composable
-private fun JellyfinBrowser(settings: Settings) {
+private fun JellyfinBrowser(settings: Settings, onExit: () -> Unit) {
     val client = remember(settings) {
         JellyfinClient(settings.jellyfinServer, settings.jellyfinToken, settings.jellyfinUserId)
     }
@@ -87,33 +84,45 @@ private fun JellyfinBrowser(settings: Settings) {
 
     val nowPlaying = playing
     val openSeries = series
+    // Playback fills the whole screen with no header, like live TV.
+    // Every other view keeps the header, and its back button steps out one level.
     when {
         nowPlaying != null -> VodPlayer(nowPlaying.streamUrl)
-        openSeries != null -> SeriesDetail(
-            series = openSeries,
-            episodes = episodes,
-            onPlay = { playing = it },
-            onBack = { series = null }
-        )
-        else -> Library(
-            loading = loading,
-            loadError = loadError,
-            resume = resume,
-            recent = recent,
-            onSelect = { item ->
-                if (item.type == "Series") {
-                    scope.launch {
-                        val eps = withContext(Dispatchers.IO) {
-                            runCatching { client.episodes(item.id) }.getOrDefault(emptyList())
-                        }
-                        episodes = eps
-                        series = item
-                    }
-                } else {
-                    playing = item
-                }
+        openSeries != null -> Column(Modifier.fillMaxSize()) {
+            CableHeader(title = openSeries.name.uppercase(), onBack = { series = null })
+            Box(Modifier.weight(1f).fillMaxWidth()) {
+                SeriesDetail(
+                    series = openSeries,
+                    episodes = episodes,
+                    onPlay = { playing = it },
+                    onBack = { series = null }
+                )
             }
-        )
+        }
+        else -> Column(Modifier.fillMaxSize()) {
+            CableHeader(title = "ON DEMAND", onBack = onExit)
+            Box(Modifier.weight(1f).fillMaxWidth()) {
+                Library(
+                    loading = loading,
+                    loadError = loadError,
+                    resume = resume,
+                    recent = recent,
+                    onSelect = { item ->
+                        if (item.type == "Series") {
+                            scope.launch {
+                                val eps = withContext(Dispatchers.IO) {
+                                    runCatching { client.episodes(item.id) }.getOrDefault(emptyList())
+                                }
+                                episodes = eps
+                                series = item
+                            }
+                        } else {
+                            playing = item
+                        }
+                    }
+                )
+            }
+        }
     }
 }
 
