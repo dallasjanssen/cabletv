@@ -2,26 +2,26 @@ package com.dallas.cabletv.ui
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.MediaItem
 import androidx.media3.exoplayer.ExoPlayer
@@ -35,19 +35,30 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 @Composable
-fun OnDemandScreen(settings: Settings, onExit: () -> Unit) {
+fun OnDemandScreen(settings: Settings) {
     if (settings.hasJellyfin) {
-        JellyfinBrowser(settings, onExit)
+        JellyfinBrowser(settings)
     } else {
-        Column(Modifier.fillMaxSize()) {
-            CableHeader("ON DEMAND", onBack = onExit)
-            CenterMessage("JELLYFIN IS NOT CONNECTED.\nADD YOUR SERVER IN SETTINGS.")
+        Column(
+            Modifier
+                .fillMaxSize()
+                .padding(horizontal = 48.dp, vertical = 40.dp)
+        ) {
+            PageHeader(
+                title = "On demand",
+                subtitle = "Movies and shows from your Jellyfin server"
+            )
+            EmptyState(
+                title = "Jellyfin is not connected",
+                body = "Add your server in Settings to browse your library.",
+                modifier = Modifier.weight(1f)
+            )
         }
     }
 }
 
 @Composable
-private fun JellyfinBrowser(settings: Settings, onExit: () -> Unit) {
+private fun JellyfinBrowser(settings: Settings) {
     val client = remember(settings) {
         JellyfinClient(settings.jellyfinServer, settings.jellyfinToken, settings.jellyfinUserId)
     }
@@ -82,7 +93,7 @@ private fun JellyfinBrowser(settings: Settings, onExit: () -> Unit) {
     val openSeries = series
     when {
         nowPlaying != null -> VodPlayer(nowPlaying.streamUrl)
-        openSeries != null -> EpisodeList(
+        openSeries != null -> SeriesDetail(
             series = openSeries,
             episodes = episodes,
             onPlay = { playing = it },
@@ -93,7 +104,6 @@ private fun JellyfinBrowser(settings: Settings, onExit: () -> Unit) {
             loadError = loadError,
             resume = resume,
             recent = recent,
-            onExit = onExit,
             onSelect = { item ->
                 if (item.type == "Series") {
                     scope.launch {
@@ -117,23 +127,39 @@ private fun Library(
     loadError: String?,
     resume: List<VodItem>,
     recent: List<VodItem>,
-    onExit: () -> Unit,
     onSelect: (VodItem) -> Unit
 ) {
-    Column(Modifier.fillMaxSize()) {
-        CableHeader("ON DEMAND", onBack = onExit)
+    Column(
+        Modifier
+            .fillMaxSize()
+            .padding(start = 48.dp, end = 48.dp, top = 40.dp)
+    ) {
+        PageHeader(title = "On demand", subtitle = "Pick something to watch")
+        Spacer(Modifier.height(32.dp))
         when {
-            loading -> CenterMessage("LOADING LIBRARY...")
-            loadError != null -> CenterMessage("ERROR: $loadError")
-            else -> Column(
-                Modifier
-                    .fillMaxSize()
-                    .verticalScroll(rememberScrollState())
-                    .padding(24.dp),
-                verticalArrangement = Arrangement.spacedBy(24.dp)
+            loading -> EmptyState(
+                title = "Loading your library...",
+                modifier = Modifier.weight(1f)
+            )
+            loadError != null -> EmptyState(
+                title = "Couldn't reach Jellyfin",
+                body = loadError,
+                modifier = Modifier.weight(1f)
+            )
+            resume.isEmpty() && recent.isEmpty() -> EmptyState(
+                title = "Nothing here yet",
+                body = "Add media to your Jellyfin library and it will show up here.",
+                modifier = Modifier.weight(1f)
+            )
+            else -> LazyColumn(
+                Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(36.dp),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 40.dp)
             ) {
-                if (resume.isNotEmpty()) PosterRow("CONTINUE WATCHING", resume, onSelect)
-                PosterRow("RECENTLY ADDED", recent, onSelect)
+                if (resume.isNotEmpty()) {
+                    item { PosterRow("Continue watching", resume, onSelect) }
+                }
+                item { PosterRow("Recently added", recent, onSelect) }
             }
         }
     }
@@ -141,73 +167,194 @@ private fun Library(
 
 @Composable
 private fun PosterRow(title: String, list: List<VodItem>, onSelect: (VodItem) -> Unit) {
-    Column {
+    Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
         Text(
-            title,
-            color = CableColors.Led,
-            fontFamily = FontFamily.Monospace,
-            fontWeight = FontWeight.Bold,
-            fontSize = 20.sp
+            text = title,
+            style = MaterialTheme.typography.titleLarge,
+            color = Cable.Ink
         )
-        Spacer(Modifier.height(8.dp))
-        LazyRow(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-            items(list, key = { it.id }) { item ->
-                PosterCard(item) { onSelect(item) }
+        LazyRow(
+            horizontalArrangement = Arrangement.spacedBy(28.dp),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 6.dp, vertical = 10.dp)
+        ) {
+            items(list, key = { it.id }) { vod ->
+                PosterCard(vod) { onSelect(vod) }
             }
         }
     }
 }
 
 @Composable
-private fun PosterCard(item: VodItem, onClick: () -> Unit) {
-    var focused by remember { mutableStateOf(false) }
+private fun PosterCard(vod: VodItem, onClick: () -> Unit) {
     Column(
-        Modifier
-            .width(140.dp)
-            .onFocusChanged { focused = it.isFocused }
-            .border(2.dp, if (focused) CableColors.Led else Color.Transparent)
-            .clickable(onClick = onClick)
-            .padding(4.dp)
+        Modifier.width(184.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        AsyncImage(
-            model = item.posterUrl,
-            contentDescription = item.name,
-            contentScale = ContentScale.Crop,
+        FocusSurface(
+            onClick = onClick,
             modifier = Modifier
-                .width(132.dp)
-                .height(198.dp)
-                .background(CableColors.Panel)
-        )
+                .width(184.dp)
+                .height(276.dp),
+            shape = RoundedCornerShape(16.dp),
+            focusScale = 1.05f
+        ) {
+            AsyncImage(
+                model = vod.posterUrl,
+                contentDescription = vod.name,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Cable.SurfaceHi)
+            )
+        }
         Text(
-            item.name,
-            color = CableColors.Text,
-            fontFamily = FontFamily.Monospace,
-            fontSize = 13.sp,
-            maxLines = 2,
+            text = vod.name,
+            style = MaterialTheme.typography.bodyLarge,
+            color = Cable.Ink,
+            maxLines = 1,
             overflow = TextOverflow.Ellipsis
         )
+        vod.year?.let {
+            Text(
+                text = it.toString(),
+                style = MaterialTheme.typography.bodyMedium,
+                color = Cable.Ink3
+            )
+        }
     }
 }
 
 @Composable
-private fun EpisodeList(series: VodItem, episodes: List<VodItem>, onPlay: (VodItem) -> Unit, onBack: () -> Unit) {
-    Column(Modifier.fillMaxSize()) {
-        CableHeader(series.name.uppercase(), onBack = onBack)
-        if (episodes.isEmpty()) {
-            CenterMessage("NO EPISODES FOUND.")
-        } else {
-            LazyColumn(Modifier.weight(1f)) {
-                items(episodes, key = { it.id }) { ep ->
-                    CableRow(onClick = { onPlay(ep) }) {
-                        Text(
-                            ep.name,
-                            color = CableColors.Text,
-                            fontFamily = FontFamily.Monospace,
-                            fontSize = 18.sp
-                        )
+private fun SeriesDetail(
+    series: VodItem,
+    episodes: List<VodItem>,
+    onPlay: (VodItem) -> Unit,
+    onBack: () -> Unit
+) {
+    val firstEpisode = remember { FocusRequester() }
+    LaunchedEffect(episodes.size) {
+        if (episodes.isNotEmpty()) runCatching { firstEpisode.requestFocus() }
+    }
+
+    Row(
+        Modifier
+            .fillMaxSize()
+            .padding(horizontal = 48.dp, vertical = 40.dp),
+        horizontalArrangement = Arrangement.spacedBy(48.dp)
+    ) {
+        Column(
+            Modifier
+                .width(280.dp)
+                .fillMaxHeight(),
+            verticalArrangement = Arrangement.spacedBy(20.dp)
+        ) {
+            OutlinedButton(onClick = onBack) { Text("Back to library") }
+            AsyncImage(
+                model = series.posterUrl,
+                contentDescription = series.name,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier
+                    .width(280.dp)
+                    .height(420.dp)
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(Cable.SurfaceHi)
+            )
+            Text(
+                text = series.name,
+                style = MaterialTheme.typography.titleLarge,
+                color = Cable.Ink,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+            series.year?.let {
+                Text(
+                    text = it.toString(),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Cable.Ink3
+                )
+            }
+        }
+
+        Column(
+            Modifier
+                .weight(1f)
+                .fillMaxHeight(),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            series.overview?.takeIf { it.isNotBlank() }?.let {
+                Text(
+                    text = it,
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = Cable.Ink2,
+                    maxLines = 4,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            Text(
+                text = "Episodes",
+                style = MaterialTheme.typography.titleLarge,
+                color = Cable.Ink
+            )
+            if (episodes.isEmpty()) {
+                EmptyState(
+                    title = "No episodes found",
+                    modifier = Modifier.weight(1f)
+                )
+            } else {
+                LazyColumn(
+                    Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 4.dp)
+                ) {
+                    itemsIndexed(episodes, key = { _, ep -> ep.id }) { idx, ep ->
+                        EpisodeRow(
+                            episode = ep,
+                            focusRequester = if (idx == 0) firstEpisode else null
+                        ) { onPlay(ep) }
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun EpisodeRow(
+    episode: VodItem,
+    focusRequester: FocusRequester?,
+    onClick: () -> Unit
+) {
+    val rowModifier = if (focusRequester != null) {
+        Modifier.fillMaxWidth().focusRequester(focusRequester)
+    } else {
+        Modifier.fillMaxWidth()
+    }
+    FocusSurface(
+        onClick = onClick,
+        modifier = rowModifier,
+        shape = RoundedCornerShape(14.dp),
+        focusScale = 1f
+    ) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .background(Cable.Surface)
+                .padding(horizontal = 28.dp, vertical = 22.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = episode.name,
+                style = MaterialTheme.typography.titleMedium,
+                color = Cable.Ink,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f)
+            )
+            Text(
+                text = "PLAY",
+                style = MaterialTheme.typography.labelLarge,
+                color = Cable.Accent
+            )
         }
     }
 }

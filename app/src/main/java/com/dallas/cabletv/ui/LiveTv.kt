@@ -10,26 +10,30 @@ import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.onPreviewKeyEvent
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
+import coil.compose.AsyncImage
 import com.dallas.cabletv.data.LiveChannel
 import com.dallas.cabletv.data.NowNext
 import com.dallas.cabletv.data.Program
@@ -39,11 +43,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
-
-private val clockFmt = SimpleDateFormat("h:mm a", Locale.US)
 
 private fun progressOf(p: Program): Float {
     val total = (p.end - p.start).coerceAtLeast(1L)
@@ -74,7 +73,7 @@ fun LiveTvScreen(
     DisposableEffect(player) {
         val listener = object : Player.Listener {
             override fun onPlayerError(e: PlaybackException) {
-                playerError = e.message ?: "SIGNAL LOST"
+                playerError = e.message ?: "Signal lost"
             }
         }
         player.addListener(listener)
@@ -136,6 +135,7 @@ fun LiveTvScreen(
     Box(
         Modifier
             .fillMaxSize()
+            .background(Color.Black)
             .focusRequester(focus)
             .focusable()
             .onPreviewKeyEvent { ev ->
@@ -169,30 +169,39 @@ fun LiveTvScreen(
             modifier = Modifier.fillMaxSize()
         )
 
-        if (channels.isEmpty()) {
-            CenterMessage(
-                when {
-                    loading -> "SEARCHING FOR CHANNELS..."
-                    error != null -> "ERROR: $error"
-                    else -> "NO CHANNELS. OPEN SETTINGS TO ADD A SOURCE."
-                }
+        when {
+            channels.isEmpty() -> EmptyState(
+                title = when {
+                    loading -> "Finding channels..."
+                    error != null -> "Can't load channels"
+                    else -> "No channels yet"
+                },
+                body = error ?: if (loading) null else "Open Settings to add a live source.",
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Cable.Canvas.copy(alpha = 0.8f))
             )
-        } else if (playerError != null) {
-            CenterMessage("NO SIGNAL")
+            playerError != null -> EmptyState(
+                title = "No signal",
+                body = "This channel is not responding. Press up or down to try another.",
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Cable.Canvas.copy(alpha = 0.6f))
+            )
         }
 
         // Digits typed on the remote appear in the top corner.
         if (digits.isNotEmpty()) {
             Text(
-                digits,
-                color = CableColors.Amber,
-                fontFamily = FontFamily.Monospace,
-                fontWeight = FontWeight.Bold,
-                fontSize = 48.sp,
+                text = digits,
+                style = MaterialTheme.typography.headlineLarge,
+                color = Cable.Accent,
                 modifier = Modifier
                     .align(Alignment.TopEnd)
-                    .background(CableColors.Panel.copy(alpha = 0.9f))
-                    .padding(horizontal = 24.dp, vertical = 8.dp)
+                    .padding(40.dp)
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(Cable.Canvas.copy(alpha = 0.85f))
+                    .padding(horizontal = 28.dp, vertical = 10.dp)
             )
         }
 
@@ -203,97 +212,113 @@ fun LiveTvScreen(
             exit = fadeOut()
         ) {
             if (current != null) {
-                ChannelBanner(
-                    channel = current,
-                    nn = nowNext,
-                    onUp = { tune(1) },
-                    onDown = { tune(-1) },
-                    onMenu = onExit
-                )
+                ChannelBanner(channel = current, nn = nowNext)
             }
         }
     }
 }
 
 @Composable
-private fun ChannelBanner(
-    channel: LiveChannel,
-    nn: NowNext?,
-    onUp: () -> Unit,
-    onDown: () -> Unit,
-    onMenu: () -> Unit
-) {
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .background(CableColors.Panel.copy(alpha = 0.92f))
-            .padding(24.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Text(
-            text = channel.number.toString().padStart(3, '0'),
-            color = CableColors.Amber,
-            fontFamily = FontFamily.Monospace,
-            fontWeight = FontWeight.Bold,
-            fontSize = 56.sp
-        )
-        Spacer(Modifier.width(24.dp))
-        Column(Modifier.weight(1f)) {
-            Text(
-                channel.name.uppercase(),
-                color = CableColors.Text,
-                fontFamily = FontFamily.Monospace,
-                fontWeight = FontWeight.Bold,
-                fontSize = 24.sp
-            )
-            val now = nn?.now
-            if (now != null) {
-                Text(
-                    "${clockFmt.format(Date(now.start))}  ${now.title}",
-                    color = CableColors.Text,
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 16.sp
-                )
-                ProgressBar(progressOf(now))
-            } else {
-                Text(
-                    "NO GUIDE DATA",
-                    color = CableColors.Dim,
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 16.sp
-                )
-            }
-            nn?.next?.let {
-                Text(
-                    "NEXT  ${clockFmt.format(Date(it.start))}  ${it.title}",
-                    color = CableColors.Dim,
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 14.sp
-                )
-            }
-        }
-        Column {
-            TextButton(onClick = onUp) { Text("CH +", color = CableColors.Led) }
-            TextButton(onClick = onDown) { Text("CH -", color = CableColors.Led) }
-            TextButton(onClick = onMenu) { Text("MENU", color = CableColors.Amber) }
-        }
-    }
-}
+private fun ChannelBanner(channel: LiveChannel, nn: NowNext?) {
+    val now = nn?.now
+    val next = nn?.next
 
-@Composable
-private fun ProgressBar(fraction: Float) {
     Box(
         Modifier
             .fillMaxWidth()
-            .padding(vertical = 6.dp)
-            .height(6.dp)
-            .background(CableColors.Dim)
+            .background(
+                Brush.verticalGradient(
+                    listOf(Color.Transparent, Cable.Canvas.copy(alpha = 0.92f), Cable.Canvas)
+                )
+            )
+            .padding(horizontal = 56.dp, vertical = 48.dp)
     ) {
-        Box(
-            Modifier
-                .fillMaxWidth(fraction)
-                .height(6.dp)
-                .background(CableColors.Led)
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Bottom) {
+            Column(
+                Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = channel.number.toString(),
+                        style = MaterialTheme.typography.headlineLarge,
+                        color = Cable.Accent
+                    )
+                    Spacer(Modifier.width(20.dp))
+                    Text(
+                        text = channel.name,
+                        style = MaterialTheme.typography.headlineMedium,
+                        color = Cable.Ink,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+
+                if (now != null) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Pill(text = "LIVE", color = Cable.Live)
+                        Spacer(Modifier.width(14.dp))
+                        Text(
+                            text = now.title,
+                            style = MaterialTheme.typography.titleLarge,
+                            color = Cable.Ink,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    ProgressLine(progressOf(now), Modifier.fillMaxWidth(0.55f))
+                    Text(
+                        text = "${formatTime(now.start)} to ${formatTime(now.end)}",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Cable.Ink2
+                    )
+                } else {
+                    Text(
+                        text = "No guide data for this channel",
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = Cable.Ink3
+                    )
+                }
+
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    text = "UP / DOWN   Change channel      0-9   Jump to number      BACK   Menu",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = Cable.Ink3
+                )
+            }
+
+            next?.let { UpNextCard(it) }
+        }
+    }
+}
+
+@Composable
+private fun UpNextCard(program: Program) {
+    Column(
+        Modifier
+            .width(340.dp)
+            .clip(RoundedCornerShape(16.dp))
+            .background(Cable.Canvas.copy(alpha = 0.8f))
+            .padding(20.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        Text(
+            text = "UP NEXT",
+            style = MaterialTheme.typography.labelMedium,
+            color = Cable.Ink3
+        )
+        Text(
+            text = program.title,
+            style = MaterialTheme.typography.titleMedium,
+            color = Cable.Ink,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis
+        )
+        Text(
+            text = formatTime(program.start),
+            style = MaterialTheme.typography.bodyMedium,
+            color = Cable.Ink2
         )
     }
 }
@@ -302,20 +327,51 @@ private fun ProgressBar(fraction: Float) {
 fun GuideScreen(
     channels: List<LiveChannel>,
     epg: XtreamClient?,
-    onWatch: (Int) -> Unit,
-    onExit: () -> Unit
+    onWatch: (Int) -> Unit
 ) {
     val cache = remember { mutableStateMapOf<String, NowNext>() }
     val gate = remember { Semaphore(3) } // limit guide requests so the provider is not flooded
+    val firstRow = remember { FocusRequester() }
 
-    Column(Modifier.fillMaxSize()) {
-        CableHeader("PROGRAM GUIDE", onBack = onExit)
+    LaunchedEffect(channels.size) {
+        if (channels.isNotEmpty()) runCatching { firstRow.requestFocus() }
+    }
+
+    Column(
+        Modifier
+            .fillMaxSize()
+            .padding(horizontal = 48.dp, vertical = 40.dp)
+    ) {
+        PageHeader(
+            title = "Program guide",
+            subtitle = if (epg == null) {
+                "Connect a live source to see what is on"
+            } else {
+                "What is on now, and what is next"
+            }
+        )
+        Spacer(Modifier.height(28.dp))
+
         if (channels.isEmpty()) {
-            CenterMessage("NO CHANNELS LOADED.")
+            EmptyState(
+                title = "No channels loaded",
+                body = "Add a live source in Settings.",
+                modifier = Modifier.weight(1f)
+            )
         } else {
-            LazyColumn(Modifier.weight(1f)) {
+            LazyColumn(
+                Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 4.dp)
+            ) {
                 itemsIndexed(channels, key = { _, c -> c.id }) { idx, ch ->
-                    GuideRow(ch, cache, epg, gate) { onWatch(idx) }
+                    GuideRow(
+                        ch = ch,
+                        cache = cache,
+                        epg = epg,
+                        gate = gate,
+                        focusRequester = if (idx == 0) firstRow else null
+                    ) { onWatch(idx) }
                 }
             }
         }
@@ -328,6 +384,7 @@ private fun GuideRow(
     cache: MutableMap<String, NowNext>,
     epg: XtreamClient?,
     gate: Semaphore,
+    focusRequester: FocusRequester?,
     onClick: () -> Unit
 ) {
     LaunchedEffect(ch.id) {
@@ -339,33 +396,92 @@ private fun GuideRow(
     }
 
     val nn = cache[ch.id]
-    val subtitle = nn?.now?.let { "${clockFmt.format(Date(it.start))}  ${it.title}" }
-        ?: if (epg == null) "NO GUIDE SOURCE" else "--"
+    val now = nn?.now
+    val next = nn?.next
 
-    CableRow(onClick = onClick) {
-        Text(
-            text = ch.number.toString(),
-            color = CableColors.Amber,
-            fontFamily = FontFamily.Monospace,
-            fontWeight = FontWeight.Bold,
-            fontSize = 20.sp,
-            modifier = Modifier.width(72.dp)
-        )
-        Column(Modifier.weight(1f)) {
+    val rowModifier = if (focusRequester != null) {
+        Modifier.fillMaxWidth().focusRequester(focusRequester)
+    } else {
+        Modifier.fillMaxWidth()
+    }
+
+    FocusSurface(
+        onClick = onClick,
+        modifier = rowModifier,
+        shape = RoundedCornerShape(14.dp),
+        focusScale = 1f
+    ) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .background(Cable.Surface)
+                .padding(horizontal = 24.dp, vertical = 16.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
             Text(
-                ch.name.uppercase(),
-                color = CableColors.Text,
-                fontFamily = FontFamily.Monospace,
-                fontSize = 18.sp,
-                maxLines = 1
+                text = ch.number.toString(),
+                style = MaterialTheme.typography.titleLarge,
+                color = Cable.Accent,
+                modifier = Modifier.width(88.dp)
             )
-            Text(
-                subtitle,
-                color = CableColors.Dim,
-                fontFamily = FontFamily.Monospace,
-                fontSize = 14.sp,
-                maxLines = 1
-            )
+            ChannelLogo(ch.logo)
+            Spacer(Modifier.width(20.dp))
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(
+                    text = ch.name,
+                    style = MaterialTheme.typography.titleMedium,
+                    color = Cable.Ink,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                if (now != null) {
+                    Text(
+                        text = now.title,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Cable.Ink2,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    ProgressLine(progressOf(now), Modifier.fillMaxWidth(0.7f).padding(top = 4.dp))
+                } else {
+                    Text(
+                        text = if (epg == null) "No guide source" else "No guide data",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Cable.Ink3
+                    )
+                }
+            }
+            if (next != null) {
+                Spacer(Modifier.width(24.dp))
+                Column(Modifier.width(300.dp), horizontalAlignment = Alignment.End) {
+                    Text(
+                        text = "NEXT  ${formatTime(next.start)}",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = Cable.Ink3
+                    )
+                    Text(
+                        text = next.title,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Cable.Ink2,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
         }
+    }
+}
+
+@Composable
+private fun ChannelLogo(url: String?) {
+    if (url.isNullOrBlank()) {
+        Spacer(Modifier.width(72.dp))
+    } else {
+        AsyncImage(
+            model = url,
+            contentDescription = null,
+            contentScale = ContentScale.Fit,
+            modifier = Modifier.size(width = 72.dp, height = 44.dp)
+        )
     }
 }
