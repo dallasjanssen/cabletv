@@ -16,6 +16,25 @@ android {
         versionName = "1.0"
     }
 
+    // Release signing reads its values from environment variables (or Gradle properties with the
+    // same names), so the keystore and its passwords never live in the repository.
+    //   CABLETV_KEYSTORE_PATH, CABLETV_KEYSTORE_PASSWORD, CABLETV_KEY_ALIAS, CABLETV_KEY_PASSWORD
+    // If any are missing, the release build is produced unsigned, and debug builds are unaffected.
+    signingConfigs {
+        create("release") {
+            fun setting(name: String): String? =
+                (System.getenv(name) ?: providers.gradleProperty(name).orNull)?.takeIf { it.isNotBlank() }
+
+            val path = setting("CABLETV_KEYSTORE_PATH")
+            if (path != null) {
+                storeFile = file(path)
+                storePassword = setting("CABLETV_KEYSTORE_PASSWORD")
+                keyAlias = setting("CABLETV_KEY_ALIAS")
+                keyPassword = setting("CABLETV_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildFeatures {
         compose = true
     }
@@ -32,6 +51,10 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
+            // Only attach the signing config when a keystore was supplied.
+            if (signingConfigs.getByName("release").storeFile != null) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
 }
