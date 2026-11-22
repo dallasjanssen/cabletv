@@ -12,6 +12,10 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
+import android.view.KeyEvent
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -25,6 +29,8 @@ enum class Screen { Menu, LiveTv, Guide, OnDemand, Settings }
 @Composable
 fun CableApp(vm: CableViewModel) {
     var screen by remember { mutableStateOf(Screen.Menu) }
+    // Where the guide was opened from, so Back can return to live TV instead of stopping it.
+    var guideFrom by remember { mutableStateOf(Screen.Menu) }
     val channels by vm.channels.collectAsState()
     val guideStatus by vm.guideStatus.collectAsState()
     val settings by vm.settings.collectAsState()
@@ -52,18 +58,30 @@ fun CableApp(vm: CableViewModel) {
                 guideHasData = vm.epg.hasData(),
                 nowPlaying = liveChannel?.name,
                 jellyfinReady = settings.hasJellyfin,
-                onOpen = { target -> screen = target }
+                onOpen = { target ->
+                    guideFrom = Screen.Menu
+                    screen = target
+                }
             )
             Screen.LiveTv -> LiveTvScreen(
                 vm = vm,
                 onExit = ::goMenu,
-                onGuide = { screen = Screen.Guide }
+                onGuide = {
+                    guideFrom = Screen.LiveTv
+                    screen = Screen.Guide
+                }
             )
             Screen.Guide -> GuideScreen(
                 vm = vm,
                 onWatch = ::watch,
                 onLive = { screen = Screen.LiveTv },
-                onExit = ::goMenu
+                onExit = {
+                    if (guideFrom == Screen.LiveTv && liveChannel != null) {
+                        screen = Screen.LiveTv
+                    } else {
+                        goMenu()
+                    }
+                }
             )
             Screen.OnDemand -> OnDemandScreen(vm = vm, onExit = ::goMenu)
             Screen.Settings -> SettingsScreen(vm = vm, onExit = { screen = Screen.Menu })
@@ -81,7 +99,7 @@ private fun MenuScreen(
     onOpen: (Screen) -> Unit
 ) {
     val firstFocus = remember { FocusRequester() }
-    LaunchedEffect(Unit) { firstFocus.requestFocus() }
+    LaunchedEffect(Unit) { runCatching { firstFocus.requestFocus() } }
 
     val entries = listOf(
         Screen.LiveTv to "1   LIVE TV",
@@ -90,7 +108,23 @@ private fun MenuScreen(
         Screen.Settings to "4   SETTINGS"
     )
 
-    Column(Modifier.fillMaxSize()) {
+    Column(
+        Modifier
+            .fillMaxSize()
+            .onPreviewKeyEvent { ev ->
+                // The labels show number keys, so the number keys work too.
+                if (ev.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                val target = when (ev.nativeKeyEvent.keyCode) {
+                    KeyEvent.KEYCODE_1 -> Screen.LiveTv
+                    KeyEvent.KEYCODE_2 -> Screen.Guide
+                    KeyEvent.KEYCODE_3 -> Screen.OnDemand
+                    KeyEvent.KEYCODE_4 -> Screen.Settings
+                    else -> null
+                }
+                if (target != null) onOpen(target)
+                target != null
+            }
+    ) {
         CableHeader("CABLE TV")
         Row(
             Modifier.fillMaxSize().padding(32.dp),

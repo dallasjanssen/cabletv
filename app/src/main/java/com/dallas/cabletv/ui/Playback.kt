@@ -7,6 +7,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
+import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.TrackSelectionOverride
@@ -21,7 +22,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 /** One selectable audio or subtitle track, as shown in the track menu. */
 data class TrackOption(
@@ -73,6 +73,9 @@ class Playback(context: Context, private val scope: CoroutineScope) {
     private var vodPlaySession = ""
     private var vodStartedAt = 0L
     private var fallbackAllowed = true
+    private var stopSent = false
+    private var hlsTried = false
+    private var resumeLiveAfterBackground: LiveChannel? = null
 
     init {
         player.addListener(object : Player.Listener {
@@ -83,14 +86,27 @@ class Playback(context: Context, private val scope: CoroutineScope) {
                     reconnecting = null
                     error = null
                 }
-                if (state == Player.STATE_ENDED && vodItem != null) {
-                    // Finished a file: report it as stopped at the end.
-                    reportStopNow()
+                if (state == Player.STATE_ENDED) {
+                    if (vodItem != null) {
+                        reportStopOnce()
+                    } else if (liveChannel != null) {
+                        // A live stream that closes cleanly is a dropped connection, not the end.
+                        scheduleReconnect()
+                    }
                 }
             }
 
             override fun onPlayerError(e: PlaybackException) {
                 handleError(e)
+            }
+
+            override fun onTracksChanged(tracks: Tracks) {
+                // ExoPlayer can drop an unsupported video or audio track without raising an error.
+                // Treat that as a playback failure so On Demand can fall back to transcoding.
+                val vod = vodItem
+                if (vod != null && !transcoding && fallbackAllowed && hasUnsupportedRequiredTrack(tracks)) {
+                    switchToTranscode(player.currentPosition.takeIf { it > 0 } ?: vodStartedAt)
+                }
             }
         })
         startTicker()
@@ -121,17 +137,48 @@ class Playback(context: Context, private val scope: CoroutineScope) {
         stopVod()
         liveChannel = channel
         retries = 0
+        hlsTried = false
         retryJob?.cancel()
         error = null
         reconnecting = null
-        playUrl(channel.streamUrl, startMs = 0L)
+        playLive(channel, forceHls = false)
     }
 
     fun stopLive() {
         retryJob?.cancel()
         liveChannel = null
+        retries = 0
+        error = null
+        reconnecting = null
         player.stop()
         player.clearMediaItems()
+    }
+
+    private fun playLive(channel: LiveChannel, forceHls: Boolean) {
+        val item = if (forceHls) {
+            MediaItem.Builder().setUri(channel.streamUrl).setMimeType(MimeTypes.APPLICATION_M3U8).build()
+        } else {
+            MediaItem.fromUri(channel.streamUrl)
+        }
+        player.setMediaItem(item)
+        player.prepare()
+        player.playWhenReady = true
+    }
+
+    private fun scheduleReconnect() {
+        val channel = liveChannel ?: return
+        if (retries >= MAX_RETRIES) {
+            error = "Stream stopped"
+            reconnecting = null
+            return
+        }
+        retries++
+        reconnecting = "RECONNECTING $retries/$MAX_RETRIES"
+        retryJob?.cancel()
+        retryJob = scope.launch {
+            delay(BACKOFF_MS * retries)
+            playLive(channel, forceHls = hlsTried)
+        }
     }
 
     // ---- On Demand ----
@@ -150,8 +197,13 @@ class Playback(context: Context, private val scope: CoroutineScope) {
         vodStartedAt = startMs
         fallbackAllowed = allowTranscodeFallback
         error = null
+        reconnecting = null
         transcoding = false
-        playUrl(item.streamUrl, startMs = startMs)
+        stopSent = false
+        player.setMediaItem(MediaItem.fromUri(item.streamUrl))
+        if (startMs > 0L) player.seekTo(startMs)
+        player.prepare()
+        player.playWhenReady = true
         scope.launch(Dispatchers.IO) {
             runCatching { client.reportStart(item, startMs, vodPlaySession, transcoded = false) }
         }
@@ -160,7 +212,7 @@ class Playback(context: Context, private val scope: CoroutineScope) {
     /** Stops On Demand playback and tells Jellyfin where it stopped. */
     fun stopVod() {
         if (vodItem == null) return
-        reportStopNow()
+        reportStopOnce()
         player.stop()
         player.clearMediaItems()
         vodItem = null
@@ -168,9 +220,12 @@ class Playback(context: Context, private val scope: CoroutineScope) {
         transcoding = false
     }
 
-    private fun reportStopNow() {
+    /** Sends the Stopped report at most once per play session. */
+    private fun reportStopOnce() {
+        if (stopSent) return
         val item = vodItem ?: return
         val client = vodClient ?: return
+        stopSent = true
         val pos = player.currentPosition
         val session = vodPlaySession
         val isTranscoded = transcoding
@@ -209,38 +264,61 @@ class Playback(context: Context, private val scope: CoroutineScope) {
 
     private fun handleError(e: PlaybackException) {
         val vod = vodItem
-        val client = vodClient
         val resumeAt = player.currentPosition.takeIf { it > 0 } ?: vodStartedAt
-        if (vod != null && client != null && fallbackAllowed && !transcoding) {
+        if (vod != null && vodClient != null && fallbackAllowed && !transcoding) {
             // Direct play failed. Ask the server to transcode and resume where we were.
-            transcoding = true
-            error = null
-            playUrl(client.transcodeStreamUrl(vod.id, vod.mediaSourceId), startMs = resumeAt)
+            switchToTranscode(resumeAt)
             return
         }
 
         val channel = liveChannel
-        if (channel != null && retries < MAX_RETRIES) {
-            retries++
-            reconnecting = "RECONNECTING $retries/$MAX_RETRIES"
-            retryJob?.cancel()
-            retryJob = scope.launch {
-                delay(BACKOFF_MS * retries)
-                playUrl(channel.streamUrl, startMs = 0L)
+        if (channel != null) {
+            // A URL with no recognizable file extension is often HLS. Try that once before giving up.
+            if (!hlsTried && !hasKnownExtension(channel.streamUrl)) {
+                hlsTried = true
+                retryJob?.cancel()
+                retryJob = scope.launch {
+                    playLive(channel, forceHls = true)
+                }
+                return
             }
-            return
+            if (retries < MAX_RETRIES) {
+                scheduleReconnect()
+                return
+            }
         }
 
         error = e.message ?: "SIGNAL LOST"
         reconnecting = null
     }
 
-    /** Lets the user retry a channel that gave up. */
+    private fun switchToTranscode(resumeAt: Long) {
+        val vod = vodItem ?: return
+        val client = vodClient ?: return
+        transcoding = true
+        error = null
+        reconnecting = null
+        player.setMediaItem(MediaItem.fromUri(client.transcodeStreamUrl(vod, vodPlaySession)))
+        if (resumeAt > 0L) player.seekTo(resumeAt)
+        player.prepare()
+        player.playWhenReady = true
+        scope.launch(Dispatchers.IO) {
+            runCatching { client.reportStart(vod, resumeAt, vodPlaySession, transcoded = true) }
+        }
+    }
+
+    /** Lets the user retry a channel or item that gave up. */
     fun retry() {
         val channel = liveChannel
         val vod = vodItem
         when {
-            channel != null -> tuneLive(channel)
+            channel != null -> {
+                retries = 0
+                hlsTried = false
+                error = null
+                reconnecting = null
+                playLive(channel, forceHls = false)
+            }
             vod != null && vodClient != null -> {
                 val client = vodClient ?: return
                 playVod(vod, client, player.currentPosition, fallbackAllowed)
@@ -248,12 +326,34 @@ class Playback(context: Context, private val scope: CoroutineScope) {
         }
     }
 
-    private fun playUrl(url: String, startMs: Long) {
-        player.setMediaItem(MediaItem.fromUri(url))
-        if (startMs > 0L) player.seekTo(startMs)
-        player.prepare()
-        player.playWhenReady = true
+    /** Called when the app leaves the screen. Live TV stops, so no connection is held in the background. */
+    fun onBackground() {
+        val channel = liveChannel
+        if (channel != null) {
+            resumeLiveAfterBackground = channel
+            stopLive()
+        } else if (vodItem != null) {
+            player.pause()
+        }
     }
+
+    /** Called when the app comes back. Live TV tunes to the channel it was on. */
+    fun onForeground() {
+        resumeLiveAfterBackground?.let { tuneLive(it) }
+        resumeLiveAfterBackground = null
+    }
+
+    private fun hasKnownExtension(url: String): Boolean {
+        val path = url.substringBefore('?').substringAfterLast('/').lowercase()
+        return listOf(".ts", ".m3u8", ".mp4", ".mkv", ".mpd", ".webm", ".m4v", ".avi").any { path.endsWith(it) }
+    }
+
+    private fun hasUnsupportedRequiredTrack(tracks: Tracks): Boolean =
+        tracks.groups.any { g ->
+            (g.type == C.TRACK_TYPE_VIDEO || g.type == C.TRACK_TYPE_AUDIO) &&
+                g.length > 0 &&
+                (0 until g.length).none { g.isTrackSupported(it) }
+        }
 
     // ---- Tracks ----
 
@@ -288,7 +388,8 @@ class Playback(context: Context, private val scope: CoroutineScope) {
                 builder.clearOverridesOfType(type).setTrackTypeDisabled(type, false)
             }
         } else {
-            val group = player.currentTracks.groups[option.groupIndex].mediaTrackGroup
+            // The track list can change under an open menu, for example after an auto-advance.
+            val group = player.currentTracks.groups.getOrNull(option.groupIndex)?.mediaTrackGroup ?: return
             builder.setTrackTypeDisabled(type, false)
                 .clearOverridesOfType(type)
                 .setOverrideForType(TrackSelectionOverride(group, option.trackIndex))

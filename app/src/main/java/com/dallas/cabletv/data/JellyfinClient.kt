@@ -14,7 +14,12 @@ import java.util.concurrent.TimeUnit
  * Jellyfin client: sign in, browse the library, search, resume playback, and
  * report progress back to the server so Continue Watching stays accurate.
  */
-class JellyfinClient(server: String, private val token: String, private val userId: String) {
+class JellyfinClient(
+    server: String,
+    private val token: String,
+    private val userId: String,
+    private val deviceId: String = "cabletv-android"
+) {
 
     private val base = server.trim().trimEnd('/')
     private val http = OkHttpClient.Builder()
@@ -23,13 +28,13 @@ class JellyfinClient(server: String, private val token: String, private val user
         .build()
 
     companion object {
-        private const val CLIENT_AUTH =
-            "MediaBrowser Client=\"CableTV\", Device=\"Android\", DeviceId=\"cabletv-android\", Version=\"1.0\""
+        private const val FIELDS = "Overview,Genres,RunTimeTicks,UserData,MediaSources"
 
-        private const val FIELDS = "Overview,Genres,RunTimeTicks,UserData"
+        private fun clientAuth(deviceId: String): String =
+            "MediaBrowser Client=\"CableTV\", Device=\"Android\", DeviceId=\"$deviceId\", Version=\"1.0\""
 
-        /** Returns Pair(accessToken, userId). */
-        fun login(server: String, username: String, password: String): Pair<String, String> {
+        /** Returns Pair(accessToken, userId). Pass a per-install device id so sessions do not collide. */
+        fun login(server: String, username: String, password: String, deviceId: String): Pair<String, String> {
             val body = JSONObject()
                 .put("Username", username)
                 .put("Pw", password)
@@ -38,7 +43,7 @@ class JellyfinClient(server: String, private val token: String, private val user
 
             val req = Request.Builder()
                 .url("${server.trim().trimEnd('/')}/Users/AuthenticateByName")
-                .header("Authorization", CLIENT_AUTH)
+                .header("Authorization", clientAuth(deviceId))
                 .post(body)
                 .build()
 
@@ -52,7 +57,7 @@ class JellyfinClient(server: String, private val token: String, private val user
         private fun q(value: String): String = URLEncoder.encode(value, "UTF-8")
     }
 
-    private fun authHeader(): String = "$CLIENT_AUTH, Token=\"$token\""
+    private fun authHeader(): String = "${clientAuth(deviceId)}, Token=\"$token\""
 
     private fun getJson(path: String): JSONObject {
         val req = Request.Builder().url("$base$path").header("Authorization", authHeader()).build()
@@ -105,10 +110,11 @@ class JellyfinClient(server: String, private val token: String, private val user
         "$base/Videos/$itemId/stream?static=true&api_key=$token"
 
     /** Server-side transcode to H.264 and AAC HLS. Used when direct play fails. */
-    fun transcodeStreamUrl(itemId: String, mediaSourceId: String?): String {
-        val source = mediaSourceId?.let { "&MediaSourceId=${q(it)}" }.orEmpty()
-        return "$base/Videos/$itemId/master.m3u8?VideoCodec=h264&AudioCodec=aac" +
-            "&MaxStreamingBitrate=20000000$source&api_key=$token"
+    fun transcodeStreamUrl(item: VodItem, playSessionId: String): String {
+        val source = q(item.mediaSourceId ?: item.id)
+        return "$base/Videos/${item.id}/master.m3u8?MediaSourceId=$source" +
+            "&VideoCodec=h264&AudioCodec=aac&MaxStreamingBitrate=20000000" +
+            "&PlaySessionId=${q(playSessionId)}&DeviceId=${q(deviceId)}&api_key=$token"
     }
 
     fun recentlyAdded(types: String = "Movie,Series", limit: Int = 60): List<VodItem> =
@@ -152,6 +158,9 @@ class JellyfinClient(server: String, private val token: String, private val user
             .getJSONArray("Items")
         return (0 until arr.length()).map { arr.getJSONObject(it).getString("Name") }.sorted()
     }
+
+    /** One item with its current watch position, so resume points are up to date. */
+    fun item(id: String): VodItem = mapItem(getJson("/Users/$userId/Items/$id?Fields=$FIELDS"))
 
     fun seasons(seriesId: String): List<VodItem> =
         mapItems(

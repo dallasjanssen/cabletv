@@ -60,6 +60,11 @@ fun SettingsScreen(vm: CableViewModel, onExit: () -> Unit) {
     )
 
     fun runTest(source: CableViewModel.Source) {
+        // The saved token belongs to the saved server, so testing a changed server needs a save first.
+        if (source == CableViewModel.Source.Jellyfin && sameServer(js, current.jellyfinServer).not()) {
+            results[source] = "FAILED: Save the new server first, then test."
+            return
+        }
         scope.launch {
             results[source] = "TESTING..."
             val result = vm.testConnection(source, formSettings(current.jellyfinToken, current.jellyfinUserId))
@@ -149,12 +154,12 @@ fun SettingsScreen(vm: CableViewModel, onExit: () -> Unit) {
                                     var token = current.jellyfinToken
                                     var userId = current.jellyfinUserId
                                     val jServer = js.trim()
-                                    if (jServer.isBlank() || jServer != current.jellyfinServer) {
+                                    if (jServer.isBlank() || !sameServer(jServer, current.jellyfinServer)) {
                                         token = ""
                                         userId = ""
                                     }
                                     if (jServer.isNotBlank() && ju.isNotBlank() && jp.isNotBlank()) {
-                                        val (t, u) = JellyfinClient.login(jServer, ju.trim(), jp)
+                                        val (t, u) = JellyfinClient.login(jServer, ju.trim(), jp, vm.deviceId)
                                         token = t
                                         userId = u
                                     }
@@ -193,6 +198,10 @@ private fun TestRow(label: String, result: String?, onTest: () -> Unit) {
         }
     }
 }
+
+/** Two server URLs match when they differ only by case, spaces, or a trailing slash. */
+private fun sameServer(a: String, b: String): Boolean =
+    a.trim().trimEnd('/').equals(b.trim().trimEnd('/'), ignoreCase = true)
 
 @Composable
 private fun CableField(label: String, value: String, secret: Boolean = false, onChange: (String) -> Unit) {

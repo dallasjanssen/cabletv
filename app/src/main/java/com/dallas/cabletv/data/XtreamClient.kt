@@ -26,6 +26,9 @@ class XtreamClient(server: String, private val user: String, private val pass: S
 
     private fun enc(value: String): String = URLEncoder.encode(value, "UTF-8")
 
+    /** Path segments need %20 for spaces, not the "+" that form encoding produces. */
+    private fun encPath(value: String): String = enc(value).replace("+", "%20")
+
     private fun creds(): String = "username=${enc(user)}&password=${enc(pass)}"
 
     private fun open(url: String): Response {
@@ -69,7 +72,7 @@ class XtreamClient(server: String, private val user: String, private val pass: S
                 name = o.optString("name"),
                 logo = o.optString("stream_icon").takeIf { it.isNotBlank() },
                 group = categories[o.optString("category_id")] ?: "Other",
-                streamUrl = "$base/live/${enc(user)}/${enc(pass)}/$id.ts",
+                streamUrl = "$base/live/${encPath(user)}/${encPath(pass)}/$id.ts",
                 epgId = o.optString("epg_channel_id").takeIf { it.isNotBlank() }
             )
         }.sortedBy { it.number }

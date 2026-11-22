@@ -145,16 +145,21 @@ fun CableRow(
 @Composable
 fun KeyLegend(key: String, label: String, color: Color) {
     Row(verticalAlignment = Alignment.CenterVertically) {
-        Box(
-            Modifier
-                .size(26.dp)
-                .background(color, RoundedCornerShape(3.dp)),
-            contentAlignment = Alignment.Center
-        ) {
-            Text(key, color = CableColors.OnSelected, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-        }
+        // The badge grows to fit its label, so "LEFT RIGHT" or "PG UP/DN" stays on one line.
+        Text(
+            key,
+            color = CableColors.OnSelected,
+            fontWeight = FontWeight.Bold,
+            fontSize = 15.sp,
+            maxLines = 1,
+            softWrap = false,
+            modifier = Modifier
+                .clip(RoundedCornerShape(3.dp))
+                .background(color)
+                .padding(horizontal = 8.dp, vertical = 3.dp)
+        )
         Spacer(Modifier.width(8.dp))
-        Text(label, color = CableColors.Text, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+        Text(label, color = CableColors.Text, fontWeight = FontWeight.Bold, fontSize = 15.sp, maxLines = 1, softWrap = false)
     }
 }
 

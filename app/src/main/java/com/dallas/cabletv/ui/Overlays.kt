@@ -10,6 +10,8 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.media3.common.C
@@ -20,6 +22,9 @@ fun TrackMenu(playback: Playback, onDismiss: () -> Unit) {
     val audio = remember { playback.trackOptions(C.TRACK_TYPE_AUDIO) }
     val subs = remember { playback.trackOptions(C.TRACK_TYPE_TEXT) }
     val noSubsSelected = subs.none { it.selected }
+    // Focus starts on the first row so the remote can drive the menu straight away.
+    val firstRow = remember { FocusRequester() }
+    LaunchedEffect(Unit) { runCatching { firstRow.requestFocus() } }
 
     Column(
         Modifier
@@ -29,7 +34,7 @@ fun TrackMenu(playback: Playback, onDismiss: () -> Unit) {
             .verticalScroll(rememberScrollState())
     ) {
         Text("AUDIO", color = CableColors.Led, fontWeight = androidx.compose.ui.text.font.FontWeight.Bold, fontSize = 16.sp)
-        CableRow(onClick = {
+        CableRow(modifier = Modifier.focusRequester(firstRow), onClick = {
             playback.selectTrack(null, C.TRACK_TYPE_AUDIO)
             onDismiss()
         }) {

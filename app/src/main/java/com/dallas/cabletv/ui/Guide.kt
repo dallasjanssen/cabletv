@@ -111,7 +111,9 @@ fun GuideScreen(vm: CableViewModel, onWatch: (LiveChannel) -> Unit, onLive: () -
 
     fun moveRow(delta: Int) {
         if (channels.isEmpty()) return
-        selectNear(channels[ChannelLogic.step(selIndex, delta, channels.size)], selStart.takeIf { it > 0 } ?: nowMs)
+        // Keep the same time on the new row. A program that started before the window uses the window start.
+        val reference = maxOf(selStart, windowStart).takeIf { selStart > 0 } ?: nowMs
+        selectNear(channels[ChannelLogic.step(selIndex, delta, channels.size)], reference)
     }
 
     fun moveProgram(dir: Int) {
@@ -128,7 +130,10 @@ fun GuideScreen(vm: CableViewModel, onWatch: (LiveChannel) -> Unit, onLive: () -
     }
 
     fun shiftWindow(deltaMs: Long) {
-        windowStart = ChannelLogic.floorToSlot(windowStart + deltaMs)
+        // Stay between an hour before now and the end of the guide's listings.
+        val earliest = ChannelLogic.floorToSlot(nowMs - 60 * 60 * 1000L)
+        val latest = ChannelLogic.floorToSlot(nowMs + EpgRepository.LOOKAHEAD_MS - WINDOW_MS)
+        windowStart = ChannelLogic.floorToSlot(windowStart + deltaMs).coerceIn(earliest, maxOf(earliest, latest))
     }
 
     fun jumpToNow() {
@@ -155,9 +160,16 @@ fun GuideScreen(vm: CableViewModel, onWatch: (LiveChannel) -> Unit, onLive: () -
         }
     }
 
-    // Keep the selected row visible.
+    // Scroll only when the selected row has left the screen, so moving does not jump the list.
     LaunchedEffect(selIndex) {
-        if (channels.isNotEmpty()) listState.animateScrollToItem(selIndex)
+        if (channels.isEmpty()) return@LaunchedEffect
+        val visible = listState.layoutInfo.visibleItemsInfo
+        val firstVisible = visible.firstOrNull()?.index ?: 0
+        val lastVisible = visible.lastOrNull()?.index ?: 0
+        when {
+            selIndex < firstVisible -> listState.animateScrollToItem(selIndex)
+            selIndex >= lastVisible -> listState.animateScrollToItem((selIndex - visible.size + 2).coerceAtLeast(0))
+        }
     }
 
     LaunchedEffect(Unit) { focus.requestFocus() }
@@ -356,6 +368,7 @@ private fun InfoAndPreview(channel: LiveChannel?, program: Program?, playback: c
                 AndroidView(
                     factory = { ctx -> PlayerView(ctx).apply { useController = false; player = playback.player } },
                     update = { it.player = playback.player },
+                    onRelease = { it.player = null },
                     modifier = Modifier.fillMaxSize()
                 )
             } else {
@@ -442,11 +455,12 @@ private fun GuideRow(
             .fillMaxWidth()
             .height(ROW_HEIGHT_DP.dp)
     ) {
+        // The channel cell lights up for the selected row, even when the cursor sits on a gap with no listing.
         Row(
             Modifier
                 .width(CHANNEL_COL)
                 .fillMaxHeight()
-                .background(CableColors.PanelDeep)
+                .background(if (selectedStart != null) CableColors.Highlight else CableColors.PanelDeep)
                 .padding(start = 6.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {

@@ -7,7 +7,6 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -65,6 +64,7 @@ private sealed interface VodView {
 }
 
 private const val PAGE_SIZE = 60
+private const val CONTROLS_MS = 4000L
 
 @Composable
 fun OnDemandScreen(vm: CableViewModel, onExit: () -> Unit) {
@@ -72,6 +72,7 @@ fun OnDemandScreen(vm: CableViewModel, onExit: () -> Unit) {
     if (settings.hasJellyfin) {
         JellyfinBrowser(vm, settings, onExit)
     } else {
+        BackHandler { onExit() }
         Column(Modifier.fillMaxSize()) {
             CableHeader("ON DEMAND", onBack = onExit)
             CenterMessage("JELLYFIN IS NOT CONNECTED.\nADD YOUR SERVER IN SETTINGS.")
@@ -81,10 +82,13 @@ fun OnDemandScreen(vm: CableViewModel, onExit: () -> Unit) {
 
 @Composable
 private fun JellyfinBrowser(vm: CableViewModel, settings: Settings, onExit: () -> Unit) {
-    val client = remember(settings.jellyfinServer, settings.jellyfinToken, settings.jellyfinUserId) {
-        JellyfinClient(settings.jellyfinServer, settings.jellyfinToken, settings.jellyfinUserId)
+    val client = remember(settings.jellyfinServer, settings.jellyfinToken, settings.jellyfinUserId, vm.deviceId) {
+        JellyfinClient(settings.jellyfinServer, settings.jellyfinToken, settings.jellyfinUserId, vm.deviceId)
     }
     var view by remember { mutableStateOf<VodView>(VodView.Home) }
+
+    // Back on the Home view leaves On Demand entirely.
+    BackHandler(enabled = view is VodView.Home) { onExit() }
 
     // Back steps out one level at a time. Playback stops in the player itself.
     BackHandler(enabled = view !is VodView.Home) {
@@ -133,8 +137,7 @@ private fun JellyfinBrowser(vm: CableViewModel, settings: Settings, onExit: () -
         when (val v = view) {
             VodView.Home -> HomeView(
                 client = client,
-                onSelect = { item -> view = VodView.Detail(item, VodView.Home) },
-                onExit = onExit
+                onSelect = { item -> view = VodView.Detail(item, VodView.Home) }
             )
             is VodView.Browse -> BrowseView(
                 client = client,
@@ -143,7 +146,7 @@ private fun JellyfinBrowser(vm: CableViewModel, settings: Settings, onExit: () -
             )
             is VodView.Detail -> DetailView(
                 client = client,
-                item = v.item,
+                initialItem = v.item,
                 onPlay = { startMs, queue, index ->
                     view = VodView.Play(queue.getOrElse(index) { v.item }, queue, index, startMs, v)
                 }
@@ -195,7 +198,7 @@ private fun TabChip(label: String, active: Boolean, onClick: () -> Unit) {
 // ---- Home ----
 
 @Composable
-private fun HomeView(client: JellyfinClient, onSelect: (VodItem) -> Unit, onExit: () -> Unit) {
+private fun HomeView(client: JellyfinClient, onSelect: (VodItem) -> Unit) {
     var resume by remember { mutableStateOf<List<VodItem>>(emptyList()) }
     var nextUp by remember { mutableStateOf<List<VodItem>>(emptyList()) }
     var recent by remember { mutableStateOf<List<VodItem>>(emptyList()) }
@@ -248,6 +251,9 @@ private fun BrowseView(client: JellyfinClient, tab: VodTab, onSelect: (VodItem) 
     var canLoadMore by remember(tab) { mutableStateOf(true) }
     var loading by remember(tab) { mutableStateOf(false) }
     var error by remember(tab) { mutableStateOf<String?>(null) }
+    // Each reset starts a new generation. Pages from an older generation are discarded when they arrive,
+    // so a changed genre or search never mixes with results that were still loading.
+    var generation by remember(tab) { mutableIntStateOf(0) }
     val gridState = rememberLazyGridState()
 
     LaunchedEffect(tab) {
@@ -258,25 +264,36 @@ private fun BrowseView(client: JellyfinClient, tab: VodTab, onSelect: (VodItem) 
 
     // Reloads from page one whenever the genre or search text changes.
     suspend fun loadPage(reset: Boolean) {
-        if (loading) return
+        if (!reset && loading) return
+        val gen: Int
         if (reset) {
+            generation++
+            gen = generation
             items.clear()
             page = 0
             canLoadMore = true
+            loading = false
+        } else {
+            if (!canLoadMore) return
+            gen = generation
         }
         if (!canLoadMore) return
         loading = true
-        val start = page * PAGE_SIZE
-        val result = withContext(Dispatchers.IO) {
-            runCatching { client.library(tab, search = query, genre = genre, start = start, limit = PAGE_SIZE) }
+        try {
+            val start = page * PAGE_SIZE
+            val result = withContext(Dispatchers.IO) {
+                runCatching { client.library(tab, search = query, genre = genre, start = start, limit = PAGE_SIZE) }
+            }
+            if (gen != generation) return
+            result.onSuccess { list ->
+                items.addAll(list)
+                page++
+                canLoadMore = list.size == PAGE_SIZE
+                error = null
+            }.onFailure { error = it.message ?: "Could not load" }
+        } finally {
+            if (gen == generation) loading = false
         }
-        result.onSuccess { list ->
-            items.addAll(list)
-            page++
-            canLoadMore = list.size == PAGE_SIZE
-            error = null
-        }.onFailure { error = it.message ?: "Could not load" }
-        loading = false
     }
 
     LaunchedEffect(tab, genre) {
@@ -288,9 +305,11 @@ private fun BrowseView(client: JellyfinClient, tab: VodTab, onSelect: (VodItem) 
     LaunchedEffect(query) {
         if (tab != VodTab.Search) return@LaunchedEffect
         if (query.isBlank()) {
+            generation++
             items.clear()
             page = 0
             canLoadMore = true
+            loading = false
             return@LaunchedEffect
         }
         delay(400)
@@ -378,15 +397,28 @@ private fun GenreChip(label: String, active: Boolean, onClick: () -> Unit) {
 @Composable
 private fun DetailView(
     client: JellyfinClient,
-    item: VodItem,
+    initialItem: VodItem,
     onPlay: (startMs: Long, queue: List<VodItem>, index: Int) -> Unit
 ) {
+    // Starts from the list's copy, then refetches so resume points are current after returning from playback.
+    var item by remember(initialItem.id) { mutableStateOf(initialItem) }
+    LaunchedEffect(initialItem.id) {
+        withContext(Dispatchers.IO) { runCatching { client.item(initialItem.id) } }
+            .onSuccess { item = it }
+    }
+
     val isSeries = item.type == "Series"
     val scope = rememberCoroutineScope()
+    val primaryFocus = remember { FocusRequester() }
     var seasons by remember(item.id) { mutableStateOf<List<VodItem>>(emptyList()) }
     var seasonIndex by remember(item.id) { mutableIntStateOf(0) }
     var episodes by remember(item.id) { mutableStateOf<List<VodItem>>(emptyList()) }
     var detailError by remember(item.id) { mutableStateOf<String?>(null) }
+
+    // Focus lands on the main action, so the remote can press it straight away.
+    LaunchedEffect(item.id) {
+        if (!isSeries) runCatching { primaryFocus.requestFocus() }
+    }
 
     LaunchedEffect(item.id) {
         if (!isSeries) return@LaunchedEffect
@@ -438,27 +470,24 @@ private fun DetailView(
                 )
                 Spacer(Modifier.height(16.dp))
                 if (!isSeries) {
+                    fun playFrom(startMs: Long) {
+                        scope.launch {
+                            val (queue, index) = queueFor(client, item)
+                            onPlay(startMs, queue, index)
+                        }
+                    }
                     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         if (item.resumeTicks > 0) {
-                            Button(onClick = {
-                                scope.launch {
-                                    val queue = queueFor(client, item)
-                                    onPlay(item.resumeTicks / TICKS_PER_MS, queue.first, queue.second)
-                                }
-                            }) { Text("RESUME AT ${formatPosition(item.resumeTicks / TICKS_PER_MS)}") }
-                            OutlinedButton(onClick = {
-                                scope.launch {
-                                    val queue = queueFor(client, item)
-                                    onPlay(0L, queue.first, queue.second)
-                                }
-                            }) { Text("START OVER") }
+                            Button(
+                                modifier = Modifier.focusRequester(primaryFocus),
+                                onClick = { playFrom(item.resumeTicks / TICKS_PER_MS) }
+                            ) { Text("RESUME AT ${formatPosition(item.resumeTicks / TICKS_PER_MS)}") }
+                            OutlinedButton(onClick = { playFrom(0L) }) { Text("START OVER") }
                         } else {
-                            Button(onClick = {
-                                scope.launch {
-                                    val queue = queueFor(client, item)
-                                    onPlay(0L, queue.first, queue.second)
-                                }
-                            }) { Text("PLAY") }
+                            Button(
+                                modifier = Modifier.focusRequester(primaryFocus),
+                                onClick = { playFrom(0L) }
+                            ) { Text("PLAY") }
                         }
                     }
                 }
@@ -484,9 +513,11 @@ private fun DetailView(
                     Text("NO EPISODES.", color = CableColors.Dim)
                 } else {
                     episodes.forEachIndexed { idx, ep ->
-                        EpisodeRow(ep) {
-                            onPlay(ep.resumeTicks / TICKS_PER_MS, episodes, idx)
-                        }
+                        EpisodeRow(
+                            ep = ep,
+                            onPlay = { onPlay(ep.resumeTicks / TICKS_PER_MS, episodes, idx) },
+                            onStartOver = { onPlay(0L, episodes, idx) }
+                        )
                     }
                 }
             }
@@ -505,7 +536,7 @@ private suspend fun queueFor(client: JellyfinClient, item: VodItem): Pair<List<V
 }
 
 @Composable
-private fun EpisodeRow(ep: VodItem, onClick: () -> Unit) {
+private fun EpisodeRow(ep: VodItem, onPlay: () -> Unit, onStartOver: () -> Unit) {
     var focused by remember { mutableStateOf(false) }
     Column(
         Modifier
@@ -516,20 +547,35 @@ private fun EpisodeRow(ep: VodItem, onClick: () -> Unit) {
                 color = if (focused) CableColors.Selected else Color.Transparent
             )
             .onFocusChanged { focused = it.isFocused }
-            .clickable(onClick = onClick)
+            .clickable(onClick = onPlay)
             .padding(horizontal = 12.dp, vertical = 10.dp)
     ) {
-        val code = if (ep.seasonNumber != null && ep.episodeNumber != null) {
-            "S${ep.seasonNumber}E${ep.episodeNumber}  "
-        } else ""
-        Text(
-            code + ep.name,
-            color = CableColors.Text,
-            fontWeight = FontWeight.Bold,
-            fontSize = 17.sp,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis
-        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            val code = if (ep.seasonNumber != null && ep.episodeNumber != null) {
+                "S${ep.seasonNumber}E${ep.episodeNumber}  "
+            } else ""
+            Text(
+                code + ep.name,
+                color = CableColors.Text,
+                fontWeight = FontWeight.Bold,
+                fontSize = 17.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f)
+            )
+            if (ep.resumeTicks > 0) {
+                // Start over is its own target, so it can be reached without the resume position.
+                Text(
+                    "START OVER",
+                    color = CableColors.Led,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 13.sp,
+                    modifier = Modifier
+                        .clickable(onClick = onStartOver)
+                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                )
+            }
+        }
         if (ep.resumeTicks > 0 && ep.runtimeTicks > 0) {
             val fraction = (ep.resumeTicks.toFloat() / ep.runtimeTicks).coerceIn(0f, 1f)
             Box(
@@ -608,6 +654,7 @@ private fun VodPlayer(
     var pendingStart by remember(queue) { mutableLongStateOf(startMs) }
     var controlsTick by remember { mutableIntStateOf(0) }
     var showControls by remember { mutableStateOf(true) }
+    var isPlaying by remember { mutableStateOf(playback.player.isPlaying) }
     var trackOpen by remember { mutableStateOf(false) }
     val item = queue.getOrNull(index)
     val focus = remember { FocusRequester() }
@@ -620,18 +667,24 @@ private fun VodPlayer(
         playback.playVod(current, client, start, allowFallback)
     }
 
-    // Controls fade out after a few seconds with no key presses.
-    LaunchedEffect(controlsTick) {
+    // Controls fade out after a few seconds, but stay up while paused.
+    LaunchedEffect(controlsTick, isPlaying) {
         showControls = true
-        delay(4000)
-        showControls = false
+        if (isPlaying) {
+            delay(CONTROLS_MS)
+            showControls = false
+        }
     }
 
     // Move to the next episode when one ends, or leave after the last one.
     DisposableEffect(playback.player) {
         val listener = object : Player.Listener {
+            override fun onIsPlayingChanged(playing: Boolean) {
+                isPlaying = playing
+            }
+
             override fun onPlaybackStateChanged(state: Int) {
-                if (state == Player.STATE_ENDED) {
+                if (state == Player.STATE_ENDED && playback.vodItem != null) {
                     if (index + 1 < queue.size) {
                         index += 1
                     } else {
@@ -662,7 +715,11 @@ private fun VodPlayer(
             .onPreviewKeyEvent { ev ->
                 if (ev.type != KeyEventType.KeyDown || trackOpen) return@onPreviewKeyEvent false
                 val handled = when (ev.nativeKeyEvent.keyCode) {
-                    KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER,
+                    KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
+                        // When the stream has failed, OK means retry, so the RETRY action works with a remote.
+                        if (playback.error != null) playback.retry() else playback.togglePlayPause()
+                        true
+                    }
                     KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, KeyEvent.KEYCODE_MEDIA_PLAY,
                     KeyEvent.KEYCODE_MEDIA_PAUSE -> {
                         playback.togglePlayPause(); true
@@ -691,6 +748,7 @@ private fun VodPlayer(
         AndroidView(
             factory = { ctx -> PlayerView(ctx).apply { useController = false; player = playback.player } },
             update = { it.player = playback.player },
+            onRelease = { it.player = null },
             modifier = Modifier.fillMaxSize()
         )
 
@@ -744,9 +802,22 @@ private fun VodPlayer(
                     )
                 }
                 Spacer(Modifier.height(8.dp))
+                // Touch equivalents of the remote keys, for phones and tablets.
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = { playback.seekBy(-10_000L); controlsTick++ }) { Text("-10s") }
+                    Button(onClick = { playback.togglePlayPause(); controlsTick++ }) {
+                        Text(if (isPlaying) "PAUSE" else "PLAY")
+                    }
+                    OutlinedButton(onClick = { playback.seekBy(10_000L); controlsTick++ }) { Text("+10s") }
+                    OutlinedButton(onClick = { trackOpen = true }) { Text("AUDIO") }
+                    if (index > 0) OutlinedButton(onClick = { index -= 1; controlsTick++ }) { Text("PREV") }
+                    if (index + 1 < queue.size) OutlinedButton(onClick = { index += 1; controlsTick++ }) { Text("NEXT") }
+                }
+                Spacer(Modifier.height(8.dp))
                 LegendBar {
                     KeyLegend("OK", "PLAY / PAUSE", CableColors.Selected)
                     KeyLegend("LEFT RIGHT", "10 SEC", CableColors.TimeBar)
+                    KeyLegend("REW FF", "1 MIN", CableColors.TimeBar)
                     KeyLegend("CH", "NEXT / PREV", CableColors.TimeBar)
                     KeyLegend("MENU", "AUDIO / SUBS", CableColors.TimeBar)
                     KeyLegend("BACK", "EXIT", CableColors.Live)

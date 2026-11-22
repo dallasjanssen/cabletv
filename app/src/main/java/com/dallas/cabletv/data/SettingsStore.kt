@@ -11,13 +11,25 @@ import androidx.security.crypto.MasterKey
  */
 class SettingsStore(context: Context) {
 
-    private val prefs: SharedPreferences = EncryptedSharedPreferences.create(
-        context,
-        "cabletv_secure_prefs",
-        MasterKey.Builder(context).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build(),
-        EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-        EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
-    )
+    private val prefs: SharedPreferences = openEncrypted(context)
+
+    private fun openEncrypted(context: Context): SharedPreferences {
+        fun create() = EncryptedSharedPreferences.create(
+            context,
+            "cabletv_secure_prefs",
+            MasterKey.Builder(context).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build(),
+            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+        )
+        return try {
+            create()
+        } catch (e: Exception) {
+            // Some devices end up with a keystore that no longer opens the old file.
+            // Credentials are then lost and must be entered again, which is safer than crashing.
+            context.deleteSharedPreferences("cabletv_secure_prefs")
+            create()
+        }
+    }
 
     fun load(): Settings = Settings(
         xtreamServer = prefs.getString(K_XS, "").orEmpty(),
@@ -79,8 +91,25 @@ class AppStateStore(context: Context) {
         prefs.edit().putString(K_LAST, id).apply()
     }
 
+    /** Channel id that was playing when the app last ran, so Live TV can pick up there. */
+    fun currentChannelId(): String? = prefs.getString(K_CUR, null)
+
+    fun setCurrentChannelId(id: String?) {
+        prefs.edit().putString(K_CUR, id).apply()
+    }
+
+    /** A random id created once per install. Jellyfin uses it to tell devices apart. */
+    fun deviceId(): String {
+        prefs.getString(K_DEVICE, null)?.let { return it }
+        val id = java.util.UUID.randomUUID().toString()
+        prefs.edit().putString(K_DEVICE, id).apply()
+        return id
+    }
+
     private companion object {
         const val K_FAV = "favorites"
         const val K_LAST = "last_channel"
+        const val K_CUR = "current_channel"
+        const val K_DEVICE = "device_id"
     }
 }

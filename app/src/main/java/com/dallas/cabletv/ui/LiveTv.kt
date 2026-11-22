@@ -12,7 +12,9 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
@@ -21,18 +23,18 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
-import androidx.compose.ui.platform.LocalContext
 import androidx.media3.ui.PlayerView
 import coil.compose.AsyncImage
 import com.dallas.cabletv.CableViewModel
@@ -40,7 +42,6 @@ import com.dallas.cabletv.data.ChannelLogic
 import com.dallas.cabletv.data.EpgRepository
 import com.dallas.cabletv.data.LiveChannel
 import com.dallas.cabletv.data.NowNext
-import com.dallas.cabletv.data.Program
 import kotlinx.coroutines.delay
 
 private const val BANNER_MS = 5000L
@@ -59,7 +60,9 @@ fun LiveTvScreen(vm: CableViewModel, onExit: () -> Unit, onGuide: () -> Unit) {
     var trackOpen by remember { mutableStateOf(false) }
     var showBanner by remember { mutableStateOf(false) }
     var bannerTick by remember { mutableIntStateOf(0) }
+    var minuteTick by remember { mutableIntStateOf(0) }
     var digits by remember { mutableStateOf("") }
+    var notice by remember { mutableStateOf<String?>(null) }
     var group by remember { mutableStateOf(ChannelLogic.ALL_GROUP) }
     var search by remember { mutableStateOf("") }
     val focus = remember { FocusRequester() }
@@ -80,9 +83,16 @@ fun LiveTvScreen(vm: CableViewModel, onExit: () -> Unit, onGuide: () -> Unit) {
         channels.firstOrNull { it.id == id }?.let { tuneTo(it) }
     }
 
-    // Start playing when the list first arrives, or when nothing is tuned yet.
+    fun toggleFavoriteNow() {
+        current?.let { vm.toggleFavorite(it.id) }
+        bannerTick++
+    }
+
+    // Start on the channel that was playing last time, once the list arrives.
     LaunchedEffect(channels, current) {
-        if (current == null && channels.isNotEmpty()) playback.tuneLive(channels.first())
+        if (current == null && channels.isNotEmpty()) {
+            vm.startChannel()?.let { vm.tune(it) }
+        }
     }
 
     LaunchedEffect(bannerTick) {
@@ -93,14 +103,33 @@ fun LiveTvScreen(vm: CableViewModel, onExit: () -> Unit, onGuide: () -> Unit) {
         }
     }
 
+    // Keeps the "now" titles current as programs change.
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(30_000)
+            minuteTick++
+        }
+    }
+
     // Number keys tune once the user pauses typing.
     LaunchedEffect(digits) {
         if (digits.isNotEmpty()) {
             delay(1500)
-            val idx = ChannelLogic.indexOfNumber(channels, ChannelLogic.parseTypedNumber(digits) ?: -1)
-            if (idx >= 0) tuneTo(channels[idx])
+            val number = ChannelLogic.parseTypedNumber(digits)
+            val idx = ChannelLogic.indexOfNumber(channels, number ?: -1)
+            if (idx >= 0) {
+                tuneTo(channels[idx])
+            } else {
+                notice = "NO CHANNEL ${digits}"
+            }
             digits = ""
-            bannerTick++
+        }
+    }
+
+    LaunchedEffect(notice) {
+        if (notice != null) {
+            delay(2000)
+            notice = null
         }
     }
 
@@ -115,12 +144,15 @@ fun LiveTvScreen(vm: CableViewModel, onExit: () -> Unit, onGuide: () -> Unit) {
     }
     BackHandler(enabled = !listOpen && !trackOpen) { onExit() }
 
-    val nowNext: NowNext? = remember(current?.id, guideVersion) {
+    val nowNext: NowNext? = remember(current?.id, guideVersion, minuteTick) {
         current?.let { vm.epg.nowNext(it) }
     }
 
-    val filtered = remember(channels, group, favorites, search) {
-        ChannelLogic.filter(channels, group, favorites, search)
+    val groups = remember(channels, favorites) { ChannelLogic.groups(channels, favorites) }
+    // If the selected group disappears (last favorite removed, or a new source), fall back to All.
+    val activeGroup = if (group in groups) group else ChannelLogic.ALL_GROUP
+    val filtered = remember(channels, activeGroup, favorites, search) {
+        ChannelLogic.filter(channels, activeGroup, favorites, search)
     }
 
     Box(
@@ -137,18 +169,16 @@ fun LiveTvScreen(vm: CableViewModel, onExit: () -> Unit, onGuide: () -> Unit) {
                     KeyEvent.KEYCODE_DPAD_UP -> { stepChannel(1); true }
                     KeyEvent.KEYCODE_DPAD_DOWN -> { stepChannel(-1); true }
                     KeyEvent.KEYCODE_DPAD_LEFT -> { listOpen = true; true }
-                    KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_INFO -> {
-                        bannerTick++
+                    KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
+                        // When the stream has failed, OK means retry, so the RETRY action works with a remote.
+                        if (playback.error != null) playback.retry() else bannerTick++
                         true
                     }
+                    KeyEvent.KEYCODE_INFO -> { bannerTick++; true }
                     KeyEvent.KEYCODE_LAST_CHANNEL -> { lastChannel(); true }
                     KeyEvent.KEYCODE_GUIDE -> { onGuide(); true }
                     KeyEvent.KEYCODE_MENU -> { trackOpen = true; true }
-                    KeyEvent.KEYCODE_BUTTON_Y -> {
-                        current?.let { vm.toggleFavorite(it.id) }
-                        bannerTick++
-                        true
-                    }
+                    KeyEvent.KEYCODE_BUTTON_Y, KeyEvent.KEYCODE_PROG_YELLOW -> { toggleFavoriteNow(); true }
                     in KeyEvent.KEYCODE_0..KeyEvent.KEYCODE_9 -> {
                         if (digits.length < 4) digits += (code - KeyEvent.KEYCODE_0).toString()
                         true
@@ -166,6 +196,7 @@ fun LiveTvScreen(vm: CableViewModel, onExit: () -> Unit, onGuide: () -> Unit) {
                 }
             },
             update = { it.player = playback.player },
+            onRelease = { it.player = null },
             modifier = Modifier.fillMaxSize()
         )
 
@@ -189,17 +220,29 @@ fun LiveTvScreen(vm: CableViewModel, onExit: () -> Unit, onGuide: () -> Unit) {
             )
         }
 
-        if (digits.isNotEmpty()) {
-            Text(
-                digits,
-                color = CableColors.Text,
-                fontWeight = FontWeight.Bold,
-                fontSize = 48.sp,
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .background(CableColors.PanelDeep.copy(alpha = 0.9f))
-                    .padding(horizontal = 24.dp, vertical = 8.dp)
-            )
+        Column(Modifier.align(Alignment.TopEnd).padding(16.dp), horizontalAlignment = Alignment.End) {
+            if (digits.isNotEmpty()) {
+                Text(
+                    digits,
+                    color = CableColors.Text,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 48.sp,
+                    modifier = Modifier
+                        .background(CableColors.PanelDeep.copy(alpha = 0.9f))
+                        .padding(horizontal = 24.dp, vertical = 8.dp)
+                )
+            }
+            notice?.let {
+                Text(
+                    it,
+                    color = CableColors.Selected,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 18.sp,
+                    modifier = Modifier
+                        .background(CableColors.PanelDeep.copy(alpha = 0.9f))
+                        .padding(horizontal = 16.dp, vertical = 6.dp)
+                )
+            }
         }
 
         AnimatedVisibility(
@@ -212,7 +255,13 @@ fun LiveTvScreen(vm: CableViewModel, onExit: () -> Unit, onGuide: () -> Unit) {
                 ChannelBanner(
                     channel = current,
                     nn = nowNext,
-                    favorite = current.id in favorites
+                    favorite = current.id in favorites,
+                    onPrev = { stepChannel(-1) },
+                    onNext = { stepChannel(1) },
+                    onList = { listOpen = true },
+                    onGuide = onGuide,
+                    onAudio = { trackOpen = true },
+                    onFavorite = { toggleFavoriteNow() }
                 )
             }
         }
@@ -225,8 +274,8 @@ fun LiveTvScreen(vm: CableViewModel, onExit: () -> Unit, onGuide: () -> Unit) {
         ) {
             ChannelListPanel(
                 channels = filtered,
-                groups = ChannelLogic.groups(channels, favorites),
-                selectedGroup = group,
+                groups = groups,
+                selectedGroup = activeGroup,
                 onGroup = { group = it },
                 search = search,
                 onSearch = { search = it },
@@ -238,7 +287,8 @@ fun LiveTvScreen(vm: CableViewModel, onExit: () -> Unit, onGuide: () -> Unit) {
                 },
                 onToggleFavorite = { vm.toggleFavorite(it) },
                 epg = vm.epg,
-                guideVersion = guideVersion
+                guideVersion = guideVersion,
+                tick = minuteTick
             )
         }
 
@@ -254,7 +304,17 @@ fun LiveTvScreen(vm: CableViewModel, onExit: () -> Unit, onGuide: () -> Unit) {
 }
 
 @Composable
-private fun ChannelBanner(channel: LiveChannel, nn: NowNext?, favorite: Boolean) {
+private fun ChannelBanner(
+    channel: LiveChannel,
+    nn: NowNext?,
+    favorite: Boolean,
+    onPrev: () -> Unit,
+    onNext: () -> Unit,
+    onList: () -> Unit,
+    onGuide: () -> Unit,
+    onAudio: () -> Unit,
+    onFavorite: () -> Unit
+) {
     Column(
         Modifier
             .fillMaxWidth()
@@ -330,6 +390,16 @@ private fun ChannelBanner(channel: LiveChannel, nn: NowNext?, favorite: Boolean)
             )
         }
         Spacer(Modifier.height(12.dp))
+        // Touch equivalents of the remote keys, for phones and tablets.
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(onClick = onPrev) { Text("CH -") }
+            OutlinedButton(onClick = onNext) { Text("CH +") }
+            OutlinedButton(onClick = onList) { Text("LIST") }
+            OutlinedButton(onClick = onAudio) { Text("AUDIO") }
+            OutlinedButton(onClick = onFavorite) { Text(if (favorite) "UNFAVORITE" else "FAVORITE") }
+            OutlinedButton(onClick = onGuide) { Text("GUIDE") }
+        }
+        Spacer(Modifier.height(12.dp))
         LegendBar {
             KeyLegend("CH", "CHANNEL", CableColors.Selected)
             KeyLegend("LEFT", "LIST", CableColors.Selected)
@@ -353,8 +423,28 @@ private fun ChannelListPanel(
     onPick: (LiveChannel) -> Unit,
     onToggleFavorite: (String) -> Unit,
     epg: EpgRepository,
-    guideVersion: Int
+    guideVersion: Int,
+    tick: Int
 ) {
+    val listState = rememberLazyListState()
+    val focusTarget = remember { FocusRequester() }
+    val currentIndex = channels.indexOfFirst { it.id == currentId }.coerceAtLeast(0)
+    // The row that takes focus: the playing channel, or the first row if it is filtered out.
+    val focusId = if (currentIndex < channels.size && channels.getOrNull(currentIndex)?.id == currentId) {
+        currentId
+    } else {
+        channels.firstOrNull()?.id
+    }
+
+    // Opening the list puts focus on the playing channel, so the D-pad works straight away.
+    LaunchedEffect(Unit) {
+        if (channels.isNotEmpty()) {
+            listState.scrollToItem(currentIndex)
+            delay(50)
+            runCatching { focusTarget.requestFocus() }
+        }
+    }
+
     Column(
         Modifier
             .width(520.dp)
@@ -378,14 +468,18 @@ private fun ChannelListPanel(
             modifier = Modifier.fillMaxWidth()
         )
         Spacer(Modifier.height(8.dp))
-        LazyColumn(Modifier.weight(1f)) {
+        if (channels.isEmpty()) {
+            Text("NO CHANNELS IN THIS GROUP", color = CableColors.Dim, fontSize = 15.sp)
+        }
+        LazyColumn(state = listState, modifier = Modifier.weight(1f)) {
             items(channels, key = { it.id }) { ch ->
-                val nn = remember(ch.id, guideVersion) { epg.nowNext(ch) }
+                val nn = remember(ch.id, guideVersion, tick) { epg.nowNext(ch) }
                 ChannelListRow(
                     channel = ch,
                     selected = ch.id == currentId,
                     favorite = ch.id in favorites,
                     nowTitle = nn.now?.title,
+                    focusRequester = if (ch.id == focusId) focusTarget else null,
                     onPick = { onPick(ch) },
                     onFavorite = { onToggleFavorite(ch.id) }
                 )
@@ -429,6 +523,7 @@ private fun ChannelListRow(
     selected: Boolean,
     favorite: Boolean,
     nowTitle: String?,
+    focusRequester: FocusRequester?,
     onPick: () -> Unit,
     onFavorite: () -> Unit
 ) {
@@ -436,6 +531,7 @@ private fun ChannelListRow(
     Row(
         Modifier
             .fillMaxWidth()
+            .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
             .background(
                 when {
                     focused -> CableColors.Highlight
