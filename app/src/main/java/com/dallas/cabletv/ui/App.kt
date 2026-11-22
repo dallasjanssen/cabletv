@@ -170,7 +170,13 @@ fun CableApp(store: SettingsStore) {
     val goHome: () -> Unit = { screen = Screen.Home }
     val navigate: (Screen) -> Unit = { screen = it }
 
-    Box(Modifier.fillMaxSize().background(Cable.Canvas).scanlines()) {
+    // Scan lines are part of the menu look only. Live video is shown clean.
+    Box(
+        Modifier
+            .fillMaxSize()
+            .background(Cable.Canvas)
+            .then(if (screen == Screen.LiveTv) Modifier else Modifier.scanlines())
+    ) {
         when (screen) {
             Screen.Home -> HomeMenu(
                 channelCount = channels.size,
