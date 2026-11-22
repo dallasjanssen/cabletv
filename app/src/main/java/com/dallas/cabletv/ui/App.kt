@@ -40,9 +40,12 @@ import com.dallas.cabletv.data.LiveChannel
 import com.dallas.cabletv.data.Settings
 import com.dallas.cabletv.data.SettingsStore
 import com.dallas.cabletv.data.XtreamClient
+import com.dallas.cabletv.data.EpgCache
+import com.dallas.cabletv.data.UserStateStore
 import com.dallas.cabletv.data.channelFilters
 import com.dallas.cabletv.data.isHidden
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -90,6 +93,26 @@ fun CableApp(store: SettingsStore) {
             XtreamClient(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass)
         } else {
             null
+        }
+    }
+
+    // Favorites and recent channels live on this TV only.
+    val userState = remember { UserStateStore(context) }
+    var favorites by remember { mutableStateOf(userState.favorites()) }
+    var recents by remember { mutableStateOf(userState.recents()) }
+    val toggleFavorite: (LiveChannel) -> Unit = { ch ->
+        userState.toggleFavorite(ch.id)
+        favorites = userState.favorites()
+    }
+
+    // The full schedule is downloaded now and then hourly while an Xtream login is set.
+    LaunchedEffect(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass) {
+        if (!settings.hasXtream) return@LaunchedEffect
+        while (true) {
+            withContext(Dispatchers.IO) {
+                runCatching { EpgCache.refresh(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass) }
+            }
+            delay(60 * 60 * 1000L)
         }
     }
 
@@ -214,9 +237,13 @@ fun CableApp(store: SettingsStore) {
                 error = channelError,
                 startIndex = startIndex,
                 epg = xtream,
+                favorites = favorites,
+                onToggleFavorite = toggleFavorite,
                 onExit = goBack,
                 onChannelChanged = { ch ->
                     store.saveLastChannelId(ch.id)
+                    userState.addRecent(ch.id)
+                    recents = userState.recents()
                     tuneIndex = channels.indexOfFirst { it.id == ch.id }.coerceAtLeast(0)
                 }
             )
@@ -227,6 +254,9 @@ fun CableApp(store: SettingsStore) {
                         Screen.Guide -> GuideScreen(
                             channels = channels,
                             epg = xtream,
+                            favorites = favorites,
+                            recents = recents,
+                            onToggleFavorite = toggleFavorite,
                             onWatch = { idx ->
                                 tuneIndex = idx
                                 previous = Screen.Guide
@@ -422,6 +452,17 @@ private fun SettingsScreen(
     var message by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
 
+    // Fills the fields from the phone. A blank value leaves what the TV already has.
+    fun applyPhoneFields(fields: Map<String, String>) {
+        fields["xs"]?.takeIf { it.isNotBlank() }?.let { xs = it.trim() }
+        fields["xu"]?.takeIf { it.isNotBlank() }?.let { xu = it.trim() }
+        fields["xp"]?.takeIf { it.isNotEmpty() }?.let { xp = it }
+        fields["m3u"]?.takeIf { it.isNotBlank() }?.let { m3u = it.trim() }
+        fields["js"]?.takeIf { it.isNotBlank() }?.let { js = it.trim() }
+        fields["ju"]?.takeIf { it.isNotBlank() }?.let { ju = it.trim() }
+        fields["jp"]?.takeIf { it.isNotEmpty() }?.let { jp = it }
+    }
+
     // Focus starts on SAVE, so the remote is never stuck inside a text field.
     val saveFocus = remember { FocusRequester() }
     LaunchedEffect(Unit) {
@@ -499,6 +540,13 @@ private fun SettingsScreen(
         }
 
         message?.let { StatusLine(it) }
+
+        SettingsCard(
+            title = "SIGN IN FROM YOUR PHONE",
+            subtitle = "Scan the code and type the details on your phone. They appear here, and nothing is saved until you press SAVE."
+        ) {
+            PhoneSignInPanel(onReceived = { applyPhoneFields(it) })
+        }
 
         SettingsCard(
             title = "LIVE TV",

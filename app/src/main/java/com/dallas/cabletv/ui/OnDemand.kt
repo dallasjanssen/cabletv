@@ -32,9 +32,11 @@ import androidx.media3.ui.PlayerView
 import coil.compose.AsyncImage
 import com.dallas.cabletv.data.JellyfinClient
 import com.dallas.cabletv.data.Settings
+import com.dallas.cabletv.data.UserStateStore
 import com.dallas.cabletv.data.VodItem
 import com.dallas.cabletv.data.XtreamClient
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -67,8 +69,11 @@ private fun JellyfinBrowser(settings: Settings, onExit: () -> Unit) {
             null
         }
     }
+    val context = LocalContext.current
+    val userState = remember { UserStateStore(context) }
     val scope = rememberCoroutineScope()
 
+    var resumeItems by remember { mutableStateOf(userState.continueWatching()) }
     var resume by remember { mutableStateOf<List<VodItem>>(emptyList()) }
     var recent by remember { mutableStateOf<List<VodItem>>(emptyList()) }
     var providerMovies by remember { mutableStateOf<List<VodItem>>(emptyList()) }
@@ -114,6 +119,11 @@ private fun JellyfinBrowser(settings: Settings, onExit: () -> Unit) {
         loading = false
     }
 
+    // Back from playback refreshes the "left off" row with the new positions.
+    LaunchedEffect(playing) {
+        if (playing == null) resumeItems = userState.continueWatching()
+    }
+
     // Back steps out one level at a time: player, then episodes, then the library.
     BackHandler(enabled = playing != null) { playing = null }
     BackHandler(enabled = series != null && playing == null) { series = null }
@@ -123,7 +133,7 @@ private fun JellyfinBrowser(settings: Settings, onExit: () -> Unit) {
     // Playback fills the whole screen with no header, like live TV.
     // Every other view keeps the header, and its back button steps out one level.
     when {
-        nowPlaying != null -> VodPlayer(nowPlaying.streamUrl)
+        nowPlaying != null -> VodPlayer(nowPlaying, userState)
         openSeries != null -> Column(Modifier.fillMaxSize().scanlines()) {
             CableHeader(title = openSeries.name.uppercase(), onBack = { series = null })
             Box(Modifier.weight(1f).fillMaxWidth()) {
@@ -145,6 +155,7 @@ private fun JellyfinBrowser(settings: Settings, onExit: () -> Unit) {
                 Library(
                     loading = loading,
                     loadError = loadError,
+                    leftOff = resumeItems.map { it.first },
                     resume = resume,
                     recent = recent,
                     providerMovies = providerMovies,
@@ -183,6 +194,7 @@ private fun JellyfinBrowser(settings: Settings, onExit: () -> Unit) {
 private fun Library(
     loading: Boolean,
     loadError: String?,
+    leftOff: List<VodItem>,
     resume: List<VodItem>,
     recent: List<VodItem>,
     providerMovies: List<VodItem>,
@@ -194,6 +206,7 @@ private fun Library(
     onSelect: (String, VodItem) -> Unit
 ) {
     val rows = listOfNotNull(
+        leftOff.takeIf { it.isNotEmpty() }?.let { "Pick up where you left off" to it },
         resume.takeIf { it.isNotEmpty() }?.let { "Continue watching" to it },
         recent.takeIf { it.isNotEmpty() }?.let { "Recently added" to it },
         providerMovies.takeIf { it.isNotEmpty() }?.let { "New movies" to it },
@@ -468,14 +481,20 @@ private fun EpisodeRow(
 }
 
 /**
- * Full-screen playback. The player takes focus so the remote's play, pause and
- * seek keys work, and a message appears if the stream will not start.
+ * Full-screen playback. It starts where the viewer stopped last time, saves the
+ * position as it plays, and shows a message if the stream will not start.
  */
 @Composable
-private fun VodPlayer(url: String) {
+private fun VodPlayer(item: VodItem, store: UserStateStore) {
     val context = LocalContext.current
     val player = remember { ExoPlayer.Builder(context).build() }
     var failed by remember { mutableStateOf(false) }
+
+    // The duration is unknown until the stream is ready, so nothing is saved before then.
+    fun savePosition() {
+        val duration = player.duration
+        if (duration > 0) store.saveResume(item, player.currentPosition, duration)
+    }
 
     DisposableEffect(player) {
         val listener = object : Player.Listener {
@@ -485,16 +504,26 @@ private fun VodPlayer(url: String) {
         }
         player.addListener(listener)
         onDispose {
+            savePosition()
             player.removeListener(listener)
             player.release()
         }
     }
 
-    LaunchedEffect(url) {
+    LaunchedEffect(item.streamUrl) {
         failed = false
-        player.setMediaItem(MediaItem.fromUri(url))
+        val start = store.resumePosition(item)
+        player.setMediaItem(MediaItem.fromUri(item.streamUrl), start)
         player.prepare()
         player.playWhenReady = true
+    }
+
+    // Save every ten seconds, so a crash or a power cut loses very little.
+    LaunchedEffect(item.streamUrl) {
+        while (true) {
+            delay(10_000)
+            if (player.isPlaying) savePosition()
+        }
     }
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
