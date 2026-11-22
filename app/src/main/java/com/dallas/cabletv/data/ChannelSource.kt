@@ -9,12 +9,33 @@ import java.util.concurrent.TimeUnit
  * carries categories and guide data. A plain M3U URL is the fallback.
  */
 object ChannelSource {
+    /** Every channel the source provides, minus the ones the user has hidden. */
     fun load(s: Settings): List<LiveChannel> =
+        fetchAll(s).filterNot { isHidden(it, s.hiddenTerms) }
+
+    private fun fetchAll(s: Settings): List<LiveChannel> =
         if (s.hasXtream) {
             XtreamClient(s.xtreamServer, s.xtreamUser, s.xtreamPass).liveChannels()
         } else {
             M3uParser.parse(fetchText(s.m3uUrl))
         }
+}
+
+/**
+ * A channel is hidden when its category matches a term exactly, or when its name
+ * starts with a term. A term ending in a letter or digit must stop at a word boundary,
+ * so "UK" hides "UK| BBC" but not "UKRAINE NEWS".
+ */
+fun isHidden(ch: LiveChannel, terms: List<String>): Boolean {
+    if (terms.isEmpty()) return false
+    val name = ch.name.uppercase().trim()
+    val group = ch.group.uppercase().trim()
+    return terms.any { term ->
+        val boundary = term.last().isLetterOrDigit()
+        group == term ||
+            (name.startsWith(term) &&
+                (!boundary || name.length == term.length || !name[term.length].isLetterOrDigit()))
+    }
 }
 
 private val playlistHttp = OkHttpClient.Builder()

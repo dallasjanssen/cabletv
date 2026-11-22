@@ -25,7 +25,8 @@ class SettingsStore(context: Context) {
         m3uUrl = prefs.getString(K_M3U, "").orEmpty(),
         jellyfinServer = prefs.getString(K_JS, "").orEmpty(),
         jellyfinToken = prefs.getString(K_JT, "").orEmpty(),
-        jellyfinUserId = prefs.getString(K_JU, "").orEmpty()
+        jellyfinUserId = prefs.getString(K_JU, "").orEmpty(),
+        hiddenFilters = prefs.getString(K_HIDDEN, "").orEmpty()
     )
 
     fun save(s: Settings) {
@@ -37,6 +38,7 @@ class SettingsStore(context: Context) {
             .putString(K_JS, s.jellyfinServer)
             .putString(K_JT, s.jellyfinToken)
             .putString(K_JU, s.jellyfinUserId)
+            .putString(K_HIDDEN, s.hiddenFilters)
             .apply()
     }
 
@@ -49,6 +51,7 @@ class SettingsStore(context: Context) {
 
     private companion object {
         const val K_LAST_CHANNEL = "last_channel_id"
+        const val K_HIDDEN = "hidden_filters"
         const val K_XS = "xtream_server"
         const val K_XU = "xtream_user"
         const val K_XP = "xtream_pass"

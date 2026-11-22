@@ -397,6 +397,7 @@ private fun SettingsScreen(
     var xu by remember { mutableStateOf(current.xtreamUser) }
     var xp by remember { mutableStateOf(current.xtreamPass) }
     var m3u by remember { mutableStateOf(current.m3uUrl) }
+    var hidden by remember { mutableStateOf(current.hiddenFilters) }
     var js by remember { mutableStateOf(current.jellyfinServer) }
     var ju by remember { mutableStateOf("") }
     var jp by remember { mutableStateOf("") }
@@ -443,7 +444,8 @@ private fun SettingsScreen(
                         m3uUrl = m3u.trim(),
                         jellyfinServer = jServer,
                         jellyfinToken = token,
-                        jellyfinUserId = userId
+                        jellyfinUserId = userId,
+                        hiddenFilters = hidden.trim()
                     )
                 }
             }
@@ -495,6 +497,13 @@ private fun SettingsScreen(
             subtitle = "M3U URL. Used only when no Xtream login is set."
         ) {
             CableField("Playlist URL", m3u) { m3u = it }
+        }
+
+        SettingsCard(
+            title = "HIDDEN CHANNELS",
+            subtitle = "Comma separated. A name prefix such as UK or US| hides every channel that starts with it. A category name hides that whole category. Hidden channels leave the guide and live TV."
+        ) {
+            CableField("Hide (for example UK, US|, Adult)", hidden) { hidden = it }
         }
 
         SettingsCard(

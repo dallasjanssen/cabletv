@@ -42,8 +42,14 @@ data class Settings(
     val m3uUrl: String = "",
     val jellyfinServer: String = "",
     val jellyfinToken: String = "",
-    val jellyfinUserId: String = ""
+    val jellyfinUserId: String = "",
+    /** Comma-separated prefixes and category names to hide from the guide and live TV. */
+    val hiddenFilters: String = ""
 ) {
+    /** The hidden filters, trimmed and upper-cased. */
+    val hiddenTerms: List<String>
+        get() = hiddenFilters.split(',').map { it.trim().uppercase() }.filter { it.isNotEmpty() }
+
     val hasXtream: Boolean
         get() = xtreamServer.isNotBlank() && xtreamUser.isNotBlank() && xtreamPass.isNotBlank()
 
