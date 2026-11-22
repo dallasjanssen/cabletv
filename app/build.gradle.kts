@@ -12,7 +12,8 @@ android {
         applicationId = "com.dallas.cabletv"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
+        // CI passes -PversionCode=<run number> so every release is newer than the last.
+        versionCode = (project.findProperty("versionCode") as? String)?.toIntOrNull() ?: 1
         versionName = "1.0"
     }
 
@@ -37,6 +38,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     compileOptions {

@@ -1,7 +1,14 @@
 package com.dallas.cabletv.ui
 
+import android.content.Intent
+import android.net.Uri
+import android.provider.Settings as AndroidSettings
 import android.view.KeyEvent
 import androidx.activity.compose.BackHandler
+import androidx.compose.ui.platform.LocalContext
+import com.dallas.cabletv.BuildConfig
+import com.dallas.cabletv.data.AppUpdater
+import java.io.File
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.focusable
@@ -65,6 +72,65 @@ fun CableApp(store: SettingsStore) {
         )
     }
     var restoredChannel by remember { mutableStateOf(false) }
+
+    val context = LocalContext.current
+    val updateScope = rememberCoroutineScope()
+    var update by remember { mutableStateOf<AppUpdater.Release?>(null) }
+    var updateMessage by remember { mutableStateOf<String?>(null) }
+    var updateBusy by remember { mutableStateOf(false) }
+
+    // Asks GitHub for a newer build. A manual check always reports back, an automatic one stays quiet.
+    fun checkForUpdate(manual: Boolean) {
+        updateBusy = true
+        updateScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching { AppUpdater.latest(BuildConfig.VERSION_CODE) }
+            }
+            updateBusy = false
+            result
+                .onSuccess { found ->
+                    update = found
+                    updateMessage = when {
+                        found != null -> "Build ${found.versionCode} is ready to install."
+                        manual -> "You have the latest build."
+                        else -> null
+                    }
+                }
+                .onFailure { if (manual) updateMessage = "Could not check for updates. ${it.message}" }
+        }
+    }
+
+    // Downloads the build and opens the system installer. Android asks the user to confirm.
+    fun installUpdate(release: AppUpdater.Release) {
+        if (!context.packageManager.canRequestPackageInstalls()) {
+            updateMessage = "Allow installs from CableTV, then press Install again."
+            context.startActivity(
+                Intent(
+                    AndroidSettings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                    Uri.parse("package:${context.packageName}")
+                ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+            return
+        }
+        updateBusy = true
+        updateMessage = "Downloading build ${release.versionCode}..."
+        updateScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    AppUpdater.download(release, File(context.cacheDir, "updates"))
+                }
+            }
+            updateBusy = false
+            result
+                .onSuccess { apk ->
+                    updateMessage = null
+                    AppUpdater.install(context, apk)
+                }
+                .onFailure { updateMessage = "Download failed. ${it.message}" }
+        }
+    }
+
+    LaunchedEffect(Unit) { checkForUpdate(manual = false) }
     var channels by remember { mutableStateOf<List<LiveChannel>>(emptyList()) }
     var channelsLoading by remember { mutableStateOf(false) }
     var channelError by remember { mutableStateOf<String?>(null) }
@@ -110,6 +176,7 @@ fun CableApp(store: SettingsStore) {
                 channelCount = channels.size,
                 liveReady = settings.hasLiveSource,
                 onDemandReady = settings.hasJellyfin || settings.hasXtream,
+                updateAvailable = update != null,
                 onOpen = navigate
             )
             // Full-bleed screens draw their own header, so playback can hide it.
@@ -145,7 +212,12 @@ fun CableApp(store: SettingsStore) {
                                 settings = updated
                                 screen = Screen.Home
                             },
-                            onExit = goHome
+                            onExit = goHome,
+                            update = update,
+                            updateMessage = updateMessage,
+                            updateBusy = updateBusy,
+                            onCheckUpdate = { checkForUpdate(manual = true) },
+                            onInstallUpdate = { installUpdate(it) }
                         )
                         else -> Unit
                     }
@@ -164,6 +236,7 @@ private fun HomeMenu(
     channelCount: Int,
     liveReady: Boolean,
     onDemandReady: Boolean,
+    updateAvailable: Boolean,
     onOpen: (Screen) -> Unit
 ) {
     val firstButton = remember { FocusRequester() }
@@ -201,7 +274,7 @@ private fun HomeMenu(
                 color = Cable.Led
             )
             Text(
-                text = "PRESS 1-4",
+                text = if (updateAvailable) "UPDATE READY IN SETTINGS" else "PRESS 1-4",
                 style = MaterialTheme.typography.labelMedium,
                 color = Cable.Ink3,
                 modifier = Modifier.padding(top = 14.dp)
@@ -294,7 +367,16 @@ private fun MenuButton(
 }
 
 @Composable
-private fun SettingsScreen(current: Settings, onSave: (Settings) -> Unit, onExit: () -> Unit) {
+private fun SettingsScreen(
+    current: Settings,
+    onSave: (Settings) -> Unit,
+    onExit: () -> Unit,
+    update: AppUpdater.Release?,
+    updateMessage: String?,
+    updateBusy: Boolean,
+    onCheckUpdate: () -> Unit,
+    onInstallUpdate: (AppUpdater.Release) -> Unit
+) {
     var xs by remember { mutableStateOf(current.xtreamServer) }
     var xu by remember { mutableStateOf(current.xtreamUser) }
     var xp by remember { mutableStateOf(current.xtreamPass) }
@@ -342,6 +424,21 @@ private fun SettingsScreen(current: Settings, onSave: (Settings) -> Unit, onExit
             CableField("Server URL", js) { js = it }
             CableField("Username (only to sign in again)", ju) { ju = it }
             CableField("Password", jp, secret = true) { jp = it }
+        }
+
+        SettingsCard(
+            title = "APP UPDATES",
+            subtitle = "Installed build ${BuildConfig.VERSION_CODE}. Installs always ask you to confirm."
+        ) {
+            updateMessage?.let { StatusLine(it) }
+            Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                OutlinedButton(enabled = !updateBusy, onClick = onCheckUpdate) { Text("CHECK") }
+                update?.let { release ->
+                    Button(enabled = !updateBusy, onClick = { onInstallUpdate(release) }) {
+                        Text("INSTALL BUILD ${release.versionCode}")
+                    }
+                }
+            }
         }
 
         message?.let { StatusLine(it) }
