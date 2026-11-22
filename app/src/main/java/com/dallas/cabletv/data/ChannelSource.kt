@@ -9,9 +9,8 @@ import java.util.concurrent.TimeUnit
  * carries categories and guide data. A plain M3U URL is the fallback.
  */
 object ChannelSource {
-    /** Every channel the source provides, minus the ones the user has hidden. */
-    fun load(s: Settings): List<LiveChannel> =
-        fetchAll(s).filterNot { isHidden(it, s.hiddenTerms) }
+    /** Every channel the source provides. Hiding is applied in the app, so ticking a box never re-downloads. */
+    fun load(s: Settings): List<LiveChannel> = fetchAll(s)
 
     private fun fetchAll(s: Settings): List<LiveChannel> =
         if (s.hasXtream) {
@@ -29,13 +28,41 @@ object ChannelSource {
 fun isHidden(ch: LiveChannel, terms: List<String>): Boolean {
     if (terms.isEmpty()) return false
     val name = ch.name.uppercase().trim()
-    val group = ch.group.uppercase().trim()
+    val group = ch.group.ifBlank { "Other" }.uppercase().trim()
     return terms.any { term ->
         val boundary = term.last().isLetterOrDigit()
         group == term ||
             (name.startsWith(term) &&
                 (!boundary || name.length == term.length || !name[term.length].isLetterOrDigit()))
     }
+}
+
+/** One checkbox in the hidden-channels list. [term] is what gets stored and matched. */
+data class ChannelFilter(val term: String, val label: String, val count: Int)
+
+private val countryPrefix = Regex("^([A-Za-z]{2})\\s*[|:\\-]")
+
+/**
+ * Builds the checkbox lists from the channels the provider sent.
+ * Country prefixes come from names such as "UK| BBC". Only prefixes used by two or more
+ * channels are offered, so ordinary names are not mistaken for countries.
+ */
+fun channelFilters(channels: List<LiveChannel>): Pair<List<ChannelFilter>, List<ChannelFilter>> {
+    val prefixes = channels
+        .mapNotNull { ch -> countryPrefix.find(ch.name.trim())?.groupValues?.get(1)?.uppercase() }
+        .groupingBy { it }
+        .eachCount()
+        .filter { it.value >= 2 }
+        .map { (prefix, count) -> ChannelFilter(term = prefix, label = prefix, count = count) }
+        .sortedBy { it.term }
+
+    val categories = channels
+        .groupingBy { it.group.trim().ifBlank { "Other" } }
+        .eachCount()
+        .map { (group, count) -> ChannelFilter(term = group.uppercase(), label = group, count = count) }
+        .sortedBy { it.label }
+
+    return prefixes to categories
 }
 
 private val playlistHttp = OkHttpClient.Builder()

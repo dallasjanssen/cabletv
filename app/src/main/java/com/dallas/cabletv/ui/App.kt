@@ -40,6 +40,8 @@ import com.dallas.cabletv.data.LiveChannel
 import com.dallas.cabletv.data.Settings
 import com.dallas.cabletv.data.SettingsStore
 import com.dallas.cabletv.data.XtreamClient
+import com.dallas.cabletv.data.channelFilters
+import com.dallas.cabletv.data.isHidden
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -67,7 +69,11 @@ fun CableApp(store: SettingsStore) {
     }
     // The screen the user came from, so Back returns there instead of always going home.
     var previous by remember { mutableStateOf(Screen.Home) }
-    var channels by remember { mutableStateOf<List<LiveChannel>>(emptyList()) }
+    // Every channel the source sent, and the list the screens show after hidden channels are removed.
+    var loadedChannels by remember { mutableStateOf<List<LiveChannel>>(emptyList()) }
+    val channels = remember(loadedChannels, settings) {
+        loadedChannels.filterNot { isHidden(it, settings.hiddenTerms) }
+    }
     var channelsLoading by remember { mutableStateOf(false) }
     var channelError by remember { mutableStateOf<String?>(null) }
     var tuneIndex by remember { mutableIntStateOf(0) }
@@ -87,16 +93,24 @@ fun CableApp(store: SettingsStore) {
         }
     }
 
-    // Reload the channel list whenever the live source settings change.
-    LaunchedEffect(settings) {
-        channels = emptyList()
+    // Reload the channel list only when the live source login changes. Hiding channels does not reload.
+    LaunchedEffect(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass, settings.m3uUrl) {
+        loadedChannels = emptyList()
         channelError = null
         if (!settings.hasLiveSource) return@LaunchedEffect
         channelsLoading = true
         withContext(Dispatchers.IO) { runCatching { ChannelSource.load(settings) } }
-            .onSuccess { channels = it }
+            .onSuccess { loadedChannels = it }
             .onFailure { channelError = it.message ?: "Could not load channels" }
         channelsLoading = false
+    }
+
+    // Ticking a checkbox saves straight away, so there is no SAVE step to forget on a remote.
+    val toggleFilter: (String) -> Unit = { term ->
+        val set = settings.hiddenTerms.toMutableSet()
+        if (!set.remove(term)) set.add(term)
+        settings = settings.copy(hiddenFilters = set.joinToString(","))
+        store.save(settings)
     }
 
     // Until the saved channel is found, live TV starts on it directly, so channel 1 never plays first.
@@ -232,7 +246,9 @@ fun CableApp(store: SettingsStore) {
                             updateMessage = updateMessage,
                             updateBusy = updateBusy,
                             onCheckUpdate = { checkForUpdate(manual = true) },
-                            onInstallUpdate = { installUpdate(it) }
+                            onInstallUpdate = { installUpdate(it) },
+                            allChannels = loadedChannels,
+                            onToggleFilter = toggleFilter
                         )
                         else -> Unit
                     }
@@ -391,13 +407,14 @@ private fun SettingsScreen(
     updateMessage: String?,
     updateBusy: Boolean,
     onCheckUpdate: () -> Unit,
-    onInstallUpdate: (AppUpdater.Release) -> Unit
+    onInstallUpdate: (AppUpdater.Release) -> Unit,
+    allChannels: List<LiveChannel>,
+    onToggleFilter: (String) -> Unit
 ) {
     var xs by remember { mutableStateOf(current.xtreamServer) }
     var xu by remember { mutableStateOf(current.xtreamUser) }
     var xp by remember { mutableStateOf(current.xtreamPass) }
     var m3u by remember { mutableStateOf(current.m3uUrl) }
-    var hidden by remember { mutableStateOf(current.hiddenFilters) }
     var js by remember { mutableStateOf(current.jellyfinServer) }
     var ju by remember { mutableStateOf("") }
     var jp by remember { mutableStateOf("") }
@@ -445,7 +462,7 @@ private fun SettingsScreen(
                         jellyfinServer = jServer,
                         jellyfinToken = token,
                         jellyfinUserId = userId,
-                        hiddenFilters = hidden.trim()
+                        hiddenFilters = current.hiddenFilters
                     )
                 }
             }
@@ -501,9 +518,13 @@ private fun SettingsScreen(
 
         SettingsCard(
             title = "HIDDEN CHANNELS",
-            subtitle = "Comma separated. A name prefix such as UK or US| hides every channel that starts with it. A category name hides that whole category. Hidden channels leave the guide and live TV."
+            subtitle = "Tick a country or category to hide its channels from the guide and live TV. Press OK to tick or untick."
         ) {
-            CableField("Hide (for example UK, US|, Adult)", hidden) { hidden = it }
+            HiddenChannelFilters(
+                allChannels = allChannels,
+                hiddenTerms = current.hiddenTerms,
+                onToggle = onToggleFilter
+            )
         }
 
         SettingsCard(
@@ -531,6 +552,110 @@ private fun SettingsScreen(
                     )
                 }
             }
+        }
+    }
+}
+
+/** Checkbox lists of country prefixes and categories, built from the channels the provider sent. */
+@Composable
+private fun HiddenChannelFilters(
+    allChannels: List<LiveChannel>,
+    hiddenTerms: List<String>,
+    onToggle: (String) -> Unit
+) {
+    if (allChannels.isEmpty()) {
+        Text(
+            text = "Connect a live source to see its countries and categories.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = Cable.Ink2
+        )
+        return
+    }
+    val (prefixes, categories) = remember(allChannels) { channelFilters(allChannels) }
+
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        if (prefixes.isNotEmpty()) {
+            Text(
+                text = "COUNTRY PREFIXES",
+                style = MaterialTheme.typography.labelMedium,
+                color = Cable.Accent
+            )
+            prefixes.forEach { f ->
+                FilterCheckbox(
+                    label = f.label,
+                    count = f.count,
+                    checked = f.term in hiddenTerms,
+                    onToggle = { onToggle(f.term) }
+                )
+            }
+        }
+        if (categories.isNotEmpty()) {
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text = "CATEGORIES",
+                style = MaterialTheme.typography.labelMedium,
+                color = Cable.Accent
+            )
+            categories.forEach { f ->
+                FilterCheckbox(
+                    label = f.label,
+                    count = f.count,
+                    checked = f.term in hiddenTerms,
+                    onToggle = { onToggle(f.term) }
+                )
+            }
+        }
+    }
+}
+
+/**
+ * A large checkbox row for the remote. A ticked box means the channels are hidden.
+ * The whole row is one focus target, so OK toggles it and the ring shows where you are.
+ */
+@Composable
+private fun FilterCheckbox(label: String, count: Int, checked: Boolean, onToggle: () -> Unit) {
+    FocusSurface(
+        onClick = onToggle,
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(8.dp),
+        focusScale = 1f
+    ) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .background(Cable.Surface)
+                .padding(horizontal = 24.dp, vertical = 16.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                Modifier
+                    .size(36.dp)
+                    .border(3.dp, if (checked) Cable.Led else Cable.Ink3, RoundedCornerShape(4.dp))
+                    .background(if (checked) Cable.Led else Color.Transparent),
+                contentAlignment = Alignment.Center
+            ) {
+                if (checked) {
+                    Text(
+                        text = "X",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = Cable.Canvas
+                    )
+                }
+            }
+            Spacer(Modifier.width(24.dp))
+            Text(
+                text = label,
+                style = MaterialTheme.typography.titleMedium,
+                color = if (checked) Cable.Ink3 else Cable.Ink,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f)
+            )
+            Text(
+                text = "$count",
+                style = MaterialTheme.typography.bodyMedium,
+                color = Cable.Ink2
+            )
         }
     }
 }
