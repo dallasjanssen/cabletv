@@ -1,6 +1,7 @@
 package com.dallas.cabletv.ui
 
 import android.view.KeyEvent
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -12,6 +13,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -71,6 +73,10 @@ fun LiveTvScreen(
     var bannerTick by remember { mutableIntStateOf(0) }
     var digits by remember { mutableStateOf("") }
     var nowNext by remember { mutableStateOf<NowNext?>(null) }
+    // The mini guide opens with the left button. Up and down browse, OK tunes, right or Back closes.
+    var showMiniGuide by remember { mutableStateOf(false) }
+    var guideHighlight by remember { mutableIntStateOf(0) }
+    BackHandler(enabled = showMiniGuide) { showMiniGuide = false }
     val focus = remember { FocusRequester() }
     val current = channels.getOrNull(index)
 
@@ -139,6 +145,25 @@ fun LiveTvScreen(
         flashBanner()
     }
 
+    fun pickGuideChannel(idx: Int) {
+        index = idx
+        digits = ""
+        showMiniGuide = false
+        flashBanner()
+    }
+
+    fun handleMiniGuideKey(code: Int) {
+        val last = (channels.size - 1).coerceAtLeast(0)
+        when (code) {
+            KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_CHANNEL_UP ->
+                guideHighlight = (guideHighlight - 1).coerceAtLeast(0)
+            KeyEvent.KEYCODE_DPAD_DOWN, KeyEvent.KEYCODE_CHANNEL_DOWN ->
+                guideHighlight = (guideHighlight + 1).coerceAtMost(last)
+            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> pickGuideChannel(guideHighlight)
+            KeyEvent.KEYCODE_DPAD_RIGHT -> showMiniGuide = false
+        }
+    }
+
     LaunchedEffect(Unit) { focus.requestFocus() }
 
     Box(
@@ -149,7 +174,17 @@ fun LiveTvScreen(
             .focusable()
             .onPreviewKeyEvent { ev ->
                 if (ev.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
-                when (val code = ev.nativeKeyEvent.keyCode) {
+                val code = ev.nativeKeyEvent.keyCode
+                if (showMiniGuide) {
+                    handleMiniGuideKey(code)
+                    return@onPreviewKeyEvent true
+                }
+                when (code) {
+                    KeyEvent.KEYCODE_DPAD_LEFT -> {
+                        guideHighlight = index
+                        showMiniGuide = true
+                        true
+                    }
                     KeyEvent.KEYCODE_CHANNEL_UP, KeyEvent.KEYCODE_DPAD_UP -> {
                         tune(1)
                         true
@@ -214,8 +249,18 @@ fun LiveTvScreen(
             )
         }
 
+        if (showMiniGuide && channels.isNotEmpty()) {
+            MiniGuide(
+                channels = channels,
+                highlight = guideHighlight,
+                current = index,
+                onPick = { pickGuideChannel(it) },
+                modifier = Modifier.align(Alignment.CenterStart)
+            )
+        }
+
         AnimatedVisibility(
-            visible = showBanner && current != null,
+            visible = showBanner && current != null && !showMiniGuide,
             modifier = Modifier.align(Alignment.BottomCenter),
             enter = fadeIn(),
             exit = fadeOut()
@@ -298,6 +343,65 @@ private fun ChannelBanner(channel: LiveChannel, nn: NowNext?) {
             }
 
             next?.let { UpNextCard(it) }
+        }
+    }
+}
+
+/**
+ * A channel list over the left side of the picture. The highlighted row moves
+ * with the remote and does not change the channel until OK is pressed.
+ */
+@Composable
+private fun MiniGuide(
+    channels: List<LiveChannel>,
+    highlight: Int,
+    current: Int,
+    onPick: (Int) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val listState = rememberLazyListState()
+    LaunchedEffect(highlight) {
+        if (highlight in channels.indices) listState.animateScrollToItem(highlight)
+    }
+
+    Column(
+        modifier
+            .fillMaxHeight()
+            .width(560.dp)
+            .background(Cable.Canvas.copy(alpha = 0.92f))
+            .padding(vertical = 32.dp)
+    ) {
+        Text(
+            text = "CHANNELS",
+            style = MaterialTheme.typography.labelMedium,
+            color = Cable.Accent,
+            modifier = Modifier.padding(start = 28.dp, bottom = 12.dp)
+        )
+        LazyColumn(Modifier.weight(1f), state = listState) {
+            itemsIndexed(channels, key = { _, c -> c.id }) { idx, ch ->
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .background(if (idx == highlight) Cable.SurfaceHi else Color.Transparent)
+                        .clickable { onPick(idx) }
+                        .padding(horizontal = 28.dp, vertical = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = ch.number.toString(),
+                        style = MaterialTheme.typography.titleMedium,
+                        color = Cable.Accent,
+                        modifier = Modifier.width(88.dp)
+                    )
+                    Text(
+                        text = ch.name,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = if (idx == current) Cable.Led else Cable.Ink,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
         }
     }
 }
