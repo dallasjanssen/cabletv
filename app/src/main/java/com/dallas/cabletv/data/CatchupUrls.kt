@@ -79,7 +79,8 @@ private fun fillTemplate(
     val hasUrl = out.contains("{url}", ignoreCase = true)
     if (hasUrl) {
         out = out.replace("{url}", streamUrl, ignoreCase = true)
-    } else if (!out.startsWith("http://", ignoreCase = true) && !out.startsWith("https://", ignoreCase = true)) {
+    } else if (!FULL_ADDRESS.containsMatchIn(out)) {
+        // Only a template that is not a full address of its own (any scheme, or //host) is joined to the stream.
         out = when {
             out.startsWith("?") || out.startsWith("&") -> {
                 val joiner = if (streamUrl.contains("?")) "&" else "?"
@@ -91,6 +92,9 @@ private fun fillTemplate(
     }
     return out
 }
+
+/** A full address: a scheme such as http://, rtsp:// or udp://, or a scheme-relative //host. */
+private val FULL_ADDRESS = Regex("""^(?:[A-Za-z][A-Za-z0-9+.-]*://|//)""")
 
 private fun flussonicArchive(streamUrl: String, startSec: Long, durationSec: Long, ext: String): String {
     val noQuery = streamUrl.substringBefore("?")

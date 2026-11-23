@@ -331,7 +331,12 @@ fun GuideScreen(
                             val i = cells.indexOfFirst { it.start == f.start }
                             // "No guide information" has nothing after it.
                             if (i < 0 || cells[i].program === NO_INFO) return true
-                            val next = stepRight(cells, i, windowStart, slots * SLOT, lastWindow) ?: return true
+                            val next = stepRight(cells, i, windowStart, slots * SLOT, lastWindow)
+                            if (next == null) {
+                                // The last show runs past the edge: move the grid on so the rest of it comes into view.
+                                if (cells[i].end > windowStart + slots * SLOT && windowStart < lastWindow) windowStart += SLOT
+                                return true
+                            }
                             val nextStart = next.start ?: return true
                             windowStart = next.windowStart
                             anchor = nextStart
@@ -597,6 +602,8 @@ fun GuideScreen(
                     onGroupChange(g)
                     showCategories = false
                     val list = rowsFor(g, channels, favorites, recents)
+                    // The picked category puts the highlight on its first row, so the "rows arrived" step leaves it there.
+                    hadRows = list.isNotEmpty()
                     anchor = maxOf(now, windowStart)
                     focus = GuideFocus(0, list.firstOrNull()?.let { cellAt(it, anchor, windowEnd(windowStart, outerNarrow)) })
                     focusTick++

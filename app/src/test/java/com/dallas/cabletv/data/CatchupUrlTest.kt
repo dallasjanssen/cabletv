@@ -54,6 +54,12 @@ class CatchupUrlTest {
     }
 
     @Test
+    fun fullAddressTemplatesAreNotAppended() {
+        assertEquals("rtsp://cam/x?s=1700000000", m3uCatchupUrl("http://example/live", "default", "rtsp://cam/x?s={utc}", start, end, start))
+        assertEquals("//cdn/x?s=1700000000", m3uCatchupUrl("http://example/live", "default", "//cdn/x?s={utc}", start, end, start))
+    }
+
+    @Test
     fun urlPlaceholderIsNotAppended() {
         val url = m3uCatchupUrl("http://example/live", "default", "{url}?from=\${start}", start, end, start)
         assertEquals("http://example/live?from=1700000000", url)

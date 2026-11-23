@@ -55,6 +55,7 @@ object EpgCache {
         val feeds = mutableListOf<Map<String, List<Program>>>()
         val names = mutableListOf<Pair<String, String>>()
         val failed = mutableListOf<String>()
+        var cutShort = false
         for (url in urls.distinct()) {
             runCatching {
                 val req = Request.Builder().url(url).header("User-Agent", PLAYER_USER_AGENT).build()
@@ -64,17 +65,25 @@ object EpgCache {
                     val parsed = parse(body.byteStream())
                     feeds += parsed.programs
                     names += parsed.names
+                    // A feed cut off part way is used, but reported, and does not wipe what it did not reach.
+                    if (!parsed.complete) {
+                        cutShort = true
+                        failed += url
+                    }
                 }
             }.onFailure { failed += url }
         }
         // Two feeds often carry the same listings, so each show is kept once.
-        val stored = mergeSchedules(feeds)
+        val fresh = mergeSchedules(feeds)
+        // After a cut off feed, channels it did not reach keep their earlier listings.
+        val stored = if (cutShort) synchronized(lock) { programs } + fresh else fresh
         if (stored.isNotEmpty() && generation == refreshGeneration.get()) {
             val keys = buildEpgAliases(stored.keys, names)
             synchronized(lock) {
                 if (generation == refreshGeneration.get()) {
+                    // Kept listings keep their display names too. New names win.
+                    aliases = if (cutShort) aliases.filterValues { it in stored } + keys else keys
                     programs = stored
-                    aliases = keys
                 }
             }
         }
@@ -188,12 +197,14 @@ object EpgCache {
         val to = now + AHEAD_MS
         val out = HashMap<String, MutableList<Program>>()
         val names = mutableListOf<Pair<String, String>>()
+        var complete = true
         try {
             readFeed(input, from, to, out, names)
         } catch (e: Exception) {
             if (out.isEmpty()) throw e
+            complete = false
         }
-        return ParsedGuide(out.mapValues { (_, list) -> tidySchedule(list, from, to) }, names)
+        return ParsedGuide(out.mapValues { (_, list) -> tidySchedule(list, from, to) }, names, complete)
     }
 
     private fun readFeed(
@@ -330,7 +341,9 @@ internal fun mergeSchedules(feeds: List<Map<String, List<Program>>>): Map<String
 
 internal data class ParsedGuide(
     val programs: Map<String, List<Program>>,
-    val names: List<Pair<String, String>>
+    val names: List<Pair<String, String>>,
+    /** False when the feed broke part way and only what came before the break was read. */
+    val complete: Boolean = true
 )
 
 /** Letters and digits only, so `TNT.us` and `tnt us` can meet. Called for every channel, so it avoids a regex. */

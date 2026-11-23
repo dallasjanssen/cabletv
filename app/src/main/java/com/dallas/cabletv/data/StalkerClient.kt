@@ -34,7 +34,8 @@ class StalkerClient(portal: String, mac: String) {
     /** Now and next from the portal's short listing. */
     fun shortEpg(channelId: String): NowNext {
         val id = channelId.removePrefix("stk:")
-        val js = getChecked("type=itv&action=get_short_epg&ch_id=$id") { it.dataArray() != null }
+        // A channel with no listings is a normal answer. Only a rejected sign-in is tried again.
+        val js = getChecked("type=itv&action=get_short_epg&ch_id=$id") { true }
         val arr = js.dataArray() ?: return NowNext(null, null)
         val programs = (0 until arr.length()).mapNotNull { i ->
             val o = arr.optJSONObject(i) ?: return@mapNotNull null
