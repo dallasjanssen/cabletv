@@ -122,7 +122,7 @@ class PhoneSignInServer(
                     val line = readLine(input, MAX_LINE) ?: break
                     if (line.isEmpty()) break
                     if (++headers > MAX_HEADERS) {
-                        respond(sock, "431 Request Header Fields Too Large", page("Request too large."))
+                        respondHtml(sock, "431 Request Header Fields Too Large", page("Request too large."))
                         return
                     }
                     if (line.startsWith("Content-Length:", ignoreCase = true)) {
@@ -130,7 +130,7 @@ class PhoneSignInServer(
                     }
                 }
                 if (contentLength < 0L) {
-                    respond(sock, "400 Bad Request", page("Bad request."))
+                    respondHtml(sock, "400 Bad Request", page("Bad request."))
                     return
                 }
 
@@ -152,7 +152,8 @@ class PhoneSignInServer(
                             given == null || !sameCode(given) -> respondHtml(sock, "403 Forbidden", page("Scan the code on the TV."))
                             backupJson == null -> respondHtml(sock, "404 Not Found", page("Backup is not available here."))
                             else -> {
-                                val text = runCatching { backupJson.invoke() }.getOrElse {
+                                val provider = backupJson ?: return
+                                val text = runCatching { provider.invoke() }.getOrElse {
                                     respondHtml(sock, "500 Internal Server Error", page("Backup failed. Check the TV and try again."))
                                     return
                                 }
