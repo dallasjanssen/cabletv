@@ -296,6 +296,12 @@ fun CableApp(store: SettingsStore) {
     var showProfiles by remember { mutableStateOf(false) }
     fun switchProfile(id: String) {
         profileStore.setActive(id)
+        if (id != profileId) {
+            // Each profile returns to its own last channel, and does not take over the one playing now.
+            store.lastChannelId(id)?.let { currentChannelId = it }
+            priorChannelId = null
+            watchedId = null
+        }
         profileId = id
         contentUnlocked = false
     }
@@ -354,6 +360,8 @@ fun CableApp(store: SettingsStore) {
     // A locked channel does not play. Live TV says so and OK asks for the PIN; other screens stay as they are.
     val channelLocked = current != null && lockedNow(current)
     val playUrl = if (channelLocked) null else replay ?: current?.streamUrl
+    // The Stalker channel whose failure was already announced, so retries do not repeat the toast.
+    var stalkerToastFor by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(playUrl, liveActive, foreground, current?.origin, live.reloadRequests) {
         if (!liveActive || !foreground || playUrl == null) {
             live.stop()
@@ -371,8 +379,13 @@ fun CableApp(store: SettingsStore) {
             else withContext(Dispatchers.IO) { runCatching { portal.resolveLink(ch.streamUrl) }.getOrNull() }
             if (url == null) {
                 live.fail()
-                showToast("That channel did not start")
+                // The no signal screen tries again every so often. The toast is only shown once per channel.
+                if (stalkerToastFor != ch.id) {
+                    stalkerToastFor = ch.id
+                    showToast("That channel did not start")
+                }
             } else {
+                stalkerToastFor = null
                 live.play(url)
             }
         } else {

@@ -3,6 +3,7 @@ package com.dallas.cabletv.ui
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.view.KeyEvent
 import android.view.LayoutInflater
 import androidx.activity.compose.BackHandler
@@ -91,6 +92,10 @@ class LivePlayer(context: Context) {
     private var played = false
     private var retries = 0
     private var replay = false
+    // A live stream that keeps ending soon after it starts is counted, so it ends in No signal
+    // instead of being loaded again forever.
+    private var readyAt = 0L
+    private var quickEnds = 0
     private val handler = Handler(Looper.getMainLooper())
     // Channels whose main stream the provider refused, mapped to the MPEG-TS address that worked instead.
     private val fallbackFor = HashMap<String, String>()
@@ -126,10 +131,16 @@ class LivePlayer(context: Context) {
                 played = true
                 retries = 0
                 failed = false
+                readyAt = SystemClock.elapsedRealtime()
             }
             if (playbackState == Player.STATE_ENDED) {
                 // A replay that finished goes back to live. A live stream that the provider closed loads again.
-                if (replay) replayEnds++ else retryLater(reload = true)
+                if (replay) {
+                    replayEnds++
+                } else {
+                    quickEnds = if (SystemClock.elapsedRealtime() - readyAt < QUICK_END_MS) quickEnds + 1 else 0
+                    if (quickEnds >= MAX_QUICK_ENDS) failed = true else retryLater(reload = true)
+                }
             }
         }
 
@@ -180,6 +191,7 @@ class LivePlayer(context: Context) {
         failed = false
         played = false
         retries = 0
+        quickEnds = 0
         behindLive = false
         // A track picked on the previous channel must not stick. The saved language still applies.
         exo.trackSelectionParameters = exo.trackSelectionParameters.buildUpon().clearOverrides().build()
@@ -193,6 +205,7 @@ class LivePlayer(context: Context) {
         val target = url
         handler.removeCallbacksAndMessages(null)
         retries = 0
+        quickEnds = 0
         failed = false
         played = false
         if (target == null) {
@@ -251,7 +264,8 @@ class LivePlayer(context: Context) {
     fun atLiveEdge(): Boolean {
         if (failed || !behindLive) return true
         if (!playing) return false
-        val edge = liveEdgeMs() ?: return false
+        // A stream with no live window (plain MPEG-TS) cannot be moved through, so once it plays again it counts as live.
+        val edge = liveEdgeMs() ?: return true
         return exo.currentPosition >= edge - 3_000L
     }
 
@@ -294,6 +308,8 @@ class LivePlayer(context: Context) {
 
     private companion object {
         const val MAX_RETRIES = 4
+        const val QUICK_END_MS = 15_000L
+        const val MAX_QUICK_ENDS = 3
     }
 }
 
@@ -405,6 +421,8 @@ fun LiveTvScreen(
     // With no panel open, the screen itself holds focus so it receives the remote's keys. This runs
     // again when the PIN pad or a reminder closes, so the next key press is not lost.
     LaunchedEffect(panel, overlayOpen, emptyActions) {
+        // A PIN pad or a reminder on top closes the options bar or channel list, so focus has one place to come back to.
+        if (overlayOpen && panel != LivePanel.None) panel = LivePanel.None
         if (panel != LivePanel.None || overlayOpen) return@LaunchedEffect
         withFrameNanos { }
         if (emptyActions) runCatching { emptyAction.requestFocus() } else runCatching { rootFocus.requestFocus() }
