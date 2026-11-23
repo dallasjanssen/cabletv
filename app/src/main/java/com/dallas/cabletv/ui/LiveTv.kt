@@ -573,7 +573,7 @@ fun LiveTvScreen(
                 resizeMode = player.resizeMode,
                 onResize = { player.resizeMode = it },
                 onAudioLanguage = { TrackMemory.saveAudio(context, player.exo, it) },
-                onCaptionsLanguage = { TrackMemory.saveCaptions(context, player.exo, it) },
+                onCaptions = { enabled, language -> TrackMemory.saveCaptions(context, player.exo, enabled, language) },
                 onClose = { close() },
                 modifier = Modifier.align(Alignment.CenterEnd)
             )
