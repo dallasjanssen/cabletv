@@ -46,6 +46,7 @@ import com.dallas.cabletv.data.Settings
 import com.dallas.cabletv.data.UserStateStore
 import com.dallas.cabletv.data.VodItem
 import com.dallas.cabletv.data.XtreamClient
+import com.dallas.cabletv.data.newPlayer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -461,7 +462,7 @@ private fun VodPlayer(
     onExit: () -> Unit
 ) {
     val context = LocalContext.current
-    val player = remember { ExoPlayer.Builder(context).build() }
+    val player = remember { newPlayer(context) }
     var failed by remember { mutableStateOf(false) }
     var controls by remember { mutableStateOf(true) }
     var tracks by remember { mutableStateOf(false) }

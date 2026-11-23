@@ -9,7 +9,11 @@ data class LiveChannel(
     val streamUrl: String,
     val epgId: String?,
     /** True when the provider keeps a replay archive for this channel. */
-    val catchup: Boolean = false
+    val catchup: Boolean = false,
+    /** Days of archive the provider keeps. Zero when it did not say; replay then uses one day. */
+    val archiveDays: Int = 0,
+    /** MPEG-TS address tried once when [streamUrl] is refused before playback starts. */
+    val fallbackStreamUrl: String? = null
 )
 
 data class Program(

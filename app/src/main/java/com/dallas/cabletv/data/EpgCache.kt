@@ -31,13 +31,13 @@ object EpgCache {
 
     /** Downloads the feed from an Xtream login and replaces the cache. Runs on a background thread. */
     fun refresh(server: String, user: String, pass: String) {
-        val base = server.trim().trimEnd('/')
+        val base = normalizeXtreamServerUrl(server)
         refreshUrl("$base/xmltv.php?username=${enc(user)}&password=${enc(pass)}")
     }
 
     /** Downloads any XMLTV feed by URL and replaces the cache. Runs on a background thread. */
     fun refreshUrl(url: String) {
-        val req = Request.Builder().url(url).header("User-Agent", "CableTV/1.0").build()
+        val req = Request.Builder().url(url).header("User-Agent", PLAYER_USER_AGENT).build()
         http.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) error("XMLTV returned HTTP ${resp.code}")
             val body = resp.body ?: error("Empty XMLTV response")
@@ -71,17 +71,17 @@ object EpgCache {
     /** True once a feed has been loaded, so screens can tell "no data yet" from "no data for this channel". */
     fun hasData(): Boolean = synchronized(lock) { programs.isNotEmpty() }
 
-    /** Programmes that already aired on a channel in the last day, newest first. */
-    fun pastPrograms(epgId: String?): List<Program> {
+    /**
+     * Programmes that already aired on a channel inside [withinMs], newest first.
+     * The feed itself only keeps one day, so a longer archive still shows that day.
+     */
+    fun pastPrograms(epgId: String?, withinMs: Long = DAY_MS): List<Program> {
         if (epgId.isNullOrBlank()) return emptyList()
         val list = synchronized(lock) { programs[epgId] } ?: return emptyList()
-        val now = System.currentTimeMillis()
-        return list
-            .filter { it.end <= now && it.end - it.start >= 60_000L }
-            .sortedByDescending { it.start }
+        return finishedWithin(list, System.currentTimeMillis(), withinMs)
     }
 
-    private fun enc(value: String): String = URLEncoder.encode(value, "UTF-8")
+    private fun enc(value: String): String = URLEncoder.encode(value, "UTF-8").replace("+", "%20")
 
     /** Reads XMLTV with a streaming parser, keeping only the window around now. */
     internal fun parse(input: InputStream): Map<String, List<Program>> {

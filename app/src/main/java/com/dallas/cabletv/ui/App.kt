@@ -156,6 +156,7 @@ fun CableApp(store: SettingsStore) {
         }
     }
     val current = channels.getOrNull(index)
+    val currentId by rememberUpdatedState(current?.id)
 
     // ------------------------------------------------------------ Profiles
     val profileStore = remember { ProfileStore(context) }
@@ -191,7 +192,7 @@ fun CableApp(store: SettingsStore) {
         }
         // A short wait means holding a key only loads the channel you stop on.
         delay(250)
-        live.play(playUrl)
+        live.play(playUrl, if (replayUrl == null) current?.fallbackStreamUrl else null)
     }
     // Remember the channel on screen, so the next launch returns to it and it joins Recently watched.
     LaunchedEffect(current?.id, profileId) {
@@ -420,8 +421,22 @@ fun CableApp(store: SettingsStore) {
                     },
                     onToggleFavorite = toggleFavorite,
                     onReplay = { ch, p ->
-                        replayUrl = xtream?.timeshiftUrl(ch.id, p.start, p.end)
-                        if (replayUrl != null) showToast("Playing ${p.title} from the start")
+                        val client = xtream
+                        if (client != null) {
+                            scope.launch {
+                                // The provider is asked which replay address works, so this runs off the main thread.
+                                val url = withContext(Dispatchers.IO) {
+                                    runCatching { client.resolveTimeshiftUrl(ch.id, p.start, p.end) }.getOrNull()
+                                }
+                                when {
+                                    url == null -> showToast("${p.title} is not available to replay")
+                                    currentId == ch.id -> {
+                                        replayUrl = url
+                                        showToast("Playing ${p.title} from the start")
+                                    }
+                                }
+                            }
+                        }
                     },
                     onReturnToLive = {
                         replayUrl = null

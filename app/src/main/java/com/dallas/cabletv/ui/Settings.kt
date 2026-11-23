@@ -42,6 +42,7 @@ import com.dallas.cabletv.data.ProfileStore
 import com.dallas.cabletv.data.Settings
 import com.dallas.cabletv.data.XtreamClient
 import com.dallas.cabletv.data.channelFilters
+import com.dallas.cabletv.data.xtreamLoginFields
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -60,16 +61,20 @@ enum class SettingsPane(val label: String, val icon: ImageVector) {
 /** Checks a TV provider login, or accepts a playlist link, and returns the settings to save. */
 suspend fun checkLiveLogin(current: Settings, server: String, user: String, pass: String, m3u: String): Settings =
     withContext(Dispatchers.IO) {
-        val xs = server.trim()
-        val xu = user.trim()
         val playlist = m3u.trim()
-        if (xs.isNotEmpty() || xu.isNotEmpty() || pass.isNotEmpty()) {
-            require(xs.isNotEmpty() && xu.isNotEmpty() && pass.isNotEmpty()) { "Fill in the server, username and password" }
-            check(XtreamClient(xs, xu, pass).login()) { "The provider did not accept that login. Check the server, username and password" }
+        // A pasted playlist link in the server field fills in a blank username and password.
+        val (xs, xu, xp) = if (server.isNotBlank() || user.isNotBlank() || pass.isNotBlank()) {
+            xtreamLoginFields(server, user, pass)
+        } else {
+            Triple("", "", "")
+        }
+        if (xs.isNotEmpty() || xu.isNotEmpty() || xp.isNotEmpty()) {
+            require(xs.isNotEmpty() && xu.isNotEmpty() && xp.isNotEmpty()) { "Fill in the server, username and password" }
+            XtreamClient(xs, xu, xp).requireActive()
         } else {
             require(playlist.isNotEmpty()) { "Enter a provider login or a playlist link" }
         }
-        current.copy(xtreamServer = xs, xtreamUser = xu, xtreamPass = pass, m3uUrl = playlist)
+        current.copy(xtreamServer = xs, xtreamUser = xu, xtreamPass = xp, m3uUrl = playlist)
     }
 
 /** Signs in to Jellyfin and returns the settings to save. The password is used once and not stored. */
@@ -137,6 +142,9 @@ fun SettingsScreen(
         scope.launch {
             runCatching { checkLiveLogin(latest, drafts.xs, drafts.xu, drafts.xp, drafts.m3u) }
                 .onSuccess {
+                    drafts.xs = it.xtreamServer
+                    drafts.xu = it.xtreamUser
+                    drafts.xp = it.xtreamPass
                     onSave(it)
                     liveMessage = "Saved. Your channels are loading."
                     after("Live TV is connected.")
@@ -333,7 +341,7 @@ private fun LivePane(
     onSave: () -> Unit,
     onSignOut: () -> Unit
 ) {
-    PaneTitle("Live TV", "Your TV provider login. Channels and the guide come from here.")
+    PaneTitle("Live TV", "Your TV provider login. Channels and the guide come from here. A full playlist link pasted into Server fills in the username and password.")
     if (settings.hasLiveSource) {
         StatusChip(if (channelCount > 0) "Connected · $channelCount channels" else "Connected", ok = true)
     } else {

@@ -44,6 +44,8 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
+import com.dallas.cabletv.data.newPlayer
+import com.dallas.cabletv.data.playbackHttpStatus
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import com.dallas.cabletv.R
@@ -58,19 +60,35 @@ import kotlinx.coroutines.delay
  * playing behind them, and coming back to full screen never reloads the stream.
  */
 class LivePlayer(context: Context) {
-    val exo: ExoPlayer = ExoPlayer.Builder(context).build()
+    val exo: ExoPlayer = newPlayer(context)
     var buffering by mutableStateOf(false)
         private set
     var failed by mutableStateOf(false)
         private set
     var resizeMode by mutableIntStateOf(AspectRatioFrameLayout.RESIZE_MODE_FIT)
 
+    // The address asked for, and the one actually loaded, which differs after a fallback.
+    private var requested: String? = null
     private var url: String? = null
+    private var fallback: String? = null
+    private var triedFallback = false
+    private var played = false
     private var retries = 0
     private val handler = Handler(Looper.getMainLooper())
+    // Channels whose main stream the provider refused, mapped to the MPEG-TS address that worked instead.
+    private val fallbackFor = HashMap<String, String>()
 
     private val listener = object : Player.Listener {
         override fun onPlayerError(error: PlaybackException) {
+            // One switch from HLS to MPEG-TS when the panel refuses the stream before it plays.
+            val status = playbackHttpStatus(error)
+            val fb = fallback
+            if (!played && !triedFallback && !fb.isNullOrBlank() && fb != url && status != null && status >= 400) {
+                triedFallback = true
+                requested?.let { fallbackFor[it] = fb }
+                load(fb)
+                return
+            }
             // Most failures are brief, so retry a few times before saying there is no signal.
             if (retries < MAX_RETRIES) {
                 retries++
@@ -86,6 +104,7 @@ class LivePlayer(context: Context) {
         override fun onPlaybackStateChanged(playbackState: Int) {
             buffering = playbackState == Player.STATE_BUFFERING
             if (playbackState == Player.STATE_READY) {
+                played = true
                 retries = 0
                 failed = false
             }
@@ -96,14 +115,26 @@ class LivePlayer(context: Context) {
         exo.addListener(listener)
     }
 
-    /** Starts a stream. Asking for the one already playing does nothing. */
-    fun play(newUrl: String) {
-        if (newUrl == url) return
+    /**
+     * Starts a stream. Asking for the one already playing does nothing. [fallbackUrl] is an MPEG-TS
+     * address tried once if the provider refuses [newUrl] before it plays. Replays pass none.
+     */
+    fun play(newUrl: String, fallbackUrl: String? = null) {
+        if (newUrl == requested) return
+        requested = newUrl
+        fallback = fallbackUrl
+        val known = fallbackFor[newUrl]
+        triedFallback = known != null
+        load(known ?: newUrl)
+    }
+
+    private fun load(target: String) {
         handler.removeCallbacksAndMessages(null)
-        url = newUrl
+        url = target
         failed = false
+        played = false
         retries = 0
-        exo.setMediaItem(MediaItem.fromUri(newUrl))
+        exo.setMediaItem(MediaItem.fromUri(target))
         exo.prepare()
         exo.playWhenReady = true
     }
@@ -111,6 +142,7 @@ class LivePlayer(context: Context) {
     /** Stops and lets go of the provider connection, for example while a movie plays. */
     fun stop() {
         handler.removeCallbacksAndMessages(null)
+        requested = null
         url = null
         buffering = false
         exo.stop()
@@ -648,7 +680,11 @@ private fun ChannelListPanel(
 /** Earlier shows on a channel with catch-up, and the current one from its start. */
 @Composable
 private fun ReplayPanel(channel: LiveChannel, now: Program?, onPick: (Program) -> Unit, modifier: Modifier = Modifier) {
-    val past = remember(channel.id) { EpgCache.pastPrograms(channel.epgId).take(30) }
+    // Shows inside the provider's archive window. One day when the provider does not say.
+    val past = remember(channel.id, channel.archiveDays) {
+        val day = 24L * 3_600_000L
+        EpgCache.pastPrograms(channel.epgId, if (channel.archiveDays > 0) channel.archiveDays * day else day).take(30)
+    }
     val items = listOfNotNull(now) + past
     val first = remember { FocusRequester() }
     LaunchedEffect(Unit) {
