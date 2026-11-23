@@ -20,11 +20,15 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.key.utf16CodePoint
 import androidx.compose.ui.unit.dp
+import com.dallas.cabletv.data.EpgCache
+import com.dallas.cabletv.data.GuideSelection
 import com.dallas.cabletv.data.JellyfinClient
 import com.dallas.cabletv.data.LiveChannel
+import com.dallas.cabletv.data.Program
 import com.dallas.cabletv.data.Settings
 import com.dallas.cabletv.data.VodItem
 import com.dallas.cabletv.data.XtreamClient
+import com.dallas.cabletv.data.guideSelection
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -44,6 +48,7 @@ fun SearchScreen(
     guide: GuideData,
     settings: Settings,
     onPlayChannel: (LiveChannel) -> Unit,
+    onOpenProgramme: (LiveChannel, Program) -> Unit,
     onOpenVod: (VodItem) -> Unit
 ) {
     var query by rememberSaveable { mutableStateOf("") }
@@ -83,14 +88,16 @@ fun SearchScreen(
     val matchChannels = remember(q, channels) {
         if (q.isEmpty()) emptyList() else channels.filter { it.name.contains(q, ignoreCase = true) || it.number.toString() == q }.take(30)
     }
-    val matchShows = if (q.length < 3) {
-        emptyList()
-    } else {
-        channels.asSequence()
-            .filter { it !in matchChannels }
-            .filter { guide.peekNow(it)?.title?.contains(q, ignoreCase = true) == true }
-            .take(20)
-            .toList()
+    val guideVersion = guide.version
+    val matchShows = remember(q, channels, guideVersion) {
+        if (q.length < 2) {
+            emptyList()
+        } else {
+            EpgCache.programmesMatching(q).mapNotNull { (epgId, program) ->
+                val ch = channels.firstOrNull { it.epgId == epgId } ?: return@mapNotNull null
+                if (ch in matchChannels && isOnNow(program)) null else ch to program
+            }
+        }
     }
     val matchVod = remember(q, catalog, online) {
         if (q.length < 2) emptyList() else (catalog.filter { it.name.contains(q, ignoreCase = true) }.take(30) + online).distinctBy { it.source + ":" + it.id }
@@ -128,6 +135,7 @@ fun SearchScreen(
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     Key("Space", Modifier.weight(1.3f)) { type(" ") }
+                    Key("'", Modifier.weight(0.7f)) { type("'") }
                     Key("Delete", Modifier.weight(1f)) { type("del") }
                     Key("Clear", Modifier.weight(1f)) { type("clear") }
                 }
@@ -145,7 +153,7 @@ fun SearchScreen(
                     }
                     val favs = channels.filter { it.id in favorites }
                     if (favs.isNotEmpty()) {
-                        item { Shelf("Your favorite channels", 8.dp) { items(favs, key = { it.id }) { ch -> ChannelCard(ch, guide.nowNext(ch)?.now, false, { onPlayChannel(ch) }) } } }
+                        item { Shelf("Your favorite channels", 8.dp) { items(favs, key = { it.id }) { ch -> ChannelCard(ch, guide.nowNext(ch)?.now, true, { onPlayChannel(ch) }) } } }
                     }
                 } else if (matchChannels.isEmpty() && matchShows.isEmpty() && matchVod.isEmpty()) {
                     item {
@@ -160,7 +168,17 @@ fun SearchScreen(
                         item { Shelf("Channels", 8.dp) { items(matchChannels, key = { it.id }) { ch -> ChannelCard(ch, guide.nowNext(ch)?.now, ch.id in favorites, { onPlayChannel(ch) }) } } }
                     }
                     if (matchShows.isNotEmpty()) {
-                        item { Shelf("On now", 8.dp) { items(matchShows, key = { it.id }) { ch -> ChannelCard(ch, guide.nowNext(ch)?.now, ch.id in favorites, { onPlayChannel(ch) }) } } }
+                        item {
+                            Shelf("Shows", 8.dp) {
+                                items(matchShows, key = { it.first.id + it.second.start }) { (ch, program) ->
+                                    val shown = if (isOnNow(program)) program else program.copy(title = "${program.title} · ${formatTime(program.start)}")
+                                    ChannelCard(ch, shown, ch.id in favorites, onClick = {
+                                        val action = guideSelection(program.start, program.end, System.currentTimeMillis(), placeholder = false, catchup = ch.catchup)
+                                        if (action == GuideSelection.Replay) onOpenProgramme(ch, program) else onPlayChannel(ch)
+                                    })
+                                }
+                            }
+                        }
                     }
                     if (matchVod.isNotEmpty()) {
                         item { Shelf("Movies and shows", 8.dp) { items(matchVod, key = { it.source + ":" + it.id }) { v -> PosterCard(v, onClick = { onOpenVod(v) }) } } }
@@ -177,7 +195,7 @@ fun SearchScreen(
                 return@onPreviewKeyEvent true
             }
             val ch = ev.utf16CodePoint.toChar()
-            if (code !in KeyEvent.KEYCODE_DPAD_UP..KeyEvent.KEYCODE_DPAD_CENTER && (ch.isLetterOrDigit() || ch == ' ')) {
+            if (code !in KeyEvent.KEYCODE_DPAD_UP..KeyEvent.KEYCODE_DPAD_CENTER && (ch.isLetterOrDigit() || ch == ' ' || ch == '\'' || ch == '-')) {
                 type(ch.lowercaseChar().toString())
                 true
             } else {

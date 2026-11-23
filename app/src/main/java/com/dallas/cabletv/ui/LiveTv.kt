@@ -35,15 +35,18 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
+import com.dallas.cabletv.data.TrackMemory
 import com.dallas.cabletv.data.newPlayer
 import com.dallas.cabletv.data.playbackHttpStatus
 import androidx.media3.ui.AspectRatioFrameLayout
@@ -64,6 +67,8 @@ class LivePlayer(context: Context) {
     var buffering by mutableStateOf(false)
         private set
     var failed by mutableStateOf(false)
+        private set
+    var playing by mutableStateOf(true)
         private set
     var resizeMode by mutableIntStateOf(AspectRatioFrameLayout.RESIZE_MODE_FIT)
 
@@ -109,6 +114,10 @@ class LivePlayer(context: Context) {
                 failed = false
             }
         }
+
+        override fun onIsPlayingChanged(isPlaying: Boolean) {
+            playing = isPlaying
+        }
     }
 
     init {
@@ -134,9 +143,36 @@ class LivePlayer(context: Context) {
         failed = false
         played = false
         retries = 0
+        // A track picked on the previous channel must not stick. The saved language still applies.
+        exo.trackSelectionParameters = exo.trackSelectionParameters.buildUpon().clearOverrides().build()
         exo.setMediaItem(MediaItem.fromUri(target))
         exo.prepare()
         exo.playWhenReady = true
+    }
+
+    /** Tries the current address again after the retries have given up. */
+    fun retry() {
+        val target = url ?: return
+        handler.removeCallbacksAndMessages(null)
+        retries = 0
+        failed = false
+        played = false
+        exo.setMediaItem(MediaItem.fromUri(target))
+        exo.prepare()
+        exo.playWhenReady = true
+    }
+
+    fun togglePause() {
+        if (exo.isPlaying) exo.pause() else exo.play()
+    }
+
+    /** Moves within a replay. A live broadcast is left alone. */
+    fun seekBy(deltaMs: Long) {
+        val duration = exo.duration
+        var target = exo.currentPosition + deltaMs
+        if (target < 0L) target = 0L
+        if (duration != C.TIME_UNSET && duration > 0L && target > duration - 1000L) target = (duration - 1000L).coerceAtLeast(0L)
+        exo.seekTo(target)
     }
 
     /** Stops and lets go of the provider connection, for example while a movie plays. */
@@ -199,9 +235,13 @@ fun LiveTvScreen(
     onReplay: (LiveChannel, Program) -> Unit,
     onReturnToLive: () -> Unit,
     onOpenGuide: () -> Unit,
+    onOpenHome: () -> Unit,
+    onOpenSearch: () -> Unit,
+    onLastChannel: () -> Unit,
     onExit: () -> Unit,
     showToast: (String) -> Unit
 ) {
+    val context = LocalContext.current
     val current = channels.getOrNull(index)
     val nn = current?.let { guide.nowNext(it) }
     var panel by remember { mutableStateOf(LivePanel.None) }
@@ -237,6 +277,13 @@ fun LiveTvScreen(
         showBanner = true
         delay(4500)
         showBanner = false
+    }
+
+    // A dead channel is tried again every so often, so a short network drop recovers by itself.
+    LaunchedEffect(player.failed) {
+        if (!player.failed) return@LaunchedEffect
+        delay(15_000)
+        if (player.failed) player.retry()
     }
 
     // The options bar and channel list close by themselves after a while without a key press.
@@ -279,18 +326,60 @@ fun LiveTvScreen(
                     KeyEvent.KEYCODE_CHANNEL_UP -> { panel = LivePanel.None; tune(index + 1); return@onPreviewKeyEvent true }
                     KeyEvent.KEYCODE_CHANNEL_DOWN -> { panel = LivePanel.None; tune(index - 1); return@onPreviewKeyEvent true }
                     KeyEvent.KEYCODE_GUIDE -> { onOpenGuide(); return@onPreviewKeyEvent true }
-                    KeyEvent.KEYCODE_LAST_CHANNEL -> return@onPreviewKeyEvent false
+                    KeyEvent.KEYCODE_LAST_CHANNEL -> { panel = LivePanel.None; onLastChannel(); return@onPreviewKeyEvent true }
+                    KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
+                        if (replaying) player.togglePause()
+                        return@onPreviewKeyEvent replaying
+                    }
+                    KeyEvent.KEYCODE_MEDIA_PLAY -> {
+                        if (replaying) player.exo.play()
+                        return@onPreviewKeyEvent replaying
+                    }
+                    KeyEvent.KEYCODE_MEDIA_PAUSE -> {
+                        if (replaying) player.exo.pause()
+                        return@onPreviewKeyEvent replaying
+                    }
+                    KeyEvent.KEYCODE_MEDIA_REWIND -> {
+                        if (replaying) {
+                            player.seekBy(-10_000)
+                            bannerTick++
+                        }
+                        return@onPreviewKeyEvent replaying
+                    }
+                    KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> {
+                        if (replaying) {
+                            player.seekBy(30_000)
+                            bannerTick++
+                        }
+                        return@onPreviewKeyEvent replaying
+                    }
                 }
                 if (panel == LivePanel.Options && code == KeyEvent.KEYCODE_DPAD_DOWN) {
                     close()
                     return@onPreviewKeyEvent true
                 }
                 if (panel != LivePanel.None) return@onPreviewKeyEvent false
+                if (player.failed && (code == KeyEvent.KEYCODE_DPAD_CENTER || code == KeyEvent.KEYCODE_ENTER || code == KeyEvent.KEYCODE_NUMPAD_ENTER)) {
+                    player.retry()
+                    return@onPreviewKeyEvent true
+                }
                 when (code) {
                     KeyEvent.KEYCODE_DPAD_UP -> { tune(index + 1); true }
                     KeyEvent.KEYCODE_DPAD_DOWN -> { tune(index - 1); true }
-                    KeyEvent.KEYCODE_DPAD_LEFT -> { if (channels.isNotEmpty()) panel = LivePanel.Channels; true }
-                    KeyEvent.KEYCODE_DPAD_RIGHT -> { bannerTick++; true }
+                    KeyEvent.KEYCODE_DPAD_LEFT -> {
+                        if (replaying && !player.failed) {
+                            player.seekBy(-10_000)
+                            bannerTick++
+                        } else if (channels.isNotEmpty()) {
+                            panel = LivePanel.Channels
+                        }
+                        true
+                    }
+                    KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                        if (replaying && !player.failed) player.seekBy(30_000)
+                        bannerTick++
+                        true
+                    }
                     KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER,
                     KeyEvent.KEYCODE_MENU, KeyEvent.KEYCODE_INFO -> {
                         if (channels.isNotEmpty()) {
@@ -324,10 +413,14 @@ fun LiveTvScreen(
                 modifier = Modifier.fillMaxSize().background(Tv.Scrim)
             )
             player.failed -> Box(Modifier.fillMaxSize().background(Color(0x99000000)), contentAlignment = Alignment.Center) {
-                EmptyState(
-                    title = "No signal on ${current?.name ?: "this channel"}",
-                    body = "The provider is not sending this channel right now. Press up or down to try another."
-                )
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    EmptyState(
+                        title = "No signal on ${current?.name ?: "this channel"}",
+                        body = "The provider is not sending this channel right now. OK tries again. Up or down picks another."
+                    )
+                    Spacer(Modifier.height(16.dp))
+                    PillButton("Try again", { player.retry() }, icon = TvIcons.Replay)
+                }
             }
         }
 
@@ -382,7 +475,15 @@ fun LiveTvScreen(
             exit = fadeOut(),
             modifier = Modifier.align(Alignment.BottomStart)
         ) {
-            if (current != null) ChannelBanner(current, nn, current.id in favorites)
+            if (current != null) ChannelBanner(current, nn, current.id in favorites, replaying)
+        }
+
+        if (replaying && panel == LivePanel.None) {
+            ReplayTransport(
+                player = player,
+                onReturnToLive = onReturnToLive,
+                modifier = Modifier.align(Alignment.BottomCenter)
+            )
         }
 
         if (panel == LivePanel.Options && current != null) {
@@ -391,8 +492,18 @@ fun LiveTvScreen(
                 nn = nn,
                 isFavorite = current.id in favorites,
                 canReplay = canReplay && current.catchup,
+                replaying = replaying,
+                playing = player.playing,
                 onGuide = onOpenGuide,
+                onHome = onOpenHome,
+                onSearch = onOpenSearch,
                 onChannels = { panel = LivePanel.Channels },
+                onPause = { player.togglePause() },
+                onSeek = {
+                    player.seekBy(it)
+                    bannerTick++
+                },
+                onReturnToLive = onReturnToLive,
                 onFavorite = {
                     val adding = current.id !in favorites
                     onToggleFavorite(current)
@@ -443,6 +554,8 @@ fun LiveTvScreen(
                 player = player.exo,
                 resizeMode = player.resizeMode,
                 onResize = { player.resizeMode = it },
+                onAudioLanguage = { TrackMemory.saveAudio(context, player.exo, it) },
+                onCaptionsLanguage = { TrackMemory.saveCaptions(context, player.exo, it) },
                 onClose = { close() },
                 modifier = Modifier.align(Alignment.CenterEnd)
             )
@@ -450,13 +563,51 @@ fun LiveTvScreen(
     }
 }
 
+/** Pause and skip for a replay. Left and right on the remote do the same thing. */
+@Composable
+private fun ReplayTransport(player: LivePlayer, onReturnToLive: () -> Unit, modifier: Modifier = Modifier) {
+    var position by remember { mutableLongStateOf(0L) }
+    var duration by remember { mutableLongStateOf(0L) }
+    LaunchedEffect(player) {
+        while (true) {
+            position = player.exo.currentPosition.coerceAtLeast(0L)
+            val reported = player.exo.duration
+            duration = if (reported != C.TIME_UNSET && reported > 0L) reported else 0L
+            delay(500)
+        }
+    }
+    Column(
+        modifier
+            .fillMaxWidth()
+            .background(Brush.verticalGradient(listOf(Color.Transparent, Color(0xE60D0F13))))
+            .padding(start = 40.dp, end = 40.dp, top = 28.dp, bottom = 22.dp)
+    ) {
+        if (duration > 0L) {
+            ProgressBar(position.toFloat() / duration, Modifier.fillMaxWidth(), color = Tv.Accent)
+            Spacer(Modifier.height(6.dp))
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(formatPosition(position), style = TvType.Caption, color = Tv.Ink2)
+            Spacer(Modifier.weight(1f))
+            Text(if (duration > 0L) formatPosition(duration) else "Replay", style = TvType.Caption, color = Tv.Ink2)
+        }
+        Spacer(Modifier.height(8.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            PillButton(if (player.playing) "Pause" else "Play", { player.togglePause() }, icon = if (player.playing) TvIcons.Pause else TvIcons.Play)
+            PillButton("Back 10 seconds", { player.seekBy(-10_000) }, icon = TvIcons.Back)
+            PillButton("Forward 30 seconds", { player.seekBy(30_000) }, icon = TvIcons.Next)
+            PillButton("Back to live", onReturnToLive, icon = TvIcons.Replay)
+        }
+    }
+}
+
 /** Shown for a few seconds after each channel change. */
 @Composable
-private fun ChannelBanner(channel: LiveChannel, nn: NowNext?, isFavorite: Boolean) {
+private fun ChannelBanner(channel: LiveChannel, nn: NowNext?, isFavorite: Boolean, replaying: Boolean) {
     val now = nn?.now
     Column(
         Modifier
-            .padding(start = 40.dp, bottom = 28.dp, end = 40.dp)
+            .padding(start = 40.dp, bottom = if (replaying) 136.dp else 28.dp, end = 40.dp)
             .widthIn(max = 540.dp)
             .clip(RoundedCornerShape(14.dp))
             .background(Tv.Scrim)
@@ -494,7 +645,13 @@ private fun ChannelBanner(channel: LiveChannel, nn: NowNext?, isFavorite: Boolea
         Spacer(Modifier.height(9.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
             KeyHint("OK", "More options")
-            KeyHint("◀", "Channel list")
+            if (replaying) {
+                KeyHint("◀ ▶", "Skip")
+                KeyHint("Back", "Live")
+            } else {
+                KeyHint("◀", "Channel list")
+                KeyHint("Back", "Home")
+            }
             KeyHint("▲▼", "Change channel")
         }
     }
@@ -507,10 +664,17 @@ private fun OptionsBar(
     nn: NowNext?,
     isFavorite: Boolean,
     canReplay: Boolean,
+    replaying: Boolean,
+    playing: Boolean,
     onGuide: () -> Unit,
+    onHome: () -> Unit,
+    onSearch: () -> Unit,
     onChannels: () -> Unit,
     onFavorite: () -> Unit,
     onReplay: () -> Unit,
+    onPause: () -> Unit,
+    onSeek: (Long) -> Unit,
+    onReturnToLive: () -> Unit,
     onTracks: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -582,13 +746,22 @@ private fun OptionsBar(
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 PillButton("Guide", onGuide, icon = TvIcons.Guide, modifier = Modifier.focusRequester(first))
+                PillButton("Home", onHome, icon = TvIcons.Tv)
+                PillButton("Search", onSearch, icon = TvIcons.Search)
                 PillButton("Channel list", onChannels, icon = TvIcons.List)
                 PillButton(
                     if (isFavorite) "Remove favorite" else "Add to favorites",
                     onFavorite,
                     icon = if (isFavorite) TvIcons.StarFilled else TvIcons.Star
                 )
-                if (canReplay) PillButton("Watch from the start", onReplay, icon = TvIcons.Replay)
+                if (replaying) {
+                    PillButton(if (playing) "Pause" else "Play", onPause, icon = if (playing) TvIcons.Pause else TvIcons.Play)
+                    PillButton("Back 10 seconds", { onSeek(-10_000) }, icon = TvIcons.Back)
+                    PillButton("Forward 30 seconds", { onSeek(30_000) }, icon = TvIcons.Next)
+                    PillButton("Back to live", onReturnToLive, icon = TvIcons.Replay)
+                } else if (canReplay) {
+                    PillButton("Watch from the start", onReplay, icon = TvIcons.Replay)
+                }
                 PillButton("Audio and captions", onTracks, icon = TvIcons.Captions)
             }
         }

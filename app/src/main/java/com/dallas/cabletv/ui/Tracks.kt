@@ -53,7 +53,9 @@ fun TrackPanel(
     resizeMode: Int,
     onResize: (Int) -> Unit,
     onClose: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    onAudioLanguage: (String?) -> Unit = {},
+    onCaptionsLanguage: (String?) -> Unit = {}
 ) {
     BackHandler { onClose() }
     var tick by remember { mutableIntStateOf(0) }
@@ -71,6 +73,8 @@ fun TrackPanel(
             .setTrackTypeDisabled(type, false)
             .setOverrideForType(TrackSelectionOverride(choice.group.mediaTrackGroup, choice.index))
             .build()
+        val language = choice.group.getTrackFormat(choice.index).language
+        if (type == C.TRACK_TYPE_AUDIO) onAudioLanguage(language) else onCaptionsLanguage(language)
         tick++
     }
 
@@ -90,6 +94,7 @@ fun TrackPanel(
                     player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
                         .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
                         .build()
+                    onCaptionsLanguage(null)
                     tick++
                 }
             }

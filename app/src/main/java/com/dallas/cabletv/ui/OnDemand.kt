@@ -46,6 +46,7 @@ import com.dallas.cabletv.data.Settings
 import com.dallas.cabletv.data.UserStateStore
 import com.dallas.cabletv.data.VodItem
 import com.dallas.cabletv.data.XtreamClient
+import com.dallas.cabletv.data.TrackMemory
 import com.dallas.cabletv.data.newPlayer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -514,6 +515,7 @@ private fun VodPlayer(
     LaunchedEffect(item.streamUrl) {
         failed = false
         val start = if (startOver) 0L else store.resumePosition(item)
+        player.trackSelectionParameters = player.trackSelectionParameters.buildUpon().clearOverrides().build()
         player.setMediaItem(MediaItem.fromUri(item.streamUrl), start)
         player.prepare()
         player.playWhenReady = true
@@ -657,6 +659,8 @@ private fun VodPlayer(
                 player = player,
                 resizeMode = resizeMode,
                 onResize = { resizeMode = it },
+                onAudioLanguage = { TrackMemory.saveAudio(context, player, it) },
+                onCaptionsLanguage = { TrackMemory.saveCaptions(context, player, it) },
                 onClose = { tracks = false },
                 modifier = Modifier.align(Alignment.CenterEnd)
             )

@@ -37,6 +37,7 @@ import com.dallas.cabletv.data.EpgCache
 import com.dallas.cabletv.data.JellyfinClient
 import com.dallas.cabletv.data.LiveChannel
 import com.dallas.cabletv.data.Profile
+import com.dallas.cabletv.data.Program
 import com.dallas.cabletv.data.ProfileStore
 import com.dallas.cabletv.data.SettingsStore
 import com.dallas.cabletv.data.UserStateStore
@@ -114,8 +115,10 @@ fun CableApp(store: SettingsStore) {
     }
     var channelsLoading by remember { mutableStateOf(false) }
     var channelError by remember { mutableStateOf<String?>(null) }
+    var channelReload by remember { mutableIntStateOf(0) }
     var tuneIndex by remember { mutableIntStateOf(0) }
     var restoredChannel by remember { mutableStateOf(false) }
+    var priorChannelId by remember { mutableStateOf<String?>(null) }
 
     val xtream = remember(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass) {
         if (settings.hasXtream) XtreamClient(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass) else null
@@ -124,7 +127,7 @@ fun CableApp(store: SettingsStore) {
     SideEffect { guide.epg = xtream }
 
     // Reload the channel list only when the live login changes. Hiding channels does not reload.
-    LaunchedEffect(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass, settings.m3uUrl) {
+    LaunchedEffect(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass, settings.m3uUrl, channelReload) {
         loadedChannels = emptyList()
         channelError = null
         if (!settings.hasLiveSource) return@LaunchedEffect
@@ -209,13 +212,50 @@ fun CableApp(store: SettingsStore) {
         userState.addRecent(ch.id)
         recents = userState.recents()
     }
+    lateinit var open: (Screen) -> Unit
+
+    fun tuneToIndex(i: Int) {
+        if (channels.isEmpty()) return
+        val next = ((i % channels.size) + channels.size) % channels.size
+        val nowId = channels.getOrNull(tuneIndex)?.id
+        val nextId = channels[next].id
+        if (restoredChannel && nowId != null && nowId != nextId) priorChannelId = nowId
+        tuneIndex = next
+        restoredChannel = true
+        replayUrl = null
+    }
+
     fun tuneTo(ch: LiveChannel) {
         val i = channels.indexOfFirst { it.id == ch.id }
-        if (i >= 0) {
-            tuneIndex = i
-            restoredChannel = true
+        if (i >= 0) tuneToIndex(i) else replayUrl = null
+    }
+
+    fun tuneToPrevious() {
+        val id = priorChannelId
+        val i = id?.let { wanted -> channels.indexOfFirst { it.id == wanted } } ?: -1
+        if (i < 0) showToast("No previous channel") else tuneToIndex(i)
+    }
+
+    fun startReplay(ch: LiveChannel, program: Program) {
+        val client = xtream
+        if (client == null) {
+            showToast("${program.title} is not available to replay")
+            return
         }
-        replayUrl = null
+        if (channels.getOrNull(tuneIndex)?.id != ch.id) tuneTo(ch)
+        open(Screen.Live)
+        scope.launch {
+            val url = withContext(Dispatchers.IO) {
+                runCatching { client.resolveTimeshiftUrl(ch.id, program.start, program.end) }.getOrNull()
+            }
+            when {
+                url == null -> showToast("${program.title} is not available to replay")
+                currentId == ch.id -> {
+                    replayUrl = url
+                    showToast("Playing ${program.title} from the start")
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------ Movies and shows
@@ -330,15 +370,13 @@ fun CableApp(store: SettingsStore) {
         if (target != Screen.Guide) previewBounds = null
         screen = target
     }
+    open = ::go
 
     val nav = NavActions(
         select = { tab -> go(tab.toScreen()) },
         back = {
-            when {
-                screen != Screen.Home -> go(Screen.Home)
-                settings.hasLiveSource && channels.isNotEmpty() -> go(Screen.Live)
-                else -> (context as? Activity)?.finish()
-            }
+            // Live TV returns here. A second Back leaves the app instead of bouncing back to the picture.
+            if (screen != Screen.Home) go(Screen.Home) else (context as? Activity)?.finish()
         },
         profileName = profileName,
         onProfile = { showProfiles = true }
@@ -423,35 +461,17 @@ fun CableApp(store: SettingsStore) {
                     error = channelError,
                     canReplay = xtream != null,
                     replaying = replayUrl != null,
-                    onTune = { i ->
-                        tuneIndex = i
-                        restoredChannel = true
-                        replayUrl = null
-                    },
+                    onTune = { tuneToIndex(it) },
                     onToggleFavorite = toggleFavorite,
-                    onReplay = { ch, p ->
-                        val client = xtream
-                        if (client != null) {
-                            scope.launch {
-                                // The provider is asked which replay address works, so this runs off the main thread.
-                                val url = withContext(Dispatchers.IO) {
-                                    runCatching { client.resolveTimeshiftUrl(ch.id, p.start, p.end) }.getOrNull()
-                                }
-                                when {
-                                    url == null -> showToast("${p.title} is not available to replay")
-                                    currentId == ch.id -> {
-                                        replayUrl = url
-                                        showToast("Playing ${p.title} from the start")
-                                    }
-                                }
-                            }
-                        }
-                    },
+                    onReplay = { ch, p -> startReplay(ch, p) },
                     onReturnToLive = {
                         replayUrl = null
                         showToast("Back to live")
                     },
                     onOpenGuide = { go(Screen.Guide) },
+                    onOpenHome = { go(Screen.Home) },
+                    onOpenSearch = { go(Screen.Search) },
+                    onLastChannel = { tuneToPrevious() },
                     onExit = { go(Screen.Home) },
                     showToast = showToast
                 )
@@ -465,6 +485,8 @@ fun CableApp(store: SettingsStore) {
                     shelves = shelves,
                     hasLive = settings.hasLiveSource,
                     loadingChannels = channelsLoading,
+                    channelError = channelError,
+                    onRetry = { channelReload++ },
                     onWatch = { go(Screen.Live) },
                     onGuide = { go(Screen.Guide) },
                     onTune = { ch ->
@@ -495,6 +517,7 @@ fun CableApp(store: SettingsStore) {
                         tuneTo(ch)
                         go(Screen.Live)
                     },
+                    onReplay = { ch, program -> startReplay(ch, program) },
                     onToggleFavorite = toggleFavorite,
                     onPreviewBounds = { previewBounds = it },
                     showToast = showToast
@@ -523,6 +546,7 @@ fun CableApp(store: SettingsStore) {
                         tuneTo(ch)
                         go(Screen.Live)
                     },
+                    onOpenProgramme = { ch, program -> startReplay(ch, program) },
                     onOpenVod = { item ->
                         vodOrigin = Screen.Search
                         pendingVod = item

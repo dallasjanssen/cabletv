@@ -59,7 +59,7 @@ fun ChannelCard(ch: LiveChannel, now: Program?, favorite: Boolean, onClick: () -
             if (favorite) {
                 Icon(TvIcons.StarFilled, contentDescription = "Favorite", tint = Tv.Accent, modifier = Modifier.align(Alignment.TopEnd).padding(6.dp).size(14.dp))
             }
-            if (now != null) {
+            if (now != null && isOnNow(now)) {
                 ProgressBar(
                     progressOf(now),
                     Modifier.align(Alignment.BottomStart).fillMaxWidth(),
