@@ -89,7 +89,9 @@ fun GuideScreen(
     onRecord: (LiveChannel, Program) -> Unit,
     onToggleFavorite: (LiveChannel) -> Unit,
     onPreviewBounds: (Rect?) -> Unit,
-    showToast: (String) -> Unit
+    showToast: (String) -> Unit,
+    guideRefreshing: Boolean,
+    onRefreshGuide: () -> Unit
 ) {
     val groups = remember(channels) { groupsOf(channels) }
     LaunchedEffect(groups) {
@@ -131,6 +133,7 @@ fun GuideScreen(
     var gridOwnsFocus by remember { mutableStateOf(true) }
     var restoreTick by remember { mutableIntStateOf(0) }
     val categoryButton = remember { FocusRequester() }
+    val refreshButton = remember { FocusRequester() }
 
     BackHandler(enabled = showCategories) {
         showCategories = false
@@ -361,6 +364,24 @@ fun GuideScreen(
                     }
                 }
 
+                Row(Modifier.fillMaxWidth().padding(horizontal = side).padding(top = 4.dp), horizontalArrangement = Arrangement.End) {
+                    PillButton(
+                        if (guideRefreshing) "Refreshing" else "Refresh guide",
+                        onRefreshGuide,
+                        modifier = Modifier
+                            .focusRequester(refreshButton)
+                            .onPreviewKeyEvent { ev ->
+                                if (ev.type == KeyEventType.KeyDown && ev.nativeKeyEvent.keyCode == KeyEvent.KEYCODE_DPAD_DOWN) {
+                                    runCatching { categoryButton.requestFocus() }
+                                    true
+                                } else {
+                                    false
+                                }
+                            },
+                        enabled = !guideRefreshing
+                    )
+                }
+
                 // The category button and the times along the top of the grid.
                 Row(Modifier.fillMaxWidth().padding(horizontal = side).padding(top = 8.dp).height(30.dp), verticalAlignment = Alignment.CenterVertically) {
                     Focusable(
@@ -374,11 +395,19 @@ fun GuideScreen(
                             .height(28.dp)
                             .focusRequester(categoryButton)
                             .onPreviewKeyEvent { ev ->
-                                if (ev.type == KeyEventType.KeyDown && ev.nativeKeyEvent.keyCode == KeyEvent.KEYCODE_DPAD_DOWN && rows.isNotEmpty()) {
-                                    focusTick++
-                                    true
-                                } else {
-                                    false
+                                if (ev.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                                when (ev.nativeKeyEvent.keyCode) {
+                                    KeyEvent.KEYCODE_DPAD_DOWN -> if (rows.isNotEmpty()) {
+                                        focusTick++
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                    KeyEvent.KEYCODE_DPAD_UP -> {
+                                        runCatching { refreshButton.requestFocus() }
+                                        true
+                                    }
+                                    else -> false
                                 }
                             },
                         shape = RoundedCornerShape(8.dp),

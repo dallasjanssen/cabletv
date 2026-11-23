@@ -170,7 +170,9 @@ fun SettingsScreen(
     showToast: (String) -> Unit,
     hiddenFilters: String,
     onHiddenFilters: (String) -> Unit,
-    onJellyfinSave: (Settings) -> Unit
+    onJellyfinSave: (Settings) -> Unit,
+    guideRefreshing: Boolean,
+    onRefreshGuide: () -> Unit
 ) {
     var pane by rememberSaveable { mutableStateOf(startPane) }
     var narrowOpen by rememberSaveable { mutableStateOf(false) }
@@ -266,7 +268,7 @@ fun SettingsScreen(
         val paneContent: @Composable ColumnScope.() -> Unit = {
             when (pane) {
                 SettingsPane.Phone -> PhonePane(phoneMessage, onReceived = { fromPhone(it) })
-                SettingsPane.Live -> LivePane(settings, channelCount, drafts, liveBusy, liveMessage, onSave = { saveLive() }, onSignOut = {
+                SettingsPane.Live -> LivePane(settings, channelCount, drafts, liveBusy, liveMessage, guideRefreshing, onRefreshGuide, onSave = { saveLive() }, onSignOut = {
                     onSave(settings.copy(xtreamServer = "", xtreamUser = "", xtreamPass = "", m3uUrl = "", epgUrl = "", stalkerUrl = "", stalkerMac = "", subscriptionExpiryMs = 0L))
                     drafts.xs = ""; drafts.xu = ""; drafts.xp = ""; drafts.m3u = ""; drafts.epg = ""; drafts.su = ""; drafts.sm = ""
                     liveMessage = "Signed out of live TV."
@@ -393,6 +395,8 @@ private fun LivePane(
     drafts: Drafts,
     busy: Boolean,
     message: String?,
+    guideRefreshing: Boolean,
+    onRefreshGuide: () -> Unit,
     onSave: () -> Unit,
     onSignOut: () -> Unit
 ) {
@@ -420,6 +424,15 @@ private fun LivePane(
     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         PillButton(if (busy) "Checking" else "Check and save", onSave, icon = TvIcons.Check, enabled = !busy)
         if (settings.hasLiveSource) ConfirmButton("Sign out", "Press again to sign out", onSignOut)
+    }
+    if (settings.hasLiveSource) {
+        Spacer(Modifier.height(10.dp))
+        PillButton(
+            if (guideRefreshing) "Refreshing" else "Refresh guide",
+            onRefreshGuide,
+            icon = TvIcons.Replay,
+            enabled = !guideRefreshing
+        )
     }
     Message(message)
 }

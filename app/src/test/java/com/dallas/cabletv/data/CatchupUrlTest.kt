@@ -70,6 +70,15 @@ class EpgAddressTest {
     fun rejectsALinkThatIsNotAnAddress() {
         assertEquals(emptyList<String>(), epgAddresses("epg.xml"))
     }
+
+    @Test
+    fun saysWhatAGuideRefreshDid() {
+        assertEquals("Guide updated", guideRefreshMessage(2, 0, stalker = false))
+        assertEquals("Part of the guide did not load", guideRefreshMessage(2, 1, stalker = false))
+        assertEquals("The guide did not load", guideRefreshMessage(1, 1, stalker = false))
+        assertEquals("No guide link is saved. Add one in Settings, Live TV.", guideRefreshMessage(0, 0, stalker = false))
+        assertEquals("Guide updated", guideRefreshMessage(0, 0, stalker = true))
+    }
 }
 
 class HlsAndPortalTest {

@@ -9,6 +9,7 @@ import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * The full programme schedule from an XMLTV feed. The feed comes from the Xtream
@@ -26,6 +27,7 @@ object EpgCache {
 
     private val lock = Any()
     private var programs: Map<String, List<Program>> = emptyMap()
+    private val refreshGeneration = AtomicInteger()
 
     private val http = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
@@ -43,6 +45,7 @@ object EpgCache {
      * Returns the addresses that did not load.
      */
     fun refreshAll(urls: List<String>): List<String> {
+        val generation = refreshGeneration.incrementAndGet()
         val merged = LinkedHashMap<String, MutableList<Program>>()
         val failed = mutableListOf<String>()
         for (url in urls.distinct()) {
@@ -57,9 +60,11 @@ object EpgCache {
                 }
             }.onFailure { failed += url }
         }
-        if (merged.isNotEmpty()) {
+        if (merged.isNotEmpty() && generation == refreshGeneration.get()) {
             synchronized(lock) {
-                programs = merged.mapValues { (_, list) -> list.sortedBy { it.start } }
+                if (generation == refreshGeneration.get()) {
+                    programs = merged.mapValues { (_, list) -> list.sortedBy { it.start } }
+                }
             }
         }
         return failed
