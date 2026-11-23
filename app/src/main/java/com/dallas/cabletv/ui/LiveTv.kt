@@ -164,9 +164,14 @@ class LivePlayer(context: Context) {
         retries++
         handler.postDelayed({
             val target = url
-            if (reload && target != null) exo.setMediaItem(MediaItem.fromUri(target))
-            exo.prepare()
-            exo.playWhenReady = true
+            runCatching {
+                if (reload && target != null) exo.setMediaItem(MediaItem.fromUri(target))
+                exo.prepare()
+                exo.playWhenReady = true
+            }.onFailure {
+                buffering = false
+                failed = true
+            }
         }, 2000)
     }
 
@@ -194,10 +199,15 @@ class LivePlayer(context: Context) {
         quickEnds = 0
         behindLive = false
         // A track picked on the previous channel must not stick. The saved language still applies.
-        exo.trackSelectionParameters = exo.trackSelectionParameters.buildUpon().clearOverrides().build()
-        exo.setMediaItem(MediaItem.fromUri(target))
-        exo.prepare()
-        exo.playWhenReady = true
+        runCatching {
+            exo.trackSelectionParameters = exo.trackSelectionParameters.buildUpon().clearOverrides().build()
+            exo.setMediaItem(MediaItem.fromUri(target))
+            exo.prepare()
+            exo.playWhenReady = true
+        }.onFailure {
+            buffering = false
+            failed = true
+        }
     }
 
     /** Tries the current address again after the retries have given up. */
@@ -215,9 +225,14 @@ class LivePlayer(context: Context) {
             return
         }
         behindLive = false
-        exo.setMediaItem(MediaItem.fromUri(target))
-        exo.prepare()
-        exo.playWhenReady = true
+        runCatching {
+            exo.setMediaItem(MediaItem.fromUri(target))
+            exo.prepare()
+            exo.playWhenReady = true
+        }.onFailure {
+            buffering = false
+            failed = true
+        }
     }
 
     fun togglePause() {
