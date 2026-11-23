@@ -1,6 +1,10 @@
 package com.dallas.cabletv.ui
 
+import android.app.Activity
+import android.net.Uri
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.layout.*
@@ -41,6 +45,7 @@ import com.dallas.cabletv.data.AppUpdater
 import com.dallas.cabletv.data.JellyfinClient
 import com.dallas.cabletv.data.epgAddresses
 import com.dallas.cabletv.data.LiveChannel
+import com.dallas.cabletv.data.PHONE_BACKUP_JSON_FIELD
 import com.dallas.cabletv.data.Profile
 import com.dallas.cabletv.data.ProfileStore
 import com.dallas.cabletv.data.Settings
@@ -57,6 +62,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 
 enum class SettingsPane(val label: String, val icon: ImageVector) {
     Phone("Set up with your phone", TvIcons.Phone),
@@ -66,6 +74,7 @@ enum class SettingsPane(val label: String, val icon: ImageVector) {
     Profiles("Profiles", TvIcons.People),
     Lock("Parental lock", TvIcons.Lock),
     Recordings("Recordings", TvIcons.Download),
+    Backup("Backup & restore", TvIcons.Download),
     Updates("Updates", TvIcons.Download)
 }
 
@@ -75,6 +84,9 @@ private fun withHttpScheme(address: String): String {
     if (t.isEmpty() || Regex("^[A-Za-z][A-Za-z0-9+.-]*://").containsMatchIn(t)) return t
     return "http://$t"
 }
+
+private fun phoneBool(value: String?): Boolean =
+    value == "1" || value.equals("true", ignoreCase = true) || value.equals("on", ignoreCase = true)
 
 /**
  * Checks a TV provider login, a playlist, or a Stalker portal, and keeps whichever were filled in.
@@ -203,11 +215,16 @@ fun SettingsScreen(
     hiddenFilters: String,
     onHiddenFilters: (String) -> Unit,
     onJellyfinSave: (Settings) -> Unit,
+    onBackupExportJson: () -> String,
+    onBackupRestoreJson: (String) -> Unit,
+    onBackupExport: suspend (Uri) -> Unit,
+    onBackupRestore: suspend (Uri) -> Unit,
     guideRefreshing: Boolean,
     onRefreshGuide: () -> Unit,
     vodCategories: List<String> = emptyList(),
     jellyfinSignedIn: Boolean = settings.hasJellyfin
 ) {
+    val context = LocalContext.current
     var pane by rememberSaveable { mutableStateOf(startPane) }
     var narrowOpen by rememberSaveable { mutableStateOf(false) }
     val drafts = remember { Drafts(settings) }
@@ -217,13 +234,16 @@ fun SettingsScreen(
     var libraryBusy by remember { mutableStateOf(false) }
     var libraryMessage by remember { mutableStateOf<String?>(null) }
     var phoneMessage by remember { mutableStateOf<String?>(null) }
+    var backupBusy by remember { mutableStateOf(false) }
+    var backupMessage by remember { mutableStateOf<String?>(null) }
+    var suppressUnsavedNotice by remember { mutableStateOf(false) }
     val latest by rememberUpdatedState(settings)
     val latestToast by rememberUpdatedState(showToast)
 
     // Leaving Settings with typed changes that were never saved says so, instead of losing them quietly.
     DisposableEffect(Unit) {
         onDispose {
-            if (drafts.unsaved(latest)) latestToast("Changes in Settings were not saved.")
+            if (!suppressUnsavedNotice && drafts.unsaved(latest)) latestToast("Changes in Settings were not saved.")
         }
     }
 
@@ -285,6 +305,23 @@ fun SettingsScreen(
 
     // Details from the phone are filled in and saved right away, then the result is shown here.
     fun fromPhone(fields: Map<String, String>) {
+        fields[PHONE_BACKUP_JSON_FIELD]?.let { json ->
+            phoneMessage = "Backup received. Restoring it now."
+            scope.launch {
+                val result = withContext(Dispatchers.IO) { runCatching { onBackupRestoreJson(json) } }
+                result
+                    .onSuccess {
+                        suppressUnsavedNotice = true
+                        phoneMessage = "Backup restored. Reopening Settings."
+                        (context as? Activity)?.recreate()
+                    }
+                    .onFailure {
+                        phoneMessage = "Backup restore failed. ${(it.message ?: "Try another file").trimEnd('.')}."
+                    }
+            }
+            return
+        }
+
         fields["xs"]?.takeIf { it.isNotBlank() }?.let { drafts.xs = it.trim() }
         fields["xu"]?.takeIf { it.isNotBlank() }?.let { drafts.xu = it.trim() }
         fields["xp"]?.takeIf { it.isNotEmpty() }?.let { drafts.xp = it }
@@ -297,12 +334,13 @@ fun SettingsScreen(
         fields["jp"]?.takeIf { it.isNotEmpty() }?.let { drafts.jp = it }
         val live = listOf("xs", "xu", "xp", "m3u", "su", "sm", "epg").any { !fields[it].isNullOrBlank() }
         val library = !fields["js"].isNullOrBlank() && !fields["ju"].isNullOrBlank()
+        val hasCustom = fields.containsKey("hidden") || fields.containsKey("locked") || fields.containsKey("strip")
         val results = mutableListOf<String>()
         fun report(r: String) {
             results += r
             phoneMessage = results.joinToString(" ")
         }
-        if (!live && !library) {
+        if (!live && !library && !hasCustom) {
             phoneMessage = "Nothing was filled in on the phone."
             return
         }
@@ -311,10 +349,86 @@ fun SettingsScreen(
         // cannot write the old live login back over the new one.
         scope.launch {
             var current = latest
+            if (hasCustom) {
+                val hidden = fields["hidden"]?.trim()
+                val locked = fields["locked"]?.trim()
+                val strip = fields["strip"]?.let(::phoneBool)
+                if (hidden != null) onHiddenFilters(hidden)
+                val merged = current.copy(
+                    stripPrefixes = strip ?: current.stripPrefixes,
+                    lockedFilters = locked ?: current.lockedFilters
+                )
+                if (merged != current) {
+                    onSave(merged)
+                    current = merged
+                }
+                report("Customizations saved.")
+            }
             if (live) checkLive(current, ::report)?.let { current = it }
             if (library) signIn(current, ::report)
         }
     }
+
+    fun backupName(): String {
+        val stamp = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss")
+            .withZone(ZoneId.systemDefault())
+            .format(Instant.now())
+        return "cabletv-backup-$stamp.json"
+    }
+
+    val createBackup = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
+        if (uri == null) {
+            backupMessage = "Backup cancelled."
+            return@rememberLauncherForActivityResult
+        }
+        scope.launch {
+            backupBusy = true
+            backupMessage = "Saving backup"
+            val result = withContext(Dispatchers.IO) { runCatching { onBackupExport(uri) } }
+            backupBusy = false
+            backupMessage = result.fold(
+                onSuccess = { "Backup saved." },
+                onFailure = { "Backup failed. ${(it.message ?: "Try another file location").trimEnd('.')}." }
+            )
+        }
+    }
+
+    val restoreBackup = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri == null) {
+            backupMessage = "Restore cancelled."
+            return@rememberLauncherForActivityResult
+        }
+        scope.launch {
+            backupBusy = true
+            backupMessage = "Restoring backup"
+            suppressUnsavedNotice = true
+            val result = withContext(Dispatchers.IO) { runCatching { onBackupRestore(uri) } }
+            backupBusy = false
+            result
+                .onSuccess {
+                    backupMessage = "Backup restored. Reopening the app."
+                    (context as? Activity)?.recreate()
+                }
+                .onFailure {
+                    suppressUnsavedNotice = false
+                    backupMessage = "Restore failed. ${(it.message ?: "Try another backup file").trimEnd('.')}."
+                }
+        }
+    }
+
+    fun phoneValues(): Map<String, String> = mapOf(
+        "xs" to latest.xtreamServer,
+        "xu" to latest.xtreamUser,
+        "xp" to latest.xtreamPass,
+        "m3u" to latest.m3uUrl,
+        "epg" to latest.epgUrl,
+        "su" to latest.stalkerUrl,
+        "sm" to latest.stalkerMac,
+        "js" to latest.jellyfinServer,
+        "hidden" to hiddenFilters,
+        "locked" to latest.lockedFilters,
+        "strip" to if (latest.stripPrefixes) "1" else "0"
+    )
 
     val listRequesters = remember { SettingsPane.entries.associateWith { FocusRequester() } }
     val focusManager = LocalFocusManager.current
@@ -332,7 +446,12 @@ fun SettingsScreen(
 
         val paneContent: @Composable ColumnScope.() -> Unit = {
             when (pane) {
-                SettingsPane.Phone -> PhonePane(phoneMessage, onReceived = { fromPhone(it) })
+                SettingsPane.Phone -> PhonePane(
+                    message = phoneMessage,
+                    currentValues = { phoneValues() },
+                    backupJson = onBackupExportJson,
+                    onReceived = { fromPhone(it) }
+                )
                 SettingsPane.Live -> LivePane(settings, channelCount, drafts, liveBusy, liveMessage, guideRefreshing, onRefreshGuide, onSave = { saveLive() }, onSignOut = {
                     onSave(settings.copy(xtreamServer = "", xtreamUser = "", xtreamPass = "", m3uUrl = "", epgUrl = "", stalkerUrl = "", stalkerMac = "", subscriptionExpiryMs = 0L))
                     drafts.xs = ""; drafts.xu = ""; drafts.xp = ""; drafts.m3u = ""; drafts.epg = ""; drafts.su = ""; drafts.sm = ""
@@ -346,6 +465,12 @@ fun SettingsScreen(
                 SettingsPane.Profiles -> ProfilesPane(profiles, activeProfileId, onSwitchProfile, onAddProfile, onRemoveProfile, showToast)
                 SettingsPane.Lock -> LockPane(pinSet, onSetPin, onRemovePin, settings, allChannels, vodCategories, onSave)
                 SettingsPane.Recordings -> RecordingsPane(listRequesters.getValue(SettingsPane.Recordings))
+                SettingsPane.Backup -> BackupPane(
+                    busy = backupBusy,
+                    message = backupMessage,
+                    onBackup = { if (!backupBusy) createBackup.launch(backupName()) },
+                    onRestore = { if (!backupBusy) restoreBackup.launch(arrayOf("application/json", "text/plain", "*/*")) }
+                )
                 SettingsPane.Updates -> UpdatesPane(update, updateMessage, updateBusy, onCheckUpdate, onInstallUpdate, lastCrash, onClearCrash)
             }
         }
@@ -452,12 +577,17 @@ private fun Message(text: String?) {
 }
 
 @Composable
-private fun PhonePane(message: String?, onReceived: (Map<String, String>) -> Unit) {
+private fun PhonePane(
+    message: String?,
+    currentValues: () -> Map<String, String>,
+    backupJson: () -> String,
+    onReceived: (Map<String, String>) -> Unit
+) {
     PaneTitle(
         "Set up with your phone",
-        "Typing server addresses with a remote is slow. Show a code, scan it with your phone, and fill in your details there. They are checked and saved here as soon as you send them."
+        "Typing with a remote is slow. Show a code, scan it, and manage setup, customizations, and backups from your phone."
     )
-    PhoneSignInPanel(autoStart = false, onReceived = onReceived)
+    PhoneSignInPanel(autoStart = false, onReceived = onReceived, currentValues = currentValues, backupJson = backupJson)
     Message(message)
 }
 
@@ -719,6 +849,31 @@ private fun LockPane(
             }
         }
     }
+}
+
+@Composable
+private fun BackupPane(
+    busy: Boolean,
+    message: String?,
+    onBackup: () -> Unit,
+    onRestore: () -> Unit
+) {
+    PaneTitle(
+        "Backup & restore",
+        "Save all settings to a file and bring them back later, including logins, profiles, favorites and resume points."
+    )
+    Text(
+        "Keep backups private. They include login details and access tokens.",
+        style = TvType.Small,
+        color = Tv.Ink2,
+        modifier = Modifier.widthIn(max = 560.dp)
+    )
+    Spacer(Modifier.height(14.dp))
+    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        PillButton(if (busy) "Working" else "Backup now", onBackup, icon = TvIcons.Download, enabled = !busy)
+        PillButton(if (busy) "Working" else "Restore backup", onRestore, icon = TvIcons.Check, enabled = !busy)
+    }
+    Message(message)
 }
 
 @Composable

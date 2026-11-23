@@ -36,13 +36,20 @@ private class PhoneCode(val url: String, val address: String, val pin: String, v
 
 /** The sign-in page on the home network, started and stopped with the screen that shows it. */
 @Composable
-private fun rememberPhoneSignIn(autoStart: Boolean, onReceived: (Map<String, String>) -> Unit): Triple<PhoneCode?, String?, () -> Unit> {
+private fun rememberPhoneSignIn(
+    autoStart: Boolean,
+    onReceived: (Map<String, String>) -> Unit,
+    currentValues: () -> Map<String, String> = { emptyMap() },
+    backupJson: (() -> String)? = null
+): Triple<PhoneCode?, String?, () -> Unit> {
     val scope = rememberCoroutineScope()
     val appContext = LocalContext.current.applicationContext
     val running = remember { AtomicReference<PhoneSignInServer?>(null) }
     var code by remember { mutableStateOf<PhoneCode?>(null) }
     var problem by remember { mutableStateOf<String?>(null) }
     val latest by rememberUpdatedState(onReceived)
+    val latestValues by rememberUpdatedState(currentValues)
+    val latestBackupJson by rememberUpdatedState(backupJson)
 
     DisposableEffect(Unit) {
         onDispose { running.getAndSet(null)?.stop() }
@@ -56,14 +63,11 @@ private fun rememberPhoneSignIn(autoStart: Boolean, onReceived: (Map<String, Str
             onReceive = { fields ->
                 // Runs on the server thread, so hand the result to the UI thread.
                 scope.launch {
-                    running.getAndSet(null)?.stop()
-                    code = null
                     latest(fields)
-                    // If the check fails and this screen stays, a fresh code is ready to scan again.
-                    // On success the screen goes away and its server is stopped.
-                    open()
                 }
             },
+            currentValues = { latestValues() },
+            backupJson = { latestBackupJson?.invoke().orEmpty() }.takeIf { latestBackupJson != null },
             onEnd = { why ->
                 scope.launch {
                     running.getAndSet(null)?.stop()
@@ -96,6 +100,31 @@ private fun rememberPhoneSignIn(autoStart: Boolean, onReceived: (Map<String, Str
 @Composable
 fun PhoneSignInPanel(autoStart: Boolean, onReceived: (Map<String, String>) -> Unit) {
     val (code, problem, open) = rememberPhoneSignIn(autoStart, onReceived)
+    if (code == null) {
+        PillButton(if (problem != null) "New code" else "Show the code", open, icon = TvIcons.Phone)
+        problem?.let { Text(it, style = TvType.Small, color = Tv.Accent, modifier = Modifier.padding(top = 10.dp)) }
+    } else {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(24.dp)) {
+            QrImage(code.qr, 150.dp)
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text("Code", style = TvType.Caption, color = Tv.Ink3)
+                Text(code.pin.chunked(3).joinToString(" "), style = TvType.Display.copy(fontSize = 30.sp, letterSpacing = 2.sp), color = Tv.Accent)
+                Text("Or open ${code.address} on any phone or laptop on your Wi-Fi.", style = TvType.Small, color = Tv.Ink2, modifier = Modifier.widthIn(max = 300.dp))
+                Spacer(Modifier.height(6.dp))
+                PillButton("Get a new code", open)
+            }
+        }
+    }
+}
+
+@Composable
+fun PhoneSignInPanel(
+    autoStart: Boolean,
+    onReceived: (Map<String, String>) -> Unit,
+    currentValues: () -> Map<String, String>,
+    backupJson: () -> String
+) {
+    val (code, problem, open) = rememberPhoneSignIn(autoStart, onReceived, currentValues, backupJson)
     if (code == null) {
         PillButton(if (problem != null) "New code" else "Show the code", open, icon = TvIcons.Phone)
         problem?.let { Text(it, style = TvType.Small, color = Tv.Accent, modifier = Modifier.padding(top = 10.dp)) }
