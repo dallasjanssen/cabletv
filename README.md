@@ -3,19 +3,34 @@
 A personal, sideloaded Android and Android TV app that pulls together:
 
 - **Live TV** from an Xtream Codes IPTV login (or any M3U playlist URL)
-- **Program guide** from the provider's short EPG
+- **Program guide** from the provider's XMLTV feed, or the guide link in an M3U playlist
 - **On Demand** from your Jellyfin server
 
-The look is a cable box from the 2000s: phosphor green program text, amber channel numbers, scan lines, and monospace type. The home screen is a numbered menu, and keys 1 to 4 open each section. The focused item grows and gets a green ring so you always know where the remote is. Channel changes show a banner with the current and next program, and number-key channel entry works from anywhere in live TV.
+It opens straight into live TV on the last channel you watched. Menus sit on top of the picture, so the channel keeps playing behind Home and in a corner of the guide, and Back always returns to it.
+
+The screens are laid out for Android TV's 960 by 540 grid, with one typeface (Figtree), a dark low-glare background, and one focus style: whatever is selected turns white. Everything works with only the arrows, OK and Back. Channel and number keys are shortcuts for remotes that have them.
+
+## Screens
+
+- **Live TV**: up and down change channel. OK opens a bar with Guide, Channel list, Favorite, Watch from the start (channels with catch-up) and Audio and captions. Left opens the channel list.
+- **Home**: what is on now, with Keep watching and Guide buttons, then rows for favorite and recent channels, half-watched titles, and new movies and shows.
+- **Guide**: a time grid with a line for now, details of the highlighted show, and a preview of the channel playing. Left from a channel name picks a category. OK on a channel name adds it to favorites.
+- **Movies & Shows**: rows from Jellyfin and the provider. A title opens a details page with Resume, Start over, seasons and episodes. The player has its own controls and a panel for audio, captions and picture size.
+- **Search**: an on-screen keyboard with results beside it, for channels, shows on now, movies and series.
+- **Settings**: sections for phone setup, live TV, Jellyfin, channel list, profiles, parental lock and updates. Each section saves by itself.
+- **First launch**: with nothing set up, the app opens on a QR code so setup happens on a phone.
 
 ## Remote and keyboard controls
 
 | Action | Remote |
 | --- | --- |
-| Channel up / down | CH+ / CH- or D-pad up / down |
-| Jump to a channel | Type the number (up to 4 digits) |
-| Show channel banner | OK / center button |
-| Back to menu | Back |
+| Change channel | Up / down, or CH+ / CH- |
+| Everything you can do while watching | OK |
+| Channel list | Left |
+| Jump to a channel | Type the number (up to 4 digits), in live TV or the guide |
+| Back to what you were watching | Back |
+| Skip 10 seconds in a movie | Left / right |
+| Pause a movie | OK, or play / pause |
 
 ## Build and install (Android Studio)
 
@@ -47,6 +62,9 @@ Replace the IP with your TV's address. Accept the debugging prompt on the TV the
 ## Known limits (v1)
 
 - Jellyfin playback uses direct streams. If the TV cannot decode a file's codec, that title will fail. Transcoding can be added later.
-- The guide shows the current and next program only. It does not render a full grid timeline yet.
+- Channels with no listings in the XMLTV feed fall back to the provider's now and next listing.
 - M3U-only sources have no guide data unless the playlist's channels map to guide entries. Xtream gives the best experience.
-- Watch progress is not reported back to Jellyfin yet.
+
+## Credits
+
+The Figtree typeface is by The Figtree Project Authors, under the SIL Open Font License. The license ships in the app at `assets/licenses/Figtree-OFL.txt`.

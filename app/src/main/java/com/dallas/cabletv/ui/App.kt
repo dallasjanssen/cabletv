@@ -1,20 +1,19 @@
 package com.dallas.cabletv.ui
 
+import android.app.Activity
 import android.content.Intent
 import android.net.Uri
 import android.provider.Settings as AndroidSettings
-import android.view.KeyEvent
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.BasicTextField
-import androidx.compose.foundation.text.KeyboardActions
-import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -22,20 +21,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.input.key.KeyEventType
-import androidx.compose.ui.input.key.onPreviewKeyEvent
-import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.input.ImeAction
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.input.VisualTransformation
-import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.zIndex
 import com.dallas.cabletv.BuildConfig
 import com.dallas.cabletv.data.AppUpdater
 import com.dallas.cabletv.data.ChannelSource
@@ -44,13 +37,10 @@ import com.dallas.cabletv.data.JellyfinClient
 import com.dallas.cabletv.data.LiveChannel
 import com.dallas.cabletv.data.Profile
 import com.dallas.cabletv.data.ProfileStore
-import com.dallas.cabletv.data.Settings
 import com.dallas.cabletv.data.SettingsStore
 import com.dallas.cabletv.data.UserStateStore
 import com.dallas.cabletv.data.VodItem
 import com.dallas.cabletv.data.XtreamClient
-import com.dallas.cabletv.data.xtreamLoginFields
-import com.dallas.cabletv.data.channelFilters
 import com.dallas.cabletv.data.displayName
 import com.dallas.cabletv.data.isHidden
 import kotlinx.coroutines.Dispatchers
@@ -58,38 +48,60 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.util.Calendar
+import kotlin.math.roundToInt
 
-enum class Screen { Home, LiveTv, Guide, OnDemand, Search, Settings }
+enum class Screen { Live, Home, Guide, OnDemand, Search, Settings, Welcome }
 
 /** Which PIN pad, if any, is on screen. */
 private enum class PinPurpose { NONE, UNLOCK, SET_NEW, SET_CONFIRM, REMOVE }
 
-private fun titleOf(screen: Screen): String = when (screen) {
-    Screen.Home -> "CABLE"
-    Screen.LiveTv -> "LIVE TV"
-    Screen.Guide -> "PROGRAM GUIDE"
-    Screen.OnDemand -> "ON DEMAND"
-    Screen.Search -> "SEARCH"
-    Screen.Settings -> "SETTINGS"
+private fun Tab.toScreen(): Screen = when (this) {
+    Tab.Home -> Screen.Home
+    Tab.Guide -> Screen.Guide
+    Tab.OnDemand -> Screen.OnDemand
+    Tab.Search -> Screen.Search
+    Tab.Settings -> Screen.Settings
 }
 
 @Composable
 fun CableApp(store: SettingsStore) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var settings by remember { mutableStateOf(store.load()) }
     // Read once per launch. The app opens straight into live TV on the last channel.
     val lastChannelId = remember { store.lastChannelId() }
     var screen by remember {
         mutableStateOf(
-            if (settings.hasLiveSource && lastChannelId != null) Screen.LiveTv else Screen.Home
+            when {
+                !settings.hasLiveSource && !settings.hasJellyfin -> Screen.Welcome
+                settings.hasLiveSource && lastChannelId != null -> Screen.Live
+                else -> Screen.Home
+            }
         )
     }
-    // The screen the user came from, so Back returns there instead of always going home.
-    var previous by remember { mutableStateOf(Screen.Home) }
-    // Every channel the source sent, and the list the screens show after hidden channels are removed.
+    // Where a movie page was opened from, so Back returns there.
+    var vodOrigin by remember { mutableStateOf(Screen.OnDemand) }
+    var settingsPane by remember { mutableStateOf(SettingsPane.Phone) }
+
+    // ------------------------------------------------------------ Toasts
+    var toast by remember { mutableStateOf<String?>(null) }
+    var toastTick by remember { mutableIntStateOf(0) }
+    val showToast: (String) -> Unit = {
+        toast = it
+        toastTick++
+    }
+    LaunchedEffect(toastTick) {
+        if (toast != null) {
+            delay(2800)
+            toast = null
+        }
+    }
+
+    // ------------------------------------------------------------ Channels and guide
     var loadedChannels by remember { mutableStateOf<List<LiveChannel>>(emptyList()) }
-    val channels = remember(loadedChannels, settings) {
+    val channels = remember(loadedChannels, settings.hiddenFilters, settings.stripPrefixes) {
         loadedChannels
+            .distinctBy { it.id }
             .filterNot { isHidden(it, settings.hiddenTerms) }
             .map { if (settings.stripPrefixes) it.copy(name = displayName(it.name)) else it }
     }
@@ -98,13 +110,55 @@ fun CableApp(store: SettingsStore) {
     var tuneIndex by remember { mutableIntStateOf(0) }
     var restoredChannel by remember { mutableStateOf(false) }
 
-    val context = LocalContext.current
-    val updateScope = rememberCoroutineScope()
-    var update by remember { mutableStateOf<AppUpdater.Release?>(null) }
-    var updateMessage by remember { mutableStateOf<String?>(null) }
-    var updateBusy by remember { mutableStateOf(false) }
+    val xtream = remember(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass) {
+        if (settings.hasXtream) XtreamClient(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass) else null
+    }
+    val guide = remember { GuideData(scope) }
+    SideEffect { guide.epg = xtream }
 
-    // Profiles: each has its own favorites, recent channels, and resume points.
+    // Reload the channel list only when the live login changes. Hiding channels does not reload.
+    LaunchedEffect(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass, settings.m3uUrl) {
+        loadedChannels = emptyList()
+        channelError = null
+        if (!settings.hasLiveSource) return@LaunchedEffect
+        channelsLoading = true
+        withContext(Dispatchers.IO) { runCatching { ChannelSource.load(settings) } }
+            .onSuccess { loadedChannels = it }
+            .onFailure { channelError = it.message ?: "The channel list did not load" }
+        channelsLoading = false
+    }
+
+    // The full schedule is downloaded now and then hourly: from the provider login, or the playlist's guide link.
+    LaunchedEffect(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass, settings.m3uUrl) {
+        val s = settings
+        while (s.hasLiveSource) {
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    if (s.hasXtream) EpgCache.refresh(s.xtreamServer, s.xtreamUser, s.xtreamPass)
+                    else ChannelSource.guideUrl(s)?.let { EpgCache.refreshUrl(it) }
+                }
+            }
+            guide.scheduleUpdated()
+            delay(60 * 60 * 1000L)
+        }
+    }
+
+    // Until the saved channel is found, live TV starts on it directly, so channel 1 never plays first.
+    val index = if (!restoredChannel && channels.isNotEmpty()) {
+        (lastChannelId?.let { id -> channels.indexOfFirst { it.id == id } } ?: -1).coerceAtLeast(0)
+    } else {
+        tuneIndex.coerceIn(0, (channels.size - 1).coerceAtLeast(0))
+    }
+    LaunchedEffect(channels) {
+        if (!restoredChannel && channels.isNotEmpty()) {
+            restoredChannel = true
+            tuneIndex = index
+        }
+    }
+    val current = channels.getOrNull(index)
+    val currentId by rememberUpdatedState(current?.id)
+
+    // ------------------------------------------------------------ Profiles
     val profileStore = remember { ProfileStore(context) }
     var profiles by remember { mutableStateOf(profileStore.profiles()) }
     var profileId by remember { mutableStateOf(profileStore.active()) }
@@ -116,1007 +170,548 @@ fun CableApp(store: SettingsStore) {
         favorites = userState.favorites()
     }
     val profileName = profiles.firstOrNull { it.id == profileId }?.name ?: "Main"
+    var showProfiles by remember { mutableStateOf(false) }
+    fun switchProfile(id: String) {
+        profileStore.setActive(id)
+        profileId = id
+    }
 
-    // The parental lock: Settings needs the PIN, and it stays open only until Settings is left.
-    var pinSet by remember { mutableStateOf(store.hasPin()) }
-    var settingsUnlocked by remember { mutableStateOf(false) }
-    var pinPurpose by remember { mutableStateOf(PinPurpose.NONE) }
-    var pinFirst by remember { mutableStateOf("") }
-    var pinError by remember { mutableStateOf<String?>(null) }
-    var pinNote by remember { mutableStateOf<String?>(null) }
+    // ------------------------------------------------------------ Live player
+    val live = remember { LivePlayer(context) }
+    DisposableEffect(Unit) { onDispose { live.release() } }
+    var replayUrl by remember { mutableStateOf<String?>(null) }
+    var previewBounds by remember { mutableStateOf<Rect?>(null) }
+    // The channel keeps playing behind Home and in the guide's preview. Elsewhere it stops, so a
+    // provider that allows one stream at a time can play movies.
+    val liveActive = settings.hasLiveSource && screen in setOf(Screen.Live, Screen.Home, Screen.Guide)
+    val playUrl = replayUrl ?: current?.streamUrl
+    LaunchedEffect(playUrl, liveActive) {
+        if (!liveActive || playUrl == null) {
+            live.stop()
+            return@LaunchedEffect
+        }
+        // A short wait means holding a key only loads the channel you stop on.
+        delay(250)
+        live.play(playUrl, if (replayUrl == null) current?.fallbackStreamUrl else null)
+    }
+    // Remember the channel on screen, so the next launch returns to it and it joins Recently watched.
+    LaunchedEffect(current?.id, profileId) {
+        val ch = current ?: return@LaunchedEffect
+        delay(600)
+        store.saveLastChannelId(ch.id)
+        userState.addRecent(ch.id)
+        recents = userState.recents()
+    }
+    fun tuneTo(ch: LiveChannel) {
+        val i = channels.indexOfFirst { it.id == ch.id }
+        if (i >= 0) {
+            tuneIndex = i
+            restoredChannel = true
+        }
+        replayUrl = null
+    }
 
-    // A title chosen in search opens in On Demand.
+    // ------------------------------------------------------------ Movies and shows
+    var shelvesTick by remember { mutableIntStateOf(0) }
+    var providerVod by remember { mutableStateOf<Pair<List<VodItem>, List<VodItem>>>(emptyList<VodItem>() to emptyList()) }
+    var providerError by remember { mutableStateOf<String?>(null) }
+    var providerLoading by remember { mutableStateOf(false) }
+    LaunchedEffect(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass) {
+        providerVod = emptyList<VodItem>() to emptyList()
+        providerError = null
+        val xt = xtream ?: return@LaunchedEffect
+        providerLoading = true
+        withContext(Dispatchers.IO) { runCatching { xt.vodMovies() to xt.vodSeries() } }
+            .onSuccess { providerVod = it }
+            .onFailure { providerError = it.message ?: "Your provider did not answer" }
+        providerLoading = false
+    }
+    var jellyfinShelves by remember { mutableStateOf<Pair<List<VodItem>, List<VodItem>>>(emptyList<VodItem>() to emptyList()) }
+    var jellyfinError by remember { mutableStateOf<String?>(null) }
+    var jellyfinLoading by remember { mutableStateOf(false) }
+    LaunchedEffect(settings.jellyfinServer, settings.jellyfinToken, settings.jellyfinUserId, shelvesTick) {
+        jellyfinError = null
+        if (!settings.hasJellyfin) {
+            jellyfinShelves = emptyList<VodItem>() to emptyList()
+            return@LaunchedEffect
+        }
+        val jf = JellyfinClient(settings.jellyfinServer, settings.jellyfinToken, settings.jellyfinUserId)
+        jellyfinLoading = true
+        withContext(Dispatchers.IO) { runCatching { jf.continueWatching() to jf.recentlyAdded() } }
+            .onSuccess { jellyfinShelves = it }
+            .onFailure { jellyfinError = it.message ?: "Jellyfin did not answer" }
+        jellyfinLoading = false
+    }
+    val localResume = remember(userState, shelvesTick) { userState.continueWatching().map { it.first } }
+    val shelves = VodShelves(
+        continueWatching = (localResume + jellyfinShelves.first).distinctBy { it.source + ":" + it.id },
+        recent = jellyfinShelves.second,
+        movies = providerVod.first,
+        series = providerVod.second,
+        loading = providerLoading || jellyfinLoading,
+        error = jellyfinError ?: providerError
+    )
     var pendingVod by remember { mutableStateOf<VodItem?>(null) }
 
-    val xtream = remember(settings) {
-        if (settings.hasXtream) {
-            XtreamClient(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass)
-        } else {
-            null
-        }
-    }
-
-    // Reload the channel list only when the live source login changes. Hiding channels does not reload.
-    LaunchedEffect(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass, settings.m3uUrl) {
-        loadedChannels = emptyList()
-        channelError = null
-        if (!settings.hasLiveSource) return@LaunchedEffect
-        channelsLoading = true
-        withContext(Dispatchers.IO) { runCatching { ChannelSource.load(settings) } }
-            .onSuccess { loadedChannels = it }
-            .onFailure { channelError = it.message ?: "Could not load channels" }
-        channelsLoading = false
-    }
-
-    // The full schedule is downloaded now and then hourly: from the Xtream login, or the guide link in an M3U playlist.
-    LaunchedEffect(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass, settings.m3uUrl) {
-        while (settings.hasLiveSource) {
-            withContext(Dispatchers.IO) {
-                runCatching {
-                    if (settings.hasXtream) {
-                        EpgCache.refresh(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass)
-                    } else {
-                        ChannelSource.guideUrl(settings)?.let { EpgCache.refreshUrl(it) }
-                    }
-                }
-            }
-            delay(60 * 60 * 1000L)
-        }
-    }
-
-    // Until the saved channel is found, live TV starts on it directly, so channel 1 never plays first.
-    // The index is always kept inside the list, so a shorter list after a settings change cannot go blank.
-    val startIndex = if (!restoredChannel && channels.isNotEmpty()) {
-        (lastChannelId?.let { id -> channels.indexOfFirst { it.id == id } } ?: -1).coerceAtLeast(0)
-    } else {
-        tuneIndex.coerceIn(0, (channels.size - 1).coerceAtLeast(0))
-    }
-
-    LaunchedEffect(channels) {
-        if (!restoredChannel && channels.isNotEmpty()) {
-            restoredChannel = true
-            tuneIndex = startIndex
-        }
-    }
-
-    // Ticking a checkbox saves straight away, so there is no SAVE step to forget on a remote.
-    val toggleFilter: (String) -> Unit = { term ->
-        val set = settings.hiddenTerms.toMutableSet()
-        if (!set.remove(term)) set.add(term)
-        settings = settings.copy(hiddenFilters = set.joinToString(","))
-        store.save(settings)
-    }
-
-    val toggleStrip: () -> Unit = {
-        settings = settings.copy(stripPrefixes = !settings.stripPrefixes)
-        store.save(settings)
-    }
+    // ------------------------------------------------------------ Updates
+    var update by remember { mutableStateOf<AppUpdater.Release?>(null) }
+    var updateMessage by remember { mutableStateOf<String?>(null) }
+    var updateBusy by remember { mutableStateOf(false) }
 
     // Asks GitHub for a newer build. A manual check always reports back, an automatic one stays quiet.
     fun checkForUpdate(manual: Boolean) {
         updateBusy = true
-        updateScope.launch {
-            val result = withContext(Dispatchers.IO) {
-                runCatching { AppUpdater.latest(BuildConfig.VERSION_CODE) }
-            }
+        scope.launch {
+            val result = withContext(Dispatchers.IO) { runCatching { AppUpdater.latest(BuildConfig.VERSION_CODE) } }
             updateBusy = false
             result
                 .onSuccess { found ->
                     update = found
+                    if (found != null && !manual) showToast("Build ${found.versionCode} is ready. Install it from Settings, Updates.")
                     updateMessage = when {
-                        found != null -> "Build ${found.versionCode} is ready to install."
+                        found != null -> null
                         manual -> "You have the latest build."
                         else -> null
                     }
                 }
-                .onFailure { if (manual) updateMessage = "Could not check for updates. ${it.message}" }
+                .onFailure { if (manual) updateMessage = "The update check did not work. ${it.message ?: ""}".trim() }
         }
     }
 
-    // Downloads the build and opens the system installer. Android asks the user to confirm.
+    // Downloads the build and opens the system installer. Android asks the person to confirm.
     fun installUpdate(release: AppUpdater.Release) {
         if (!context.packageManager.canRequestPackageInstalls()) {
-            updateMessage = "Allow installs from CableTV, then press Install again."
+            updateMessage = "Allow installs from this app on the next screen, then press Install again."
             context.startActivity(
-                Intent(
-                    AndroidSettings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-                    Uri.parse("package:${context.packageName}")
-                ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                Intent(AndroidSettings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${context.packageName}"))
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             )
             return
         }
         updateBusy = true
-        updateMessage = "Downloading build ${release.versionCode}..."
-        updateScope.launch {
-            val result = withContext(Dispatchers.IO) {
-                runCatching { AppUpdater.download(release, File(context.cacheDir, "updates")) }
-            }
+        updateMessage = "Downloading build ${release.versionCode}"
+        scope.launch {
+            val result = withContext(Dispatchers.IO) { runCatching { AppUpdater.download(release, File(context.cacheDir, "updates")) } }
             updateBusy = false
             result
                 .onSuccess { apk ->
                     updateMessage = null
                     AppUpdater.install(context, apk)
                 }
-                .onFailure { updateMessage = "Download failed. ${it.message}" }
+                .onFailure { updateMessage = "The download did not finish. ${it.message ?: ""}".trim() }
         }
     }
 
     LaunchedEffect(Unit) { checkForUpdate(manual = false) }
 
-    val navigate: (Screen) -> Unit = { target ->
+    // ------------------------------------------------------------ Parental lock
+    var pinSet by remember { mutableStateOf(store.hasPin()) }
+    var settingsUnlocked by remember { mutableStateOf(false) }
+    var pinPurpose by remember { mutableStateOf(PinPurpose.NONE) }
+    var pinFirst by remember { mutableStateOf("") }
+    var pinError by remember { mutableStateOf<String?>(null) }
+
+    // ------------------------------------------------------------ Navigation
+    fun go(target: Screen) {
         if (target == Screen.Settings && pinSet && !settingsUnlocked) {
             pinError = null
             pinPurpose = PinPurpose.UNLOCK
-        } else {
-            previous = screen
-            screen = target
+            return
         }
-    }
-    val goBack: () -> Unit = {
-        if (screen == Screen.Settings) settingsUnlocked = false
-        screen = previous
-        previous = Screen.Home
-    }
-
-    BackHandler(enabled = screen != Screen.Home) { goBack() }
-
-    // Cycles to the next profile and loads its favorites and recent channels.
-    val cycleProfile: () -> Unit = {
-        if (profiles.size > 1) {
-            val at = profiles.indexOfFirst { it.id == profileId }
-            val next = profiles[(at + 1) % profiles.size]
-            profileStore.setActive(next.id)
-            profileId = next.id
-        }
+        // Leaving Settings locks it again.
+        if (screen == Screen.Settings && target != Screen.Settings) settingsUnlocked = false
+        if (target != Screen.Guide) previewBounds = null
+        screen = target
     }
 
-    // Scan lines are part of the menu look. Live video and playback are shown clean.
-    val scanlineModifier = if (screen == Screen.LiveTv || screen == Screen.OnDemand) {
-        Modifier
-    } else {
-        Modifier.scanlines()
-    }
-
-    Box(Modifier.fillMaxSize().background(Cable.Canvas).then(scanlineModifier)) {
-        when (screen) {
-            Screen.Home -> HomeMenu(
-                channelCount = channels.size,
-                liveReady = settings.hasLiveSource,
-                onDemandReady = settings.hasJellyfin || settings.hasXtream,
-                updateAvailable = update != null,
-                profileName = profileName,
-                canCycleProfile = profiles.size > 1,
-                onCycleProfile = cycleProfile,
-                onSearch = { navigate(Screen.Search) },
-                onOpen = navigate
-            )
-            // Full-bleed screens draw their own scan lines, so playback can stay clean.
-            Screen.OnDemand -> OnDemandScreen(
-                settings = settings,
-                profileId = profileId,
-                pendingVod = pendingVod,
-                onPendingConsumed = { pendingVod = null },
-                onExit = goBack
-            )
-            Screen.LiveTv -> LiveTvScreen(
-                channels = channels,
-                loading = channelsLoading,
-                error = channelError,
-                startIndex = startIndex,
-                epg = xtream,
-                favorites = favorites,
-                onToggleFavorite = toggleFavorite,
-                onExit = goBack,
-                onChannelChanged = { ch ->
-                    store.saveLastChannelId(ch.id)
-                    userState.addRecent(ch.id)
-                    recents = userState.recents()
-                    tuneIndex = channels.indexOfFirst { it.id == ch.id }.coerceAtLeast(0)
-                }
-            )
-            else -> Column(Modifier.fillMaxSize()) {
-                CableHeader(title = titleOf(screen), onBack = goBack)
-                Box(Modifier.weight(1f).fillMaxWidth()) {
-                    when (screen) {
-                        Screen.Guide -> GuideScreen(
-                            channels = channels,
-                            epg = xtream,
-                            favorites = favorites,
-                            recents = recents,
-                            onToggleFavorite = toggleFavorite,
-                            onWatch = { idx ->
-                                tuneIndex = idx
-                                previous = Screen.Guide
-                                screen = Screen.LiveTv
-                            }
-                        )
-                        Screen.Search -> SearchScreen(
-                            channels = channels,
-                            settings = settings,
-                            // Names are already shown without prefixes when that setting is on.
-                            stripPrefixes = false,
-                            onPlayChannel = { ch ->
-                                tuneIndex = channels.indexOfFirst { it.id == ch.id }.coerceAtLeast(0)
-                                previous = Screen.Search
-                                screen = Screen.LiveTv
-                            },
-                            onOpenVod = { vod ->
-                                pendingVod = vod
-                                previous = Screen.Search
-                                screen = Screen.OnDemand
-                            }
-                        )
-                        Screen.Settings -> SettingsScreen(
-                            current = settings,
-                            onSave = { updated ->
-                                store.save(updated)
-                                settings = updated
-                                // Leaving Settings locks it again.
-                                settingsUnlocked = false
-                                previous = Screen.Home
-                                screen = Screen.Home
-                            },
-                            onExit = goBack,
-                            update = update,
-                            updateMessage = updateMessage,
-                            updateBusy = updateBusy,
-                            onCheckUpdate = { checkForUpdate(manual = true) },
-                            onInstallUpdate = { installUpdate(it) },
-                            allChannels = loadedChannels,
-                            onToggleFilter = toggleFilter,
-                            onToggleStrip = toggleStrip,
-                            profiles = profiles,
-                            activeProfileId = profileId,
-                            onAddProfile = { name ->
-                                profileStore.add(name)
-                                profiles = profileStore.profiles()
-                            },
-                            onRemoveProfile = { id ->
-                                profileStore.remove(id)
-                                profiles = profileStore.profiles()
-                                profileId = profileStore.active()
-                            },
-                            pinSet = pinSet,
-                            pinNote = pinNote,
-                            onSetPin = {
-                                pinError = null
-                                pinPurpose = PinPurpose.SET_NEW
-                            },
-                            onRemovePin = {
-                                pinError = null
-                                pinPurpose = PinPurpose.REMOVE
-                            }
-                        )
-                        else -> Unit
-                    }
-                }
+    val nav = NavActions(
+        select = { tab -> go(tab.toScreen()) },
+        back = {
+            when {
+                screen != Screen.Home -> go(Screen.Home)
+                settings.hasLiveSource && channels.isNotEmpty() -> go(Screen.Live)
+                else -> (context as? Activity)?.finish()
             }
+        },
+        profileName = profileName,
+        onProfile = { showProfiles = true }
+    )
+
+    // ------------------------------------------------------------ First launch
+    var welcomeBusy by remember { mutableStateOf(false) }
+    var welcomeMessage by remember { mutableStateOf<String?>(null) }
+    fun welcomeReceived(fields: Map<String, String>) {
+        welcomeBusy = true
+        welcomeMessage = "Details received. Checking them now."
+        scope.launch {
+            var s = settings
+            val problems = mutableListOf<String>()
+            val wantsLive = listOf("xs", "xu", "xp", "m3u").any { !fields[it].isNullOrBlank() }
+            if (wantsLive) {
+                runCatching { checkLiveLogin(s, fields["xs"].orEmpty(), fields["xu"].orEmpty(), fields["xp"].orEmpty(), fields["m3u"].orEmpty()) }
+                    .onSuccess { s = it }
+                    .onFailure { problems += "Live TV: ${it.message}." }
+            }
+            if (!fields["js"].isNullOrBlank() && !fields["ju"].isNullOrBlank()) {
+                runCatching { signInJellyfin(s, fields["js"].orEmpty(), fields["ju"].orEmpty(), fields["jp"].orEmpty()) }
+                    .onSuccess { s = it }
+                    .onFailure { problems += "Jellyfin: ${it.message ?: "sign in failed"}." }
+            }
+            welcomeBusy = false
+            if (s != settings) {
+                store.save(s)
+                settings = s
+            }
+            if (problems.isEmpty() && (s.hasLiveSource || s.hasJellyfin)) {
+                showToast("You are all set")
+                go(if (s.hasLiveSource) Screen.Live else Screen.Home)
+            } else {
+                welcomeMessage = (problems.ifEmpty { listOf("Nothing was filled in on the phone.") } + "Scan the code again to fix it.").joinToString(" ")
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ Layout
+    val density = LocalDensity.current
+    Box(Modifier.fillMaxSize().background(Tv.Bg)) {
+        val bounds = previewBounds
+        val pip = screen == Screen.Guide
+        if (liveActive && channels.isNotEmpty()) {
+            // The guide shows the picture in its corner preview. Until that spot is measured, or on a
+            // phone where there is none, the view stays attached at no size so it does not restart.
+            val placement = when {
+                !pip -> Modifier.fillMaxSize()
+                bounds != null -> with(density) {
+                    Modifier
+                        .offset { IntOffset(bounds.left.roundToInt(), bounds.top.roundToInt()) }
+                        .size(bounds.width.toDp(), bounds.height.toDp())
+                        .clip(RoundedCornerShape(10.dp))
+                }
+                else -> Modifier.size(0.dp)
+            }
+            LiveVideo(live, placement.zIndex(if (pip) 2f else 0f))
+        }
+
+        Box(Modifier.fillMaxSize().zIndex(1f)) {
+            when (screen) {
+                Screen.Welcome -> WelcomeScreen(
+                    busy = welcomeBusy,
+                    message = welcomeMessage,
+                    onReceived = { welcomeReceived(it) },
+                    onUseRemote = {
+                        settingsPane = SettingsPane.Live
+                        go(Screen.Settings)
+                    }
+                )
+                Screen.Live -> LiveTvScreen(
+                    channels = channels,
+                    index = index,
+                    player = live,
+                    guide = guide,
+                    favorites = favorites,
+                    recents = recents,
+                    loading = channelsLoading,
+                    error = channelError,
+                    canReplay = xtream != null,
+                    replaying = replayUrl != null,
+                    onTune = { i ->
+                        tuneIndex = i
+                        restoredChannel = true
+                        replayUrl = null
+                    },
+                    onToggleFavorite = toggleFavorite,
+                    onReplay = { ch, p ->
+                        val client = xtream
+                        if (client != null) {
+                            scope.launch {
+                                // The provider is asked which replay address works, so this runs off the main thread.
+                                val url = withContext(Dispatchers.IO) {
+                                    runCatching { client.resolveTimeshiftUrl(ch.id, p.start, p.end) }.getOrNull()
+                                }
+                                when {
+                                    url == null -> showToast("${p.title} is not available to replay")
+                                    currentId == ch.id -> {
+                                        replayUrl = url
+                                        showToast("Playing ${p.title} from the start")
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    onReturnToLive = {
+                        replayUrl = null
+                        showToast("Back to live")
+                    },
+                    onOpenGuide = { go(Screen.Guide) },
+                    onExit = { go(Screen.Home) },
+                    showToast = showToast
+                )
+                Screen.Home -> HomeScreen(
+                    nav = nav,
+                    channels = channels,
+                    current = current,
+                    guide = guide,
+                    favorites = favorites,
+                    recents = recents,
+                    shelves = shelves,
+                    hasLive = settings.hasLiveSource,
+                    loadingChannels = channelsLoading,
+                    onWatch = { go(Screen.Live) },
+                    onGuide = { go(Screen.Guide) },
+                    onTune = { ch ->
+                        tuneTo(ch)
+                        go(Screen.Live)
+                    },
+                    onOpenVod = { item ->
+                        vodOrigin = Screen.Home
+                        pendingVod = item
+                        go(Screen.OnDemand)
+                    },
+                    onSetUp = {
+                        settingsPane = SettingsPane.Live
+                        go(Screen.Settings)
+                    }
+                )
+                Screen.Guide -> GuideScreen(
+                    nav = nav,
+                    channels = channels,
+                    currentId = current?.id,
+                    favorites = favorites,
+                    recents = recents,
+                    guide = guide,
+                    loading = channelsLoading,
+                    onWatch = { ch ->
+                        tuneTo(ch)
+                        go(Screen.Live)
+                    },
+                    onToggleFavorite = toggleFavorite,
+                    onPreviewBounds = { previewBounds = it },
+                    showToast = showToast
+                )
+                Screen.OnDemand -> OnDemandScreen(
+                    nav = nav,
+                    settings = settings,
+                    shelves = shelves,
+                    userState = userState,
+                    pendingVod = pendingVod,
+                    onPendingConsumed = { pendingVod = null },
+                    onPlaybackEnded = { shelvesTick++ },
+                    onLeaveDetail = {
+                        val back = vodOrigin
+                        vodOrigin = Screen.OnDemand
+                        if (back != Screen.OnDemand) go(back)
+                    }
+                )
+                Screen.Search -> SearchScreen(
+                    nav = nav,
+                    channels = channels,
+                    favorites = favorites,
+                    guide = guide,
+                    settings = settings,
+                    onPlayChannel = { ch ->
+                        tuneTo(ch)
+                        go(Screen.Live)
+                    },
+                    onOpenVod = { item ->
+                        vodOrigin = Screen.Search
+                        pendingVod = item
+                        go(Screen.OnDemand)
+                    }
+                )
+                Screen.Settings -> SettingsScreen(
+                    nav = nav,
+                    settings = settings,
+                    onSave = { updated ->
+                        store.save(updated)
+                        settings = updated
+                    },
+                    startPane = settingsPane,
+                    channelCount = channels.size,
+                    allChannels = loadedChannels,
+                    profiles = profiles,
+                    activeProfileId = profileId,
+                    onSwitchProfile = { switchProfile(it) },
+                    onAddProfile = { name ->
+                        profileStore.add(name)
+                        profiles = profileStore.profiles()
+                    },
+                    onRemoveProfile = { id ->
+                        profileStore.remove(id)
+                        profiles = profileStore.profiles()
+                        profileId = profileStore.active()
+                    },
+                    pinSet = pinSet,
+                    onSetPin = {
+                        pinError = null
+                        pinPurpose = PinPurpose.SET_NEW
+                    },
+                    onRemovePin = {
+                        pinError = null
+                        pinPurpose = PinPurpose.REMOVE
+                    },
+                    update = update,
+                    updateMessage = updateMessage,
+                    updateBusy = updateBusy,
+                    onCheckUpdate = { checkForUpdate(manual = true) },
+                    onInstallUpdate = { installUpdate(it) },
+                    showToast = showToast
+                )
+            }
+        }
+
+        if (showProfiles) {
+            ProfilePicker(
+                profiles = profiles,
+                activeId = profileId,
+                onPick = { id ->
+                    switchProfile(id)
+                    showProfiles = false
+                    showToast("Switched to ${profiles.firstOrNull { it.id == id }?.name ?: "profile"}")
+                },
+                onManage = {
+                    showProfiles = false
+                    settingsPane = SettingsPane.Profiles
+                    go(Screen.Settings)
+                },
+                onClose = { showProfiles = false },
+                modifier = Modifier.zIndex(3f)
+            )
         }
 
         // The PIN pad sits over whatever is showing.
-        when (pinPurpose) {
-            PinPurpose.NONE -> Unit
-            PinPurpose.UNLOCK -> PinPad(
-                title = "PARENTAL LOCK",
-                subtitle = pinError ?: "Enter the PIN to open Settings.",
-                onComplete = { entered ->
-                    if (store.checkPin(entered)) {
-                        settingsUnlocked = true
-                        pinPurpose = PinPurpose.NONE
-                        navigate(Screen.Settings)
-                    } else {
-                        pinError = "Wrong PIN. Try again."
-                    }
-                },
-                onCancel = { pinPurpose = PinPurpose.NONE }
-            )
-            PinPurpose.SET_NEW -> PinPad(
-                title = "NEW PIN",
-                subtitle = pinError ?: "Enter four digits.",
-                onComplete = { entered ->
-                    pinFirst = entered
-                    pinError = null
-                    pinPurpose = PinPurpose.SET_CONFIRM
-                },
-                onCancel = { pinPurpose = PinPurpose.NONE }
-            )
-            PinPurpose.SET_CONFIRM -> PinPad(
-                title = "CONFIRM PIN",
-                subtitle = pinError ?: "Enter the same four digits again.",
-                onComplete = { entered ->
-                    if (entered == pinFirst) {
-                        store.setPin(entered)
-                        pinSet = true
-                        pinNote = "PIN set. Settings now need it to open."
-                        pinPurpose = PinPurpose.NONE
-                    } else {
-                        pinError = "The PINs did not match. Start again."
-                        pinPurpose = PinPurpose.SET_NEW
-                    }
-                },
-                onCancel = { pinPurpose = PinPurpose.NONE }
-            )
-            PinPurpose.REMOVE -> PinPad(
-                title = "REMOVE PIN",
-                subtitle = pinError ?: "Enter the current PIN to remove the lock.",
-                onComplete = { entered ->
-                    if (store.checkPin(entered)) {
-                        store.setPin("")
-                        pinSet = false
-                        pinNote = "PIN removed."
-                        pinPurpose = PinPurpose.NONE
-                    } else {
-                        pinError = "Wrong PIN. Try again."
-                    }
-                },
-                onCancel = { pinPurpose = PinPurpose.NONE }
-            )
-        }
-    }
-}
-
-/**
- * The home screen is a numbered menu, like the front panel of the original
- * box. Keys 1 to 4 on the remote open the matching section.
- */
-@Composable
-private fun HomeMenu(
-    channelCount: Int,
-    liveReady: Boolean,
-    onDemandReady: Boolean,
-    updateAvailable: Boolean,
-    profileName: String,
-    canCycleProfile: Boolean,
-    onCycleProfile: () -> Unit,
-    onSearch: () -> Unit,
-    onOpen: (Screen) -> Unit
-) {
-    val firstButton = remember { FocusRequester() }
-    LaunchedEffect(Unit) { runCatching { firstButton.requestFocus() } }
-
-    val entries = listOf(
-        Screen.LiveTv to (if (liveReady) "$channelCount CHANNELS" else "NOT SET UP"),
-        Screen.Guide to (if (liveReady) "NOW AND NEXT" else "NEEDS A LIVE SOURCE"),
-        Screen.OnDemand to (if (onDemandReady) "CONNECTED" else "NOT SET UP"),
-        Screen.Settings to "SOURCES AND LOGIN"
-    )
-    val labels = listOf("LIVE TV", "PROGRAM GUIDE", "ON DEMAND", "SETTINGS")
-
-    Column(
-        Modifier
-            .fillMaxSize()
-            .onPreviewKeyEvent { ev ->
-                if (ev.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
-                when (val code = ev.nativeKeyEvent.keyCode) {
-                    in KeyEvent.KEYCODE_1..KeyEvent.KEYCODE_4 -> {
-                        onOpen(entries[code - KeyEvent.KEYCODE_1].first)
-                        true
-                    }
-                    else -> false
-                }
+        Box(Modifier.zIndex(4f)) {
+            when (pinPurpose) {
+                PinPurpose.NONE -> Unit
+                PinPurpose.UNLOCK -> PinPad(
+                    title = "Enter your PIN",
+                    subtitle = pinError ?: "Settings are locked.",
+                    onComplete = { entered ->
+                        if (store.checkPin(entered)) {
+                            settingsUnlocked = true
+                            pinPurpose = PinPurpose.NONE
+                            go(Screen.Settings)
+                        } else {
+                            pinError = "That PIN did not match. Try again."
+                        }
+                    },
+                    onCancel = { pinPurpose = PinPurpose.NONE }
+                )
+                PinPurpose.SET_NEW -> PinPad(
+                    title = "Choose a PIN",
+                    subtitle = pinError ?: "Four numbers you will remember.",
+                    onComplete = { entered ->
+                        pinFirst = entered
+                        pinError = null
+                        pinPurpose = PinPurpose.SET_CONFIRM
+                    },
+                    onCancel = { pinPurpose = PinPurpose.NONE }
+                )
+                PinPurpose.SET_CONFIRM -> PinPad(
+                    title = "Enter it again",
+                    subtitle = "To make sure.",
+                    onComplete = { entered ->
+                        if (entered == pinFirst) {
+                            store.setPin(entered)
+                            pinSet = true
+                            pinPurpose = PinPurpose.NONE
+                            showToast("PIN set. Settings now need it.")
+                        } else {
+                            pinError = "Those did not match. Start again."
+                            pinPurpose = PinPurpose.SET_NEW
+                        }
+                    },
+                    onCancel = { pinPurpose = PinPurpose.NONE }
+                )
+                PinPurpose.REMOVE -> PinPad(
+                    title = "Turn off the lock",
+                    subtitle = pinError ?: "Enter the current PIN.",
+                    onComplete = { entered ->
+                        if (store.checkPin(entered)) {
+                            store.setPin("")
+                            pinSet = false
+                            pinPurpose = PinPurpose.NONE
+                            showToast("Parental lock is off")
+                        } else {
+                            pinError = "That PIN did not match. Try again."
+                        }
+                    },
+                    onCancel = { pinPurpose = PinPurpose.NONE }
+                )
             }
-            .padding(horizontal = 48.dp, vertical = 32.dp),
-        verticalArrangement = Arrangement.spacedBy(20.dp)
-    ) {
-        // The title sits on its own line, so it never squeezes out on a narrow screen.
-        Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        }
+
+        AnimatedVisibility(
+            visible = toast != null,
+            enter = fadeIn(),
+            exit = fadeOut(),
+            modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 28.dp).zIndex(5f)
+        ) {
             Text(
-                text = "CABLE TV",
-                style = MaterialTheme.typography.headlineLarge,
-                color = Cable.Led
+                toast.orEmpty(),
+                style = TvType.SmallStrong,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier
+                    .widthIn(max = 560.dp)
+                    .clip(RoundedCornerShape(999.dp))
+                    .background(Tv.Surface3)
+                    .padding(horizontal = 18.dp, vertical = 10.dp)
             )
-            Row(
-                Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                CableButton(label = "SEARCH", onClick = onSearch)
-                CableButton(
-                    label = if (canCycleProfile) "PROFILE: ${profileName.uppercase()}" else profileName.uppercase(),
-                    enabled = canCycleProfile,
-                    onClick = onCycleProfile
-                )
-                Text(
-                    text = if (updateAvailable) "UPDATE READY IN SETTINGS" else "PRESS 1-4",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = if (updateAvailable) Cable.Accent else Cable.Ink3,
-                    modifier = Modifier.weight(1f)
-                )
-            }
-        }
-
-        Column(
-            Modifier.weight(1f).fillMaxWidth(),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
-        ) {
-            Row(Modifier.weight(1f).fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                MenuButton(
-                    number = 1,
-                    label = labels[0],
-                    status = entries[0].second,
-                    modifier = Modifier.weight(1f).fillMaxHeight().focusRequester(firstButton)
-                ) { onOpen(entries[0].first) }
-                MenuButton(
-                    number = 2,
-                    label = labels[1],
-                    status = entries[1].second,
-                    modifier = Modifier.weight(1f).fillMaxHeight()
-                ) { onOpen(entries[1].first) }
-            }
-            Row(Modifier.weight(1f).fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                MenuButton(
-                    number = 3,
-                    label = labels[2],
-                    status = entries[2].second,
-                    modifier = Modifier.weight(1f).fillMaxHeight()
-                ) { onOpen(entries[2].first) }
-                MenuButton(
-                    number = 4,
-                    label = labels[3],
-                    status = entries[3].second,
-                    modifier = Modifier.weight(1f).fillMaxHeight()
-                ) { onOpen(entries[3].first) }
-            }
         }
     }
 }
 
-/** A home menu card. The number sits beside the label so everything fits on a 1080p screen. */
+/** Opens from the name at the top right. Picking a profile switches favorites, recents and resume points. */
 @Composable
-private fun MenuButton(
-    number: Int,
-    label: String,
-    status: String,
-    modifier: Modifier,
-    onClick: () -> Unit
-) {
-    val shape = RoundedCornerShape(10.dp)
-    FocusSurface(
-        onClick = onClick,
-        modifier = modifier,
-        shape = shape,
-        focusScale = 1.03f
-    ) {
-        BoxWithConstraints(
-            Modifier
-                .fillMaxSize()
-                .background(Cable.Surface)
-                .border(2.dp, Cable.Accent.copy(alpha = 0.45f), shape)
-                .padding(20.dp),
-            contentAlignment = Alignment.Center
-        ) {
-            // Narrow cards (phones) stack the number above the words. Wide cards (TVs) keep them side by side.
-            if (maxWidth < 360.dp) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text(text = number.toString(), style = CableNumber, color = Cable.Accent)
-                    Spacer(Modifier.height(8.dp))
-                    CardWords(label, status, MaterialTheme.typography.titleMedium, TextAlign.Center)
-                }
-            } else {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(24.dp)
-                ) {
-                    Text(text = number.toString(), style = CableNumber, color = Cable.Accent)
-                    Column(Modifier.weight(1f)) {
-                        CardWords(label, status, MaterialTheme.typography.titleLarge, TextAlign.Start)
-                    }
-                }
-            }
-        }
-    }
-}
-
-/** The name and status of a home card. Long names wrap onto a second line instead of being cut off. */
-@Composable
-private fun CardWords(label: String, status: String, labelStyle: TextStyle, align: TextAlign) {
-    Text(
-        text = label,
-        style = labelStyle,
-        color = Cable.Led,
-        textAlign = align,
-        maxLines = 2,
-        overflow = TextOverflow.Ellipsis
-    )
-    Spacer(Modifier.height(4.dp))
-    Text(
-        text = status,
-        style = MaterialTheme.typography.bodyMedium,
-        color = Cable.Ink2,
-        textAlign = align,
-        maxLines = 2,
-        overflow = TextOverflow.Ellipsis
-    )
-}
-
-@Composable
-private fun SettingsScreen(
-    current: Settings,
-    onSave: (Settings) -> Unit,
-    onExit: () -> Unit,
-    update: AppUpdater.Release?,
-    updateMessage: String?,
-    updateBusy: Boolean,
-    onCheckUpdate: () -> Unit,
-    onInstallUpdate: (AppUpdater.Release) -> Unit,
-    allChannels: List<LiveChannel>,
-    onToggleFilter: (String) -> Unit,
-    onToggleStrip: () -> Unit,
+private fun ProfilePicker(
     profiles: List<Profile>,
-    activeProfileId: String,
-    onAddProfile: (String) -> Unit,
-    onRemoveProfile: (String) -> Unit,
-    pinSet: Boolean,
-    pinNote: String?,
-    onSetPin: () -> Unit,
-    onRemovePin: () -> Unit
+    activeId: String,
+    onPick: (String) -> Unit,
+    onManage: () -> Unit,
+    onClose: () -> Unit,
+    modifier: Modifier = Modifier
 ) {
-    var xs by remember { mutableStateOf(current.xtreamServer) }
-    var xu by remember { mutableStateOf(current.xtreamUser) }
-    var xp by remember { mutableStateOf(current.xtreamPass) }
-    var m3u by remember { mutableStateOf(current.m3uUrl) }
-    var js by remember { mutableStateOf(current.jellyfinServer) }
-    var ju by remember { mutableStateOf("") }
-    var jp by remember { mutableStateOf("") }
-    var newProfile by remember { mutableStateOf("") }
-    var busy by remember { mutableStateOf(false) }
-    var message by remember { mutableStateOf<String?>(null) }
-    val scope = rememberCoroutineScope()
-
-    // Fills the fields from the phone. A blank value leaves what the TV already has.
-    fun applyPhoneFields(fields: Map<String, String>) {
-        fields["xs"]?.takeIf { it.isNotBlank() }?.let { xs = it.trim() }
-        fields["xu"]?.takeIf { it.isNotBlank() }?.let { xu = it.trim() }
-        fields["xp"]?.takeIf { it.isNotEmpty() }?.let { xp = it }
-        fields["m3u"]?.takeIf { it.isNotBlank() }?.let { m3u = it.trim() }
-        fields["js"]?.takeIf { it.isNotBlank() }?.let { js = it.trim() }
-        fields["ju"]?.takeIf { it.isNotBlank() }?.let { ju = it.trim() }
-        fields["jp"]?.takeIf { it.isNotEmpty() }?.let { jp = it }
-    }
-
-    // Focus starts on SAVE, so the remote is never stuck inside a text field.
-    val saveFocus = remember { FocusRequester() }
+    BackHandler { onClose() }
+    val first = remember { FocusRequester() }
     LaunchedEffect(Unit) {
         withFrameNanos { }
-        runCatching { saveFocus.requestFocus() }
+        runCatching { first.requestFocus() }
     }
-
-    fun save() {
-        busy = true
-        message = "Contacting servers..."
-        scope.launch {
-            val result = runCatching {
-                withContext(Dispatchers.IO) {
-                    val (xServer, xUser, xPass) = if (
-                        xs.trim().isNotBlank() || xu.isNotBlank() || xp.isNotBlank()
-                    ) {
-                        xtreamLoginFields(xs, xu, xp)
-                    } else {
-                        Triple("", "", "")
-                    }
-                    if (xServer.isNotBlank() || xUser.isNotBlank() || xPass.isNotBlank()) {
-                        check(xServer.isNotBlank() && xUser.isNotBlank() && xPass.isNotBlank()) {
-                            "Live TV login failed. Check server, user and password."
-                        }
-                        XtreamClient(xServer, xUser, xPass).requireActive()
-                    }
-
-                    var token = current.jellyfinToken
-                    var userId = current.jellyfinUserId
-                    val jServer = js.trim()
-                    if (jServer.isBlank() || jServer != current.jellyfinServer) {
-                        token = ""
-                        userId = ""
-                    }
-                    if (jServer.isNotBlank() && ju.isNotBlank() && jp.isNotBlank()) {
-                        val (t, u) = JellyfinClient.login(jServer, ju.trim(), jp)
-                        token = t
-                        userId = u
-                    }
-
-                    Settings(
-                        xtreamServer = xServer,
-                        xtreamUser = xUser,
-                        xtreamPass = xPass,
-                        m3uUrl = m3u.trim(),
-                        jellyfinServer = jServer,
-                        jellyfinToken = token,
-                        jellyfinUserId = userId,
-                        // These are changed on their own rows, so the save keeps what is current.
-                        hiddenFilters = current.hiddenFilters,
-                        stripPrefixes = current.stripPrefixes
-                    )
-                }
-            }
-            busy = false
-            result
-                .onSuccess {
-                    xs = it.xtreamServer
-                    xu = it.xtreamUser
-                    xp = it.xtreamPass
-                    onSave(it)
-                }
-                .onFailure { message = "Save failed: ${it.message}" }
-        }
-    }
-
-    Column(
-        Modifier
+    Box(
+        modifier
             .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(horizontal = 48.dp, vertical = 32.dp),
-        verticalArrangement = Arrangement.spacedBy(20.dp)
-    ) {
-        Text(
-            text = "Credentials are encrypted on this device.",
-            style = MaterialTheme.typography.bodyLarge,
-            color = Cable.Ink2
-        )
-
-        // Actions come first, so they are one press away and not below seven fields.
-        Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-            CableButton(
-                label = "SAVE",
-                primary = true,
-                enabled = !busy,
-                onClick = { save() },
-                modifier = Modifier.focusRequester(saveFocus)
-            )
-            CableButton(label = "CANCEL", onClick = onExit)
-        }
-
-        message?.let { StatusLine(it) }
-
-        SettingsCard(
-            title = "SIGN IN FROM YOUR PHONE",
-            subtitle = "Scan the code and type the details on your phone. They appear here, and nothing is saved until you press SAVE."
-        ) {
-            PhoneSignInPanel(onReceived = { applyPhoneFields(it) })
-        }
-
-        SettingsCard(
-            title = "LIVE TV",
-            subtitle = "Xtream Codes login, used first when it is filled in. A pasted get.php link is split into these fields."
-        ) {
-            CableField("Server URL", xs) { xs = it }
-            CableField("Username", xu) { xu = it }
-            CableField("Password", xp, secret = true) { xp = it }
-        }
-
-        SettingsCard(
-            title = "LIVE TV PLAYLIST",
-            subtitle = "M3U URL. Used only when no Xtream login is set. A guide link inside the playlist is used automatically."
-        ) {
-            CableField("Playlist URL", m3u) { m3u = it }
-        }
-
-        SettingsCard(
-            title = "ON DEMAND",
-            subtitle = "Jellyfin server, optional. Provider movies and series use the Live TV login."
-        ) {
-            CableField("Server URL", js) { js = it }
-            CableField("Username (only to sign in again)", ju) { ju = it }
-            CableField("Password", jp, secret = true) { jp = it }
-        }
-
-        SettingsCard(
-            title = "PARENTAL LOCK",
-            subtitle = if (pinSet) {
-                "Settings need the PIN to open. Hidden channels can only be changed from Settings."
-            } else {
-                "Set a PIN so children cannot open Settings or change hidden channels."
-            }
-        ) {
-            pinNote?.let { StatusLine(it) }
-            Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                if (pinSet) {
-                    CableButton(label = "CHANGE PIN", onClick = onSetPin)
-                    CableButton(label = "REMOVE PIN", onClick = onRemovePin)
-                } else {
-                    CableButton(label = "SET PIN", primary = true, onClick = onSetPin)
-                }
-            }
-        }
-
-        SettingsCard(
-            title = "PROFILES",
-            subtitle = "Each profile keeps its own favorites, recent channels and resume points. Press PROFILE on the home screen to switch."
-        ) {
-            profiles.forEach { p ->
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(16.dp)
-                ) {
-                    Text(
-                        text = if (p.id == activeProfileId) "${p.name}   (in use)" else p.name,
-                        style = MaterialTheme.typography.titleMedium,
-                        color = Cable.Ink,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f)
-                    )
-                    if (p.id != com.dallas.cabletv.data.ProfileStore.DEFAULT_ID) {
-                        CableButton(label = "REMOVE", onClick = { onRemoveProfile(p.id) })
-                    }
-                }
-            }
-            CableField("New profile name", newProfile) { newProfile = it }
-            CableButton(
-                label = "ADD PROFILE",
-                primary = true,
-                enabled = newProfile.isNotBlank(),
-                onClick = {
-                    onAddProfile(newProfile)
-                    newProfile = ""
-                }
-            )
-        }
-
-        SettingsCard(
-            title = "CHANNEL NAMES",
-            subtitle = "Hide the country code at the start of names, so UK| BBC One shows as BBC One."
-        ) {
-            FilterCheckbox(
-                label = "Hide country codes",
-                count = null,
-                checked = current.stripPrefixes,
-                onToggle = onToggleStrip
-            )
-        }
-
-        SettingsCard(
-            title = "HIDDEN CHANNELS",
-            subtitle = "Tick a country or category to hide its channels from the guide and live TV. Press OK to tick or untick."
-        ) {
-            HiddenChannelFilters(
-                allChannels = allChannels,
-                hiddenTerms = current.hiddenTerms,
-                onToggle = onToggleFilter
-            )
-        }
-
-        SettingsCard(
-            title = "APP UPDATES",
-            subtitle = "Installed build ${BuildConfig.VERSION_CODE}. Installs always ask you to confirm."
-        ) {
-            updateMessage?.let { StatusLine(it) }
-            Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                CableButton(label = "CHECK", enabled = !updateBusy, onClick = onCheckUpdate)
-                update?.let { release ->
-                    CableButton(
-                        label = "INSTALL BUILD ${release.versionCode}",
-                        primary = true,
-                        enabled = !updateBusy,
-                        onClick = { onInstallUpdate(release) }
-                    )
-                }
-            }
-        }
-    }
-}
-
-/** Checkbox lists of country prefixes and categories, built from the channels the provider sent. */
-@Composable
-private fun HiddenChannelFilters(
-    allChannels: List<LiveChannel>,
-    hiddenTerms: List<String>,
-    onToggle: (String) -> Unit
-) {
-    if (allChannels.isEmpty()) {
-        Text(
-            text = "Connect a live source to see its countries and categories.",
-            style = MaterialTheme.typography.bodyMedium,
-            color = Cable.Ink2
-        )
-        return
-    }
-    val (prefixes, categories) = remember(allChannels) { channelFilters(allChannels) }
-
-    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        if (prefixes.isNotEmpty()) {
-            Text(
-                text = "COUNTRY PREFIXES",
-                style = MaterialTheme.typography.labelMedium,
-                color = Cable.Accent
-            )
-            prefixes.forEach { f ->
-                FilterCheckbox(
-                    label = f.label,
-                    count = f.count,
-                    checked = f.term in hiddenTerms,
-                    onToggle = { onToggle(f.term) }
-                )
-            }
-        }
-        if (categories.isNotEmpty()) {
-            Spacer(Modifier.height(8.dp))
-            Text(
-                text = "CATEGORIES",
-                style = MaterialTheme.typography.labelMedium,
-                color = Cable.Accent
-            )
-            categories.forEach { f ->
-                FilterCheckbox(
-                    label = f.label,
-                    count = f.count,
-                    checked = f.term in hiddenTerms,
-                    onToggle = { onToggle(f.term) }
-                )
-            }
-        }
-    }
-}
-
-/**
- * A large checkbox row for the remote. A ticked box is on. The whole row is one focus
- * target, so OK toggles it and the ring shows where you are.
- */
-@Composable
-private fun FilterCheckbox(label: String, count: Int?, checked: Boolean, onToggle: () -> Unit) {
-    FocusSurface(
-        onClick = onToggle,
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(8.dp),
-        focusScale = 1f
-    ) {
-        Row(
-            Modifier
-                .fillMaxWidth()
-                .background(Cable.Surface)
-                .padding(horizontal = 24.dp, vertical = 16.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Box(
-                Modifier
-                    .size(36.dp)
-                    .border(3.dp, if (checked) Cable.Led else Cable.Ink3, RoundedCornerShape(4.dp))
-                    .background(if (checked) Cable.Led else Color.Transparent),
-                contentAlignment = Alignment.Center
-            ) {
-                if (checked) {
-                    Text(
-                        text = "X",
-                        style = MaterialTheme.typography.labelLarge,
-                        color = Cable.Canvas
-                    )
-                }
-            }
-            Spacer(Modifier.width(24.dp))
-            Text(
-                text = label,
-                style = MaterialTheme.typography.titleMedium,
-                color = if (checked) Cable.Ink3 else Cable.Ink,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f)
-            )
-            if (count != null) {
-                Text(
-                    text = "$count",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = Cable.Ink2
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun SettingsCard(
-    title: String,
-    subtitle: String,
-    content: @Composable ColumnScope.() -> Unit
-) {
-    Column(
-        Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(8.dp))
-            .background(Cable.Surface)
-            .border(2.dp, Cable.Accent.copy(alpha = 0.35f), RoundedCornerShape(8.dp))
-            .padding(24.dp),
-        verticalArrangement = Arrangement.spacedBy(14.dp)
-    ) {
-        Text(
-            text = title,
-            style = MaterialTheme.typography.titleLarge,
-            color = Cable.Accent
-        )
-        Text(
-            text = subtitle,
-            style = MaterialTheme.typography.bodyMedium,
-            color = Cable.Ink2
-        )
-        Spacer(Modifier.height(4.dp))
-        content()
-    }
-}
-
-@Composable
-private fun StatusLine(text: String) {
-    Text(
-        text = text,
-        style = MaterialTheme.typography.bodyMedium,
-        color = Cable.Led,
-        modifier = Modifier
-            .clip(RoundedCornerShape(6.dp))
-            .background(Cable.SurfaceHi)
-            .padding(horizontal = 20.dp, vertical = 14.dp)
-    )
-}
-
-/**
- * A settings field. Moving over it with the remote only highlights it, so the keyboard
- * stays closed. OK starts editing and opens the keyboard. Done or Back finishes editing
- * and returns the highlight to the field.
- */
-@Composable
-internal fun CableField(label: String, value: String, secret: Boolean = false, onChange: (String) -> Unit) {
-    var editing by remember { mutableStateOf(false) }
-    val row = remember { FocusRequester() }
-    val input = remember { FocusRequester() }
-    val scope = rememberCoroutineScope()
-
-    fun finish() {
-        editing = false
-        scope.launch {
-            withFrameNanos { }
-            runCatching { row.requestFocus() }
-        }
-    }
-
-    BackHandler(enabled = editing) { finish() }
-    LaunchedEffect(editing) {
-        if (editing) {
-            withFrameNanos { }
-            runCatching { input.requestFocus() }
-        }
-    }
-
-    FocusSurface(
-        onClick = { editing = true },
-        modifier = Modifier.fillMaxWidth().focusRequester(row),
-        shape = RoundedCornerShape(6.dp),
-        focusScale = 1f
+            .background(Color(0x80000000))
+            .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { onClose() }
     ) {
         Column(
             Modifier
-                .fillMaxWidth()
-                .background(Cable.Surface)
-                .padding(horizontal = 20.dp, vertical = 12.dp)
+                .align(Alignment.TopEnd)
+                .trapFocus()
+                .padding(top = 52.dp, end = 32.dp)
+                .width(250.dp)
+                .clip(RoundedCornerShape(14.dp))
+                .background(Tv.Surface2)
+                .padding(8.dp),
+            verticalArrangement = Arrangement.spacedBy(2.dp)
         ) {
-            Text(
-                text = label,
-                style = MaterialTheme.typography.labelMedium,
-                color = Cable.Ink3
-            )
-            Spacer(Modifier.height(4.dp))
-            if (editing) {
-                BasicTextField(
-                    value = value,
-                    onValueChange = onChange,
-                    singleLine = true,
-                    textStyle = CableFieldStyle,
-                    cursorBrush = SolidColor(Cable.Led),
-                    visualTransformation = if (secret) PasswordVisualTransformation() else VisualTransformation.None,
-                    keyboardOptions = KeyboardOptions(
-                        keyboardType = if (secret) KeyboardType.Password else KeyboardType.Text,
-                        imeAction = ImeAction.Done
-                    ),
-                    keyboardActions = KeyboardActions(onDone = { finish() }),
-                    modifier = Modifier.fillMaxWidth().focusRequester(input)
-                )
-            } else {
-                Text(
-                    text = when {
-                        value.isEmpty() -> "Not set"
-                        secret -> "*".repeat(value.length.coerceAtMost(24))
-                        else -> value
-                    },
-                    style = CableFieldStyle,
-                    color = if (value.isEmpty()) Cable.Ink3 else Cable.Ink,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
+            Text("Who is watching?", style = TvType.CaptionStrong, color = Tv.Ink3, modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp))
+            profiles.forEach { p ->
+                Focusable(
+                    onClick = { onPick(p.id) },
+                    modifier = (if (p.id == activeId) Modifier.focusRequester(first) else Modifier).fillMaxWidth().height(44.dp),
+                    shape = RoundedCornerShape(10.dp),
+                    contentAlignment = Alignment.CenterStart
+                ) {
+                    Row(Modifier.padding(horizontal = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Avatar(p.name, Modifier.size(26.dp))
+                        Spacer(Modifier.width(12.dp))
+                        Text(p.name, style = TvType.BodyStrong, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        if (p.id == activeId) Icon(TvIcons.Check, contentDescription = "Active", tint = if (LocalFocused.current) Tv.FocusInk else Tv.Accent, modifier = Modifier.size(16.dp))
+                    }
+                }
+            }
+            Focusable(onClick = onManage, modifier = Modifier.fillMaxWidth().height(40.dp), shape = RoundedCornerShape(10.dp), contentAlignment = Alignment.CenterStart) {
+                Text("Manage profiles", style = TvType.SmallStrong, color = ink2, modifier = Modifier.padding(start = 48.dp))
             }
         }
     }

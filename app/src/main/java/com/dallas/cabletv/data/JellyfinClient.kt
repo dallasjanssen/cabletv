@@ -71,6 +71,14 @@ class JellyfinClient(server: String, private val token: String, private val user
         (0 until arr.length()).map { i ->
             val o = arr.getJSONObject(i)
             val id = o.getString("Id")
+            val type = o.optString("Type")
+            val userData = o.optJSONObject("UserData")
+            // Episodes use their show's backdrop. Movies and shows use their own.
+            val backdropId = when {
+                (o.optJSONArray("BackdropImageTags")?.length() ?: 0) > 0 -> id
+                o.optString("ParentBackdropItemId").isNotBlank() -> o.optString("ParentBackdropItemId")
+                else -> null
+            }
             VodItem(
                 id = id,
                 name = o.optString("Name"),
@@ -78,8 +86,14 @@ class JellyfinClient(server: String, private val token: String, private val user
                 overview = o.optString("Overview").takeIf { it.isNotBlank() },
                 posterUrl = "$base/Items/$id/Images/Primary?maxHeight=480&api_key=$token",
                 streamUrl = "$base/Videos/$id/stream?static=true&api_key=$token",
-                type = o.optString("Type"),
-                played = o.optJSONObject("UserData")?.optBoolean("Played") ?: false
+                type = type,
+                played = userData?.optBoolean("Played") ?: false,
+                backdropUrl = backdropId?.let { "$base/Items/$it/Images/Backdrop?maxWidth=1280&api_key=$token" },
+                season = if (type == "Episode") o.optInt("ParentIndexNumber", 0).takeIf { it > 0 } else null,
+                episode = if (type == "Episode") o.optInt("IndexNumber", 0).takeIf { it > 0 } else null,
+                seriesName = o.optString("SeriesName").takeIf { it.isNotBlank() },
+                runtimeMinutes = (o.optLong("RunTimeTicks", 0L) / 600_000_000L).toInt().takeIf { it > 0 },
+                progress = userData?.optDouble("PlayedPercentage", 0.0)?.takeIf { it > 0.0 }?.let { (it / 100.0).toFloat() }
             )
         }
 

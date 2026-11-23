@@ -18,3 +18,6 @@ local.properties
 captures/
 .externalNativeBuild/
 .cxx/
+
+# Kotlin compiler session data
+.kotlin/
