@@ -18,7 +18,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
@@ -79,19 +78,21 @@ fun GuideScreen(
     recents: List<String>,
     guide: GuideData,
     loading: Boolean,
+    group: String,
+    onGroupChange: (String) -> Unit,
     onWatch: (LiveChannel) -> Unit,
     onToggleFavorite: (LiveChannel) -> Unit,
     onPreviewBounds: (Rect?) -> Unit,
     showToast: (String) -> Unit
 ) {
-    var group by rememberSaveable { mutableStateOf(GROUP_ALL) }
-    val groups = remember(channels) { channels.map(::groupOf).distinct().sorted() }
+    val groups = remember(channels) { groupsOf(channels) }
     LaunchedEffect(groups) {
-        if (group != GROUP_ALL && group != GROUP_FAVORITES && group != GROUP_RECENT && group !in groups) group = GROUP_ALL
+        if (group != GROUP_ALL && group != GROUP_FAVORITES && group != GROUP_RECENT && group !in groups) onGroupChange(GROUP_ALL)
     }
     val rows = remember(channels, group, favorites, recents) { rowsFor(group, channels, favorites, recents) }
     @Suppress("UNUSED_VARIABLE") val epgVersion = guide.version
-    fun programsOf(ch: LiveChannel): List<Program> = guide.schedule(ch).ifEmpty { listOf(NO_INFO) }
+    // Entries that end before they start turn up in real feeds. They are skipped so cells never get a negative width.
+    fun programsOf(ch: LiveChannel): List<Program> = guide.schedule(ch).filter { it.end > it.start }.ifEmpty { listOf(NO_INFO) }
 
     val now = rememberNow(30_000L)
     val firstWindow = now / SLOT * SLOT
@@ -116,6 +117,12 @@ fun GuideScreen(
     var digits by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
     val target = remember { FocusRequester() }
+    // How many cells currently carry [target]. Focus may only be sent to it while one does,
+    // because asking for a focus target that is not on screen crashes.
+    val targetHolders = remember { intArrayOf(0) }
+    // True while the highlight is in the grid, so it can be put back if its cell is replaced.
+    var gridOwnsFocus by remember { mutableStateOf(true) }
+    var restoreTick by remember { mutableIntStateOf(0) }
     val categoryButton = remember { FocusRequester() }
 
     BackHandler(enabled = showCategories) {
@@ -161,7 +168,7 @@ fun GuideScreen(
         }
         var list = rows
         if (ch !in list) {
-            group = GROUP_ALL
+            onGroupChange(GROUP_ALL)
             list = channels
         }
         val r = list.indexOf(ch)
@@ -172,7 +179,13 @@ fun GuideScreen(
 
     BoxWithConstraints(Modifier.fillMaxSize()) {
     val outerNarrow = maxWidth < 600.dp
-    TabScaffold(Tab.Guide, nav, modifier = Modifier.background(Tv.Bg), backEnabled = !showCategories && menuFor == null) { narrow ->
+    TabScaffold(
+        Tab.Guide,
+        nav,
+        modifier = Modifier.background(Tv.Bg),
+        backEnabled = !showCategories && menuFor == null,
+        onNavFocus = { if (it) gridOwnsFocus = false }
+    ) { narrow ->
         BoxWithConstraints(Modifier.fillMaxSize().padding(top = 52.dp)) {
             val side = gutter(narrow)
             val chanW = if (narrow) 116.dp else 196.dp
@@ -185,7 +198,35 @@ fun GuideScreen(
             val slotW = gridW / slots
             val windowEnd = windowStart + slots * SLOT
 
-            fun handleKey(code: Int): Boolean {
+            // The highlighted show can disappear: listings arrive and replace "No guide information",
+            // or the show ends and the grid moves on. The highlight then moves to whatever is on at
+            // that time in the same row, or to the channel name.
+            val shown = run {
+                val ch = rows.getOrNull(focus.row)
+                val s = focus.start
+                when {
+                    ch == null || s == null -> focus
+                    programsOf(ch).any { it.start == s && it.end > windowStart && it.start < windowEnd } -> focus
+                    else -> GuideFocus(focus.row, cellAt(ch, maxOf(anchor, windowStart), windowEnd))
+                }
+            }
+            if (shown != focus) {
+                SideEffect {
+                    focus = shown
+                    restoreTick++
+                }
+            }
+            LaunchedEffect(restoreTick) {
+                if (restoreTick > 0 && gridOwnsFocus && !showCategories && menuFor == null) {
+                    repeat(3) {
+                        withFrameNanos { }
+                        if (runCatching { target.requestFocus() }.isSuccess) return@LaunchedEffect
+                    }
+                }
+            }
+
+            // Works out the new highlight. handleKey below then moves real focus to it.
+            fun moveIn(code: Int): Boolean {
                 val ch = rows.getOrNull(focus.row) ?: return false
                 val f = focus
                 when (code) {
@@ -239,6 +280,7 @@ fun GuideScreen(
                     }
                     KeyEvent.KEYCODE_DPAD_LEFT -> {
                         if (f.start == null) {
+                            gridOwnsFocus = false
                             showCategories = true
                             return true
                         }
@@ -263,14 +305,20 @@ fun GuideScreen(
                     }
                     else -> return false
                 }
-                focusTick++
                 return true
+            }
+
+            fun handleKey(code: Int): Boolean {
+                val before = focus to windowStart
+                val handled = moveIn(code)
+                if (handled && (focus to windowStart) != before) focusTick++
+                return handled
             }
 
             Column(
                 Modifier
                     .fillMaxSize()
-                    .focusProperties { enter = { target } }
+                    .focusProperties { enter = { if (targetHolders[0] > 0) target else FocusRequester.Default } }
                     .focusGroup()
             ) {
                 // Details of whatever is highlighted, with the live preview beside it.
@@ -309,7 +357,11 @@ fun GuideScreen(
                 // The category button and the times along the top of the grid.
                 Row(Modifier.fillMaxWidth().padding(horizontal = side).padding(top = 8.dp).height(30.dp), verticalAlignment = Alignment.CenterVertically) {
                     Focusable(
-                        onClick = { showCategories = true },
+                        onClick = {
+                            gridOwnsFocus = false
+                            showCategories = true
+                        },
+                        onFocus = { if (it) gridOwnsFocus = false },
                         modifier = Modifier
                             .width(chanW)
                             .height(28.dp)
@@ -402,7 +454,7 @@ fun GuideScreen(
                                     ch = ch,
                                     programs = programsOf(ch),
                                     rowIndex = i,
-                                    focus = focus,
+                                    focus = shown,
                                     target = target,
                                     windowStart = windowStart,
                                     windowEnd = windowEnd,
@@ -415,6 +467,7 @@ fun GuideScreen(
                                     compact = narrow,
                                     onChannel = {
                                         focus = GuideFocus(i, null)
+                                        gridOwnsFocus = false
                                         menuFor = ch
                                     },
                                     onProgram = { p ->
@@ -426,8 +479,10 @@ fun GuideScreen(
                                         }
                                     },
                                     onFocused = { start ->
+                                        gridOwnsFocus = true
                                         if (focus.row != i || focus.start != start) focus = GuideFocus(i, start)
-                                    }
+                                    },
+                                    targetHolders = targetHolders
                                 )
                             }
                         }
@@ -456,13 +511,14 @@ fun GuideScreen(
             exit = slideOutHorizontally { -it } + fadeOut(),
             modifier = Modifier.align(Alignment.CenterStart)
         ) {
-            val items = listOf(GROUP_FAVORITES, GROUP_RECENT, GROUP_ALL) + groups
+            val items = (listOf(GROUP_FAVORITES, GROUP_RECENT, GROUP_ALL) + groups).distinct()
             CategoryPanel(
+                title = "Show in the guide",
                 items = items,
                 selected = group,
                 countOf = { g -> rowsFor(g, channels, favorites, recents).size },
                 onPick = { g ->
-                    group = g
+                    onGroupChange(g)
                     showCategories = false
                     val list = rowsFor(g, channels, favorites, recents)
                     anchor = maxOf(now, windowStart)
@@ -546,10 +602,12 @@ private fun GuideRow(
     compact: Boolean,
     onChannel: () -> Unit,
     onProgram: (Program) -> Unit,
-    onFocused: (Long?) -> Unit
+    onFocused: (Long?) -> Unit,
+    targetHolders: IntArray
 ) {
     Row(Modifier.fillMaxWidth().height(50.dp), verticalAlignment = Alignment.CenterVertically) {
         val isTargetChannel = focus.row == rowIndex && focus.start == null
+        if (isTargetChannel) HoldsTarget(targetHolders)
         Focusable(
             onClick = onChannel,
             modifier = Modifier
@@ -585,12 +643,16 @@ private fun GuideRow(
         }
         Spacer(Modifier.width(8.dp))
         Box(Modifier.width(gridW).fillMaxHeight()) {
-            programs.forEach { p ->
-                if (p.end > windowStart && p.start < windowEnd) {
-                    key(p.start) {
+            // Cells are keyed by their place in the row, not by show. When listings arrive and replace
+            // "No guide information", or the grid moves on, the focused cell stays and shows the new
+            // programme instead of disappearing from under the remote.
+            programs.filter { it.end > windowStart && it.start < windowEnd }.forEachIndexed { place, p ->
+                run {
+                    key(place) {
                         val left = slotW * ((maxOf(p.start, windowStart) - windowStart).toFloat() / SLOT)
                         val right = slotW * ((minOf(p.end, windowEnd) - windowStart).toFloat() / SLOT)
                         val isTarget = focus.row == rowIndex && focus.start == p.start
+                        if (isTarget) HoldsTarget(targetHolders)
                         val wide = right - left > 46.dp
                         Focusable(
                             onClick = { onProgram(p) },
@@ -626,8 +688,27 @@ private fun GuideRow(
     }
 }
 
+/** Counts the cells carrying the guide's focus target while they are on screen. */
 @Composable
-private fun CategoryPanel(
+private fun HoldsTarget(holders: IntArray) {
+    DisposableEffect(Unit) {
+        holders[0]++
+        onDispose { holders[0]-- }
+    }
+}
+
+/** The categories a channel list can show: favorites, recents, everything, then the provider's groups. */
+fun groupsOf(channels: List<LiveChannel>): List<String> = channels.map(::groupOf).distinct().sorted()
+
+fun categoryItems(groups: List<String>): List<String> = (listOf(GROUP_FAVORITES, GROUP_RECENT, GROUP_ALL) + groups).distinct()
+
+/** The channels in a category, in list order. */
+fun channelsIn(group: String, channels: List<LiveChannel>, favorites: Set<String>, recents: List<String>): List<LiveChannel> =
+    rowsFor(group, channels, favorites, recents)
+
+@Composable
+fun CategoryPanel(
+    title: String,
     items: List<String>,
     selected: String,
     countOf: (String) -> Int,
@@ -644,7 +725,7 @@ private fun CategoryPanel(
     }
     BoxWithConstraints {
         SidePanel(
-            "Show in the guide",
+            title,
             Modifier
                 .width(minOf(320.dp, maxWidth * 0.88f))
                 .onPreviewKeyEvent { ev ->

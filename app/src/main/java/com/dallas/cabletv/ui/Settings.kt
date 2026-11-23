@@ -123,6 +123,8 @@ fun SettingsScreen(
     updateBusy: Boolean,
     onCheckUpdate: () -> Unit,
     onInstallUpdate: (AppUpdater.Release) -> Unit,
+    lastCrash: String?,
+    onClearCrash: () -> Unit,
     showToast: (String) -> Unit
 ) {
     var pane by rememberSaveable { mutableStateOf(startPane) }
@@ -224,7 +226,7 @@ fun SettingsScreen(
                 SettingsPane.Channels -> ChannelsPane(settings, allChannels, onSave)
                 SettingsPane.Profiles -> ProfilesPane(profiles, activeProfileId, onSwitchProfile, onAddProfile, onRemoveProfile, showToast)
                 SettingsPane.Lock -> LockPane(pinSet, onSetPin, onRemovePin)
-                SettingsPane.Updates -> UpdatesPane(update, updateMessage, updateBusy, onCheckUpdate, onInstallUpdate)
+                SettingsPane.Updates -> UpdatesPane(update, updateMessage, updateBusy, onCheckUpdate, onInstallUpdate, lastCrash, onClearCrash)
             }
         }
 
@@ -486,7 +488,9 @@ private fun UpdatesPane(
     message: String?,
     busy: Boolean,
     onCheck: () -> Unit,
-    onInstall: (AppUpdater.Release) -> Unit
+    onInstall: (AppUpdater.Release) -> Unit,
+    lastCrash: String?,
+    onClearCrash: () -> Unit
 ) {
     PaneTitle("Updates", "New versions come from your GitHub builds. Installing always asks you to confirm.")
     if (update != null) {
@@ -500,6 +504,23 @@ private fun UpdatesPane(
         PillButton(if (busy) "Checking" else "Check for updates", onCheck, enabled = !busy)
     }
     Message(message)
+    if (lastCrash != null) {
+        SectionLabel("Last problem", Modifier.padding(top = 22.dp, bottom = 6.dp))
+        Text(
+            "The app closed unexpectedly. If you report it, include a photo of this.",
+            style = TvType.Small,
+            color = Tv.Ink2
+        )
+        Spacer(Modifier.height(8.dp))
+        Text(
+            lastCrash.lines().filter { it.isNotBlank() }.take(14).joinToString("\n"),
+            style = TvType.Caption.copy(fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace),
+            color = Tv.Ink2,
+            modifier = Modifier.clip(RoundedCornerShape(10.dp)).background(Tv.Surface).padding(12.dp)
+        )
+        Spacer(Modifier.height(10.dp))
+        PillButton("Clear", onClearCrash)
+    }
 }
 
 private fun channelCount(n: Int) = if (n == 1) "1 channel" else "$n channels"

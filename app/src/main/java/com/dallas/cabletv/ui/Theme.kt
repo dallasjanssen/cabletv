@@ -556,6 +556,7 @@ fun TabScaffold(
     nav: NavActions,
     modifier: Modifier = Modifier,
     backEnabled: Boolean = true,
+    onNavFocus: (Boolean) -> Unit = {},
     content: @Composable BoxScope.(narrow: Boolean) -> Unit
 ) {
     val selectedTab = remember { FocusRequester() }
@@ -583,7 +584,12 @@ fun TabScaffold(
             Row(
                 Modifier
                     .weight(1f)
-                    .onFocusChanged { navHasFocus = it.hasFocus }
+                    .onFocusChanged {
+                        if (navHasFocus != it.hasFocus) {
+                            navHasFocus = it.hasFocus
+                            onNavFocus(it.hasFocus)
+                        }
+                    }
                     .focusProperties { enter = { selectedTab } }
                     .focusGroup(),
                 horizontalArrangement = Arrangement.SpaceBetween,
