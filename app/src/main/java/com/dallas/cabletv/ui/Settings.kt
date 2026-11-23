@@ -40,6 +40,8 @@ import com.dallas.cabletv.data.LiveChannel
 import com.dallas.cabletv.data.Profile
 import com.dallas.cabletv.data.ProfileStore
 import com.dallas.cabletv.data.Settings
+import com.dallas.cabletv.data.RecordingStore
+import com.dallas.cabletv.data.StalkerClient
 import com.dallas.cabletv.data.XtreamClient
 import com.dallas.cabletv.data.channelFilters
 import com.dallas.cabletv.data.xtreamLoginFields
@@ -55,26 +57,55 @@ enum class SettingsPane(val label: String, val icon: ImageVector) {
     Channels("Channel list", TvIcons.Eye),
     Profiles("Profiles", TvIcons.People),
     Lock("Parental lock", TvIcons.Lock),
+    Recordings("Recordings", TvIcons.Download),
     Updates("Updates", TvIcons.Download)
 }
 
-/** Checks a TV provider login, or accepts a playlist link, and returns the settings to save. */
-suspend fun checkLiveLogin(current: Settings, server: String, user: String, pass: String, m3u: String): Settings =
+/** Checks a TV provider login, a playlist, or a Stalker portal, and keeps whichever were filled in. */
+suspend fun checkLiveLogin(
+    current: Settings,
+    server: String,
+    user: String,
+    pass: String,
+    m3u: String,
+    stalkerUrl: String = "",
+    stalkerMac: String = ""
+): Settings =
     withContext(Dispatchers.IO) {
         val playlist = m3u.trim()
+        val portal = stalkerUrl.trim()
+        val mac = stalkerMac.trim()
         // A pasted playlist link in the server field fills in a blank username and password.
         val (xs, xu, xp) = if (server.isNotBlank() || user.isNotBlank() || pass.isNotBlank()) {
             xtreamLoginFields(server, user, pass)
         } else {
             Triple("", "", "")
         }
-        if (xs.isNotEmpty() || xu.isNotEmpty() || xp.isNotEmpty()) {
+        val hasPortal = xs.isNotEmpty() || xu.isNotEmpty() || xp.isNotEmpty()
+        val hasStalker = portal.isNotEmpty() || mac.isNotEmpty()
+        var expiry = current.subscriptionExpiryMs
+        if (hasPortal) {
             require(xs.isNotEmpty() && xu.isNotEmpty() && xp.isNotEmpty()) { "Fill in the server, username and password" }
-            XtreamClient(xs, xu, xp).requireActive()
-        } else {
-            require(playlist.isNotEmpty()) { "Enter a provider login or a playlist link" }
+            val client = XtreamClient(xs, xu, xp)
+            client.requireActive()
+            expiry = client.subscriptionExpiryMs()
         }
-        current.copy(xtreamServer = xs, xtreamUser = xu, xtreamPass = xp, m3uUrl = playlist)
+        if (hasStalker) {
+            require(portal.isNotEmpty() && mac.isNotEmpty()) { "Enter the portal address and the MAC address" }
+            StalkerClient(portal, mac).connect()
+        }
+        if (!hasPortal && playlist.isEmpty() && !hasStalker) {
+            require(false) { "Enter a provider login, a playlist link, or a portal" }
+        }
+        current.copy(
+            xtreamServer = xs,
+            xtreamUser = xu,
+            xtreamPass = xp,
+            m3uUrl = playlist,
+            stalkerUrl = portal,
+            stalkerMac = mac,
+            subscriptionExpiryMs = expiry
+        )
     }
 
 /** Signs in to Jellyfin and returns the settings to save. The password is used once and not stored. */
@@ -92,6 +123,8 @@ private class Drafts(s: Settings) {
     var xu by mutableStateOf(s.xtreamUser)
     var xp by mutableStateOf(s.xtreamPass)
     var m3u by mutableStateOf(s.m3uUrl)
+    var su by mutableStateOf(s.stalkerUrl)
+    var sm by mutableStateOf(s.stalkerMac)
     var js by mutableStateOf(s.jellyfinServer)
     var ju by mutableStateOf("")
     var jp by mutableStateOf("")
@@ -125,7 +158,10 @@ fun SettingsScreen(
     onInstallUpdate: (AppUpdater.Release) -> Unit,
     lastCrash: String?,
     onClearCrash: () -> Unit,
-    showToast: (String) -> Unit
+    showToast: (String) -> Unit,
+    hiddenFilters: String,
+    onHiddenFilters: (String) -> Unit,
+    onJellyfinSave: (Settings) -> Unit
 ) {
     var pane by rememberSaveable { mutableStateOf(startPane) }
     var narrowOpen by rememberSaveable { mutableStateOf(false) }
@@ -142,11 +178,13 @@ fun SettingsScreen(
         liveBusy = true
         liveMessage = "Checking your login"
         scope.launch {
-            runCatching { checkLiveLogin(latest, drafts.xs, drafts.xu, drafts.xp, drafts.m3u) }
+            runCatching { checkLiveLogin(latest, drafts.xs, drafts.xu, drafts.xp, drafts.m3u, drafts.su, drafts.sm) }
                 .onSuccess {
                     drafts.xs = it.xtreamServer
                     drafts.xu = it.xtreamUser
                     drafts.xp = it.xtreamPass
+                    drafts.su = it.stalkerUrl
+                    drafts.sm = it.stalkerMac
                     onSave(it)
                     liveMessage = "Saved. Your channels are loading."
                     after("Live TV is connected.")
@@ -165,7 +203,7 @@ fun SettingsScreen(
         scope.launch {
             runCatching { signInJellyfin(latest, drafts.js, drafts.ju, drafts.jp) }
                 .onSuccess {
-                    onSave(it)
+                    onJellyfinSave(it)
                     drafts.jp = ""
                     libraryMessage = "Signed in."
                     after("Jellyfin is signed in.")
@@ -184,10 +222,12 @@ fun SettingsScreen(
         fields["xu"]?.takeIf { it.isNotBlank() }?.let { drafts.xu = it.trim() }
         fields["xp"]?.takeIf { it.isNotEmpty() }?.let { drafts.xp = it }
         fields["m3u"]?.takeIf { it.isNotBlank() }?.let { drafts.m3u = it.trim() }
+        fields["su"]?.takeIf { it.isNotBlank() }?.let { drafts.su = it.trim() }
+        fields["sm"]?.takeIf { it.isNotBlank() }?.let { drafts.sm = it.trim() }
         fields["js"]?.takeIf { it.isNotBlank() }?.let { drafts.js = it.trim() }
         fields["ju"]?.takeIf { it.isNotBlank() }?.let { drafts.ju = it.trim() }
         fields["jp"]?.takeIf { it.isNotEmpty() }?.let { drafts.jp = it }
-        val live = listOf("xs", "xu", "xp", "m3u").any { !fields[it].isNullOrBlank() }
+        val live = listOf("xs", "xu", "xp", "m3u", "su", "sm").any { !fields[it].isNullOrBlank() }
         val library = !fields["js"].isNullOrBlank() && !fields["ju"].isNullOrBlank()
         val results = mutableListOf<String>()
         phoneMessage = "Details received. Checking them now."
@@ -215,17 +255,18 @@ fun SettingsScreen(
             when (pane) {
                 SettingsPane.Phone -> PhonePane(phoneMessage, onReceived = { fromPhone(it) })
                 SettingsPane.Live -> LivePane(settings, channelCount, drafts, liveBusy, liveMessage, onSave = { saveLive() }, onSignOut = {
-                    onSave(settings.copy(xtreamServer = "", xtreamUser = "", xtreamPass = "", m3uUrl = ""))
-                    drafts.xs = ""; drafts.xu = ""; drafts.xp = ""; drafts.m3u = ""
+                    onSave(settings.copy(xtreamServer = "", xtreamUser = "", xtreamPass = "", m3uUrl = "", stalkerUrl = "", stalkerMac = "", subscriptionExpiryMs = 0L))
+                    drafts.xs = ""; drafts.xu = ""; drafts.xp = ""; drafts.m3u = ""; drafts.su = ""; drafts.sm = ""
                     liveMessage = "Signed out of live TV."
                 })
                 SettingsPane.Library -> LibraryPane(settings, drafts, libraryBusy, libraryMessage, onSave = { saveLibrary() }, onSignOut = {
-                    onSave(settings.copy(jellyfinToken = "", jellyfinUserId = ""))
-                    libraryMessage = "Signed out of Jellyfin."
+                    onJellyfinSave(settings.copy(jellyfinToken = "", jellyfinUserId = ""))
+                    libraryMessage = "Signed out of Jellyfin for this profile."
                 })
-                SettingsPane.Channels -> ChannelsPane(settings, allChannels, onSave)
+                SettingsPane.Channels -> ChannelsPane(settings, allChannels, hiddenFilters, onHiddenFilters, onSave)
                 SettingsPane.Profiles -> ProfilesPane(profiles, activeProfileId, onSwitchProfile, onAddProfile, onRemoveProfile, showToast)
-                SettingsPane.Lock -> LockPane(pinSet, onSetPin, onRemovePin)
+                SettingsPane.Lock -> LockPane(pinSet, onSetPin, onRemovePin, settings, allChannels, onSave)
+                SettingsPane.Recordings -> RecordingsPane()
                 SettingsPane.Updates -> UpdatesPane(update, updateMessage, updateBusy, onCheckUpdate, onInstallUpdate, lastCrash, onClearCrash)
             }
         }
@@ -354,7 +395,13 @@ private fun LivePane(
         SettingsField("Server", drafts.xs, placeholder = "http://example.com:8080") { drafts.xs = it }
         SettingsField("Username", drafts.xu) { drafts.xu = it }
         SettingsField("Password", drafts.xp, secret = true) { drafts.xp = it }
-        SettingsField("Playlist link", drafts.m3u, placeholder = "Only if you have no login") { drafts.m3u = it }
+        SettingsField("Playlist link", drafts.m3u, placeholder = "Optional, kept alongside a login") { drafts.m3u = it }
+        SettingsField("Stalker portal", drafts.su, placeholder = "http://portal.example/stalker_portal") { drafts.su = it }
+        SettingsField("MAC address", drafts.sm, placeholder = "00:1A:79:00:00:00") { drafts.sm = it }
+    }
+    if (settings.subscriptionExpiryMs > 0L && settings.hasXtream) {
+        Spacer(Modifier.height(8.dp))
+        Text("Subscription until ${expiryLabel(settings.subscriptionExpiryMs)}", style = TvType.Small, color = Tv.Ink2)
     }
     Spacer(Modifier.height(14.dp))
     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -390,13 +437,19 @@ private fun LibraryPane(
 }
 
 @Composable
-private fun ChannelsPane(settings: Settings, allChannels: List<LiveChannel>, onSave: (Settings) -> Unit) {
-    PaneTitle("Channel list", "Choose what shows in the guide and the channel list. Changes save right away.")
-    val hidden = settings.hiddenTerms
+private fun ChannelsPane(
+    settings: Settings,
+    allChannels: List<LiveChannel>,
+    hiddenFilters: String,
+    onHiddenFilters: (String) -> Unit,
+    onSave: (Settings) -> Unit
+) {
+    PaneTitle("Channel list", "Hidden groups are for this profile. A new profile starts from the list saved here the first time.")
+    val hidden = hiddenFilters.split(',').map { it.trim().uppercase() }.filter { it.isNotEmpty() }
     fun toggle(term: String) {
         val set = hidden.toMutableSet()
         if (!set.remove(term)) set.add(term)
-        onSave(settings.copy(hiddenFilters = set.joinToString(",")))
+        onHiddenFilters(set.joinToString(","))
     }
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         SwitchRow("Show names without country codes", "UK| News becomes News", settings.stripPrefixes) {
@@ -468,9 +521,16 @@ private fun ProfilesPane(
 }
 
 @Composable
-private fun LockPane(pinSet: Boolean, onSetPin: () -> Unit, onRemovePin: () -> Unit) {
-    PaneTitle("Parental lock", "A PIN stops others from opening Settings and changing which channels show.")
-    if (pinSet) StatusChip("On. Settings need the PIN.", ok = true) else StatusChip("Off. Anyone can open Settings.", ok = false)
+private fun LockPane(
+    pinSet: Boolean,
+    onSetPin: () -> Unit,
+    onRemovePin: () -> Unit,
+    settings: Settings,
+    allChannels: List<LiveChannel>,
+    onSave: (Settings) -> Unit
+) {
+    PaneTitle("Parental lock", "The PIN opens Settings. Groups marked below also need it before they play. One correct PIN unlocks them until you switch profile.")
+    if (pinSet) StatusChip("On. Settings and locked groups need the PIN.", ok = true) else StatusChip("Off. Anyone can open Settings.", ok = false)
     Spacer(Modifier.height(14.dp))
     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         if (pinSet) {
@@ -480,7 +540,50 @@ private fun LockPane(pinSet: Boolean, onSetPin: () -> Unit, onRemovePin: () -> U
             PillButton("Set a PIN", onSetPin, icon = TvIcons.Lock)
         }
     }
+    if (!pinSet || allChannels.isEmpty()) return
+    val locked = settings.lockedTerms
+    val groups = allChannels.map { it.group }.filter { it.isNotBlank() }.distinct().sorted()
+    SectionLabel("Need a PIN", Modifier.padding(top = 18.dp, bottom = 8.dp))
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        groups.forEach { group ->
+            val term = group.uppercase()
+            SwitchRow(group, "Ask for the PIN before these channels play", term in locked) {
+                val set = locked.toMutableSet()
+                if (!set.remove(term)) set.add(term)
+                onSave(settings.copy(lockedFilters = set.joinToString(",")))
+            }
+        }
+    }
 }
+
+@Composable
+private fun RecordingsPane() {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    var items by remember { mutableStateOf(RecordingStore(context.filesDir).list()) }
+    PaneTitle("Recordings", "One recording at a time. A scheduled one starts while the app is open, and the file stays if you leave the picture. A provider that allows one connection may stop live TV while this runs.")
+    if (items.isEmpty()) {
+        Message("Nothing recorded yet. Pick a show in the guide and choose Record.")
+        return
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        items.forEach { item ->
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Column(Modifier.weight(1f)) {
+                    Text(item.title, style = TvType.BodyStrong, maxLines = 1)
+                    Text(item.channelName, style = TvType.Caption, color = Tv.Ink3)
+                }
+                PillButton("Delete", {
+                    RecordingStore(context.filesDir).delete(item.id)
+                    items = RecordingStore(context.filesDir).list()
+                })
+            }
+        }
+    }
+}
+
+private fun expiryLabel(ms: Long): String =
+    java.time.Instant.ofEpochMilli(ms).atZone(java.time.ZoneId.systemDefault())
+        .format(java.time.format.DateTimeFormatter.ofPattern("d MMM yyyy"))
 
 @Composable
 private fun UpdatesPane(

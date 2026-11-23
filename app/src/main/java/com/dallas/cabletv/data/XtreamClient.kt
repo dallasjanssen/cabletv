@@ -94,6 +94,7 @@ class XtreamClient(server: String, user: String, pass: String) {
 
     /** Newest movies on the provider, by the date the panel added them. */
     fun vodMovies(limit: Int = 60): List<VodItem> {
+        val categories = categoryNames("get_vod_categories")
         val arr = JSONArray(api("get_vod_streams"))
         return (0 until arr.length()).map { i ->
             val o = arr.getJSONObject(i)
@@ -111,13 +112,37 @@ class XtreamClient(server: String, user: String, pass: String) {
                 ),
                 type = "Movie",
                 source = "xtream",
-                addedAt = recentlyAddedEpochSeconds(jsonLong(o, "added"), jsonLong(o, "last_modified"), series = false)
+                addedAt = recentlyAddedEpochSeconds(jsonLong(o, "added"), jsonLong(o, "last_modified"), series = false),
+                category = categories[o.optString("category_id")] ?: "Movies"
             )
         }.sortedByDescending { it.addedAt }.take(limit)
     }
 
+    /** Plot, year and backdrop for one movie. The list call does not include them. */
+    fun movieDetails(streamId: String): VodItem? = try {
+        val json = JSONObject(api("get_vod_info", "vod_id=$streamId"))
+        val info = json.optJSONObject("info") ?: return null
+        val movieData = json.optJSONObject("movie_data")
+        VodItem(
+            id = streamId,
+            name = info.optString("name"),
+            year = info.optString("releasedate").take(4).toIntOrNull() ?: info.optString("year").toIntOrNull(),
+            overview = info.optString("plot").takeIf { it.isNotBlank() } ?: info.optString("description").takeIf { it.isNotBlank() },
+            posterUrl = info.optString("movie_image"),
+            streamUrl = "",
+            type = "Movie",
+            source = "xtream",
+            backdropUrl = info.optString("backdrop_path").takeIf { it.startsWith("http") }
+                ?: movieData?.optString("stream_icon")?.takeIf { it.startsWith("http") },
+            runtimeMinutes = info.optInt("duration_secs", 0).takeIf { it > 0 }?.div(60)
+        )
+    } catch (e: Exception) {
+        null
+    }
+
     /** Newest series on the provider. Episodes load separately when one is opened. */
     fun vodSeries(limit: Int = 60): List<VodItem> {
+        val categories = categoryNames("get_series_categories")
         val arr = JSONArray(api("get_series"))
         return (0 until arr.length()).map { i ->
             val o = arr.getJSONObject(i)
@@ -130,9 +155,22 @@ class XtreamClient(server: String, user: String, pass: String) {
                 streamUrl = "",
                 type = "Series",
                 source = "xtream",
-                addedAt = recentlyAddedEpochSeconds(jsonLong(o, "added"), jsonLong(o, "last_modified"), series = true)
+                addedAt = recentlyAddedEpochSeconds(jsonLong(o, "added"), jsonLong(o, "last_modified"), series = true),
+                category = categories[o.optString("category_id")] ?: "Shows"
             )
         }.sortedByDescending { it.addedAt }.take(limit)
+    }
+
+    private fun categoryNames(action: String): Map<String, String> = try {
+        val arr = JSONArray(api(action))
+        buildMap {
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                put(o.optString("category_id"), o.optString("category_name"))
+            }
+        }
+    } catch (e: Exception) {
+        emptyMap()
     }
 
     /** Episodes of one series, in season and episode order. */
@@ -305,7 +343,8 @@ class XtreamClient(server: String, user: String, pass: String) {
                     server?.optString("timezone"),
                     server?.optString("time_now"),
                     server?.let { jsonValue(it, "timestamp_now") }
-                )
+                ),
+                expiresAt = expirationEpochMillis(jsonValue(userInfo, "exp_date")) ?: 0L
             )
         }
     } catch (e: Exception) {
@@ -323,7 +362,8 @@ class XtreamClient(server: String, user: String, pass: String) {
         return PortalInfo(
             status = status,
             formats = current.formats.ifEmpty { candidate.formats },
-            timezone = current.timezone ?: candidate.timezone
+            timezone = current.timezone ?: candidate.timezone,
+            expiresAt = current.expiresAt.takeIf { it > 0L } ?: candidate.expiresAt
         )
     }
 
@@ -355,9 +395,13 @@ class XtreamClient(server: String, user: String, pass: String) {
         s
     }
 
+    /** When the subscription ends, or 0 when the panel did not say. */
+    fun subscriptionExpiryMs(): Long = readPortal()?.expiresAt ?: 0L
+
     private data class PortalInfo(
         val status: PortalStatus,
         val formats: List<String>,
-        val timezone: String?
+        val timezone: String?,
+        val expiresAt: Long = 0L
     )
 }

@@ -35,6 +35,7 @@ import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import com.dallas.cabletv.data.EpgCache
 import com.dallas.cabletv.data.GuideSelection
 import com.dallas.cabletv.data.LiveChannel
 import com.dallas.cabletv.data.Program
@@ -84,6 +85,8 @@ fun GuideScreen(
     onGroupChange: (String) -> Unit,
     onWatch: (LiveChannel) -> Unit,
     onReplay: (LiveChannel, Program) -> Unit,
+    onRemind: (LiveChannel, Program) -> Unit,
+    onRecord: (LiveChannel, Program) -> Unit,
     onToggleFavorite: (LiveChannel) -> Unit,
     onPreviewBounds: (Rect?) -> Unit,
     showToast: (String) -> Unit
@@ -99,9 +102,9 @@ fun GuideScreen(
 
     val now = rememberNow(30_000L)
     val firstWindow = now / SLOT * SLOT
-    val lastWindow = firstWindow + 10 * HOUR
+    val earliest = firstWindow - EpgCache.BEHIND_MS
+    val lastWindow = firstWindow + EpgCache.AHEAD_MS
     var windowStart by remember { mutableLongStateOf(firstWindow) }
-    LaunchedEffect(firstWindow) { if (windowStart < firstWindow) windowStart = firstWindow }
     var anchor by remember { mutableLongStateOf(now) }
 
     fun cellAt(ch: LiveChannel, t: Long, winEnd: Long): Long? {
@@ -117,6 +120,7 @@ fun GuideScreen(
     var focusTick by remember { mutableIntStateOf(1) }
     var showCategories by remember { mutableStateOf(false) }
     var menuFor by remember { mutableStateOf<LiveChannel?>(null) }
+    var programMenu by remember { mutableStateOf<Pair<LiveChannel, Program>?>(null) }
     var digits by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
     val target = remember { FocusRequester() }
@@ -290,7 +294,7 @@ fun GuideScreen(
                         val list = programsOf(ch)
                         val p = list.firstOrNull { it.start == f.start } ?: return true
                         if (p.start <= windowStart) {
-                            if (windowStart > firstWindow) {
+                            if (windowStart > earliest) {
                                 windowStart -= SLOT
                                 anchor = maxOf(p.start, windowStart)
                             } else {
@@ -478,7 +482,7 @@ fun GuideScreen(
                                         when (guideSelection(p.start, p.end, now, p === NO_INFO, ch.catchup)) {
                                             GuideSelection.WatchLive -> onWatch(ch)
                                             GuideSelection.Replay -> onReplay(ch, p)
-                                            GuideSelection.Later -> showToast("${p.title} starts at ${formatTime(p.start)} on ${ch.name}")
+                                            GuideSelection.Later -> programMenu = ch to p
                                             GuideSelection.Unavailable -> showToast("${p.title} is not available to replay")
                                         }
                                     },
@@ -533,6 +537,23 @@ fun GuideScreen(
                     showCategories = false
                     focusTick++
                 }
+            )
+        }
+
+        programMenu?.let { (ch, program) ->
+            ProgrammeMenu(
+                channel = ch,
+                program = program,
+                onRemind = {
+                    onRemind(ch, program)
+                    programMenu = null
+                },
+                onRecord = {
+                    onRecord(ch, program)
+                    programMenu = null
+                },
+                onClose = { programMenu = null },
+                modifier = Modifier.align(Alignment.Center)
             )
         }
 
@@ -804,6 +825,35 @@ private fun ChannelMenu(
                 icon = if (favorite) TvIcons.StarFilled else TvIcons.Star,
                 modifier = Modifier.fillMaxWidth()
             )
+        }
+    }
+}
+
+@Composable
+private fun ProgrammeMenu(
+    channel: LiveChannel,
+    program: Program,
+    onRemind: () -> Unit,
+    onRecord: () -> Unit,
+    onClose: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val first = remember { FocusRequester() }
+    LaunchedEffect(Unit) {
+        withFrameNanos { }
+        runCatching { first.requestFocus() }
+    }
+    BackHandler { onClose() }
+    Box(Modifier.fillMaxSize().background(Color(0x99000000)), contentAlignment = Alignment.Center) {
+        Column(
+            modifier.trapFocus().width(340.dp).clip(RoundedCornerShape(16.dp)).background(Tv.Surface2).padding(18.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Text(program.title, style = TvType.Section, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            Text("${channel.name} · ${formatTime(program.start)}", style = TvType.Caption, color = Tv.Ink3)
+            PillButton("Remind me", onRemind, modifier = Modifier.fillMaxWidth().focusRequester(first))
+            PillButton("Record", onRecord, modifier = Modifier.fillMaxWidth())
+            PillButton("Close", onClose, modifier = Modifier.fillMaxWidth())
         }
     }
 }

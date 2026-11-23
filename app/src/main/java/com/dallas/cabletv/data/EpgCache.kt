@@ -19,7 +19,10 @@ import java.util.concurrent.TimeUnit
 object EpgCache {
 
     private const val DAY_MS = 24 * 3_600_000L
-    private const val AHEAD_MS = 12 * 3_600_000L
+    /** Two days ahead, so tomorrow evening is on the guide. */
+    const val AHEAD_MS = 48 * 3_600_000L
+    /** Two days behind, so catch-up has listings to play. */
+    const val BEHIND_MS = 48 * 3_600_000L
 
     private val lock = Any()
     private var programs: Map<String, List<Program>> = emptyMap()
@@ -33,6 +36,28 @@ object EpgCache {
     fun refresh(server: String, user: String, pass: String) {
         val base = normalizeXtreamServerUrl(server)
         refreshUrl("$base/xmltv.php?username=${enc(user)}&password=${enc(pass)}")
+    }
+
+    /** Downloads every guide and keeps them together. One feed failing leaves the others in place. */
+    fun refreshAll(urls: List<String>) {
+        val merged = LinkedHashMap<String, MutableList<Program>>()
+        for (url in urls.distinct()) {
+            runCatching {
+                val req = Request.Builder().url(url).header("User-Agent", PLAYER_USER_AGENT).build()
+                http.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) error("XMLTV returned HTTP ${resp.code}")
+                    val body = resp.body ?: error("Empty XMLTV response")
+                    parse(body.byteStream()).forEach { (id, list) ->
+                        merged.getOrPut(id) { mutableListOf() }.addAll(list)
+                    }
+                }
+            }
+        }
+        if (merged.isNotEmpty()) {
+            synchronized(lock) {
+                programs = merged.mapValues { (_, list) -> list.sortedBy { it.start } }
+            }
+        }
     }
 
     /** Downloads any XMLTV feed by URL and replaces the cache. Runs on a background thread. */
@@ -92,7 +117,7 @@ object EpgCache {
     /** Reads XMLTV with a streaming parser, keeping only the window around now. */
     internal fun parse(input: InputStream): Map<String, List<Program>> {
         val now = System.currentTimeMillis()
-        val from = now - DAY_MS
+        val from = now - BEHIND_MS
         val to = now + AHEAD_MS
         val stamp = SimpleDateFormat("yyyyMMddHHmmss Z", Locale.US)
         val out = HashMap<String, MutableList<Program>>()

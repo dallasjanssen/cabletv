@@ -357,6 +357,9 @@ private fun normalizeAuth(value: Any?): Boolean? = when (value) {
     else -> null
 }
 
+/** Unix milliseconds for a panel exp_date, or null when the panel did not send one. */
+fun expirationEpochMillis(expDate: Any?): Long? = parseExpiration(expDate)?.times(1000)
+
 private fun parseExpiration(value: Any?): Long? {
     val parsed = when (value) {
         is Number -> value.toLong()

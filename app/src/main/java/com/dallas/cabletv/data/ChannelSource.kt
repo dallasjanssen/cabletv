@@ -12,25 +12,40 @@ object ChannelSource {
     /** Every channel the source provides. Hiding is applied in the app, so ticking a box never re-downloads. */
     fun load(s: Settings): List<LiveChannel> = fetchAll(s)
 
-    private fun fetchAll(s: Settings): List<LiveChannel> =
-        if (s.hasXtream) {
-            XtreamClient(s.xtreamServer, s.xtreamUser, s.xtreamPass).liveChannels()
-        } else {
-            M3uParser.parse(fetchText(s.m3uUrl))
+    private fun fetchAll(s: Settings): List<LiveChannel> {
+        val all = mutableListOf<LiveChannel>()
+        if (s.hasXtream) all += XtreamClient(s.xtreamServer, s.xtreamUser, s.xtreamPass).liveChannels()
+        if (s.m3uUrl.isNotBlank()) {
+            all += M3uParser.parse(fetchText(s.m3uUrl)).map { it.copy(origin = "playlist") }
         }
+        if (s.hasStalker) all += StalkerClient(s.stalkerUrl, s.stalkerMac).channels()
+        return all.distinctBy { it.origin + ":" + it.id }
+    }
 
     /**
      * The XMLTV guide link named in an M3U playlist's first line (url-tvg), or null.
      * Only the first line is read, so this stays cheap even for large playlists.
      */
-    fun guideUrl(s: Settings): String? {
-        if (s.hasXtream || s.m3uUrl.isBlank()) return null
-        return runCatching {
-            val req = Request.Builder().url(s.m3uUrl).header("User-Agent", PLAYER_USER_AGENT).build()
-            playlistHttp.newCall(req).execute().use { resp ->
-                resp.body?.source()?.readUtf8Line()?.let { M3uParser.guideUrlFrom(it) }
-            }
-        }.getOrNull()
+    fun guideUrl(s: Settings): String? = guideUrls(s).firstOrNull()
+
+    /** Every XMLTV address the saved logins provide. Xtream and a playlist can both contribute. */
+    fun guideUrls(s: Settings): List<String> {
+        val urls = mutableListOf<String>()
+        if (s.hasXtream) {
+            val base = normalizeXtreamServerUrl(s.xtreamServer)
+            val user = java.net.URLEncoder.encode(s.xtreamUser, "UTF-8").replace("+", "%20")
+            val pass = java.net.URLEncoder.encode(s.xtreamPass, "UTF-8").replace("+", "%20")
+            urls += "$base/xmltv.php?username=$user&password=$pass"
+        }
+        if (s.m3uUrl.isNotBlank()) {
+            runCatching {
+                val req = Request.Builder().url(s.m3uUrl).header("User-Agent", PLAYER_USER_AGENT).build()
+                playlistHttp.newCall(req).execute().use { resp ->
+                    resp.body?.source()?.readUtf8Line()?.let { M3uParser.guideUrlFrom(it) }
+                }
+            }.getOrNull()?.let { urls += it }
+        }
+        return urls.distinct()
     }
 }
 
@@ -132,7 +147,14 @@ object M3uParser {
                         logo = attrs.nz("tvg-logo"),
                         group = attrs.nz("group-title") ?: "Other",
                         streamUrl = line,
-                        epgId = attrs.nz("tvg-id")
+                        epgId = attrs.nz("tvg-id"),
+                        catchup = catchupOf(attrs),
+                        archiveDays = attrs["catchup-days"]?.toIntOrNull()
+                            ?: attrs["timeshift"]?.toIntOrNull()
+                            ?: 0,
+                        catchupType = attrs.nz("catchup"),
+                        catchupSource = attrs.nz("catchup-source"),
+                        origin = "playlist"
                     )
                     attrs = emptyMap()
                     title = ""
@@ -144,4 +166,12 @@ object M3uParser {
 
     private fun Map<String, String>.nz(key: String): String? =
         this[key]?.takeIf { it.isNotBlank() }
+
+    private fun catchupOf(attrs: Map<String, String>): Boolean {
+        val type = attrs["catchup"]?.trim()?.lowercase().orEmpty()
+        if (type.isNotEmpty() && type != "0" && type != "none") return true
+        if (!attrs["catchup-source"].isNullOrBlank()) return true
+        val days = attrs["catchup-days"]?.toIntOrNull() ?: attrs["timeshift"]?.toIntOrNull() ?: 0
+        return days > 0
+    }
 }

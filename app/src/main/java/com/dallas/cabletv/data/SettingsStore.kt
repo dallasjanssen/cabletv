@@ -29,8 +29,27 @@ class SettingsStore(context: Context) {
         jellyfinToken = prefs.getString(K_JT, "").orEmpty(),
         jellyfinUserId = prefs.getString(K_JU, "").orEmpty(),
         hiddenFilters = prefs.getString(K_HIDDEN, "").orEmpty(),
-        stripPrefixes = prefs.getBoolean(K_STRIP, false)
+        stripPrefixes = prefs.getBoolean(K_STRIP, false),
+        lockedFilters = prefs.getString(K_LOCKED, "").orEmpty(),
+        stalkerUrl = prefs.getString(K_STALKER_URL, "").orEmpty(),
+        stalkerMac = prefs.getString(K_STALKER_MAC, "").orEmpty(),
+        subscriptionExpiryMs = prefs.getLong(K_EXPIRY, 0L)
     )
+
+    /** A Jellyfin token that belongs to one profile. Null when that profile uses the household login. */
+    fun profileJellyfin(profileId: String): Pair<String, String>? {
+        val token = prefs.getString(jfTokenKey(profileId), null)?.takeIf { it.isNotBlank() } ?: return null
+        val userId = prefs.getString(jfUserKey(profileId), null)?.takeIf { it.isNotBlank() } ?: return null
+        return token to userId
+    }
+
+    fun saveProfileJellyfin(profileId: String, token: String, userId: String) {
+        prefs.edit().putString(jfTokenKey(profileId), token).putString(jfUserKey(profileId), userId).apply()
+    }
+
+    fun clearProfileJellyfin(profileId: String) {
+        prefs.edit().remove(jfTokenKey(profileId)).remove(jfUserKey(profileId)).apply()
+    }
 
     fun save(s: Settings) {
         prefs.edit()
@@ -43,6 +62,10 @@ class SettingsStore(context: Context) {
             .putString(K_JU, s.jellyfinUserId)
             .putString(K_HIDDEN, s.hiddenFilters)
             .putBoolean(K_STRIP, s.stripPrefixes)
+            .putString(K_LOCKED, s.lockedFilters)
+            .putString(K_STALKER_URL, s.stalkerUrl)
+            .putString(K_STALKER_MAC, s.stalkerMac)
+            .putLong(K_EXPIRY, s.subscriptionExpiryMs)
             .apply()
     }
 
@@ -89,6 +112,13 @@ class SettingsStore(context: Context) {
         const val K_JU = "jellyfin_user_id"
         const val K_HIDDEN = "hidden_filters"
         const val K_STRIP = "strip_prefixes"
+        const val K_LOCKED = "locked_filters"
+        const val K_STALKER_URL = "stalker_url"
+        const val K_STALKER_MAC = "stalker_mac"
+        const val K_EXPIRY = "subscription_expiry"
         const val K_PIN = "parental_pin"
+
+        private fun jfTokenKey(profileId: String) = "jf_token_$profileId"
+        private fun jfUserKey(profileId: String) = "jf_user_$profileId"
     }
 }

@@ -151,8 +151,12 @@ class PhoneSignInServer(private val pin: String, private val onReceive: (Map<Str
           <label>Server URL<input name="xs" autocapitalize="off" autocorrect="off"></label>
           <label>Username<input name="xu" autocapitalize="off" autocorrect="off"></label>
           <label>Password<input name="xp" type="password"></label>
-          <h2>Live TV playlist (M3U, only if no Xtream login)</h2>
+          <h2>Live TV playlist (M3U, optional)</h2>
+          <p>Kept as well as an Xtream login. Use it when you have a separate playlist.</p>
           <label>Playlist URL<input name="m3u" autocapitalize="off" autocorrect="off"></label>
+          <h2>Stalker / Ministra portal (optional)</h2>
+          <label>Portal URL<input name="su" autocapitalize="off" autocorrect="off"></label>
+          <label>MAC address<input name="sm" autocapitalize="off" autocorrect="off" placeholder="00:1A:79:00:00:00"></label>
           <h2>On demand (Jellyfin, optional)</h2>
           <label>Server URL<input name="js" autocapitalize="off" autocorrect="off"></label>
           <label>Username<input name="ju" autocapitalize="off" autocorrect="off"></label>
