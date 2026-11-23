@@ -508,7 +508,12 @@ private fun DetailScreen(
                         PillButton("Start over", { onPlay(item, true) }, icon = TvIcons.Replay)
                     }
                     !isSeries -> PillButton("Play", { onPlay(item, true) }, icon = TvIcons.Play, modifier = Modifier.focusRequester(primary))
-                    episodes == null -> PillButton("Loading episodes", {}, modifier = Modifier.focusRequester(primary))
+                    episodes == null -> PillButton(
+                        "Loading episodes",
+                        {},
+                        enabled = false,
+                        modifier = Modifier.focusRequester(primary)
+                    )
                     startEpisode != null -> {
                         val label = episodeLabel(startEpisode)?.let { " $it" }.orEmpty()
                         PillButton(
@@ -518,7 +523,12 @@ private fun DetailScreen(
                             modifier = Modifier.focusRequester(primary)
                         )
                     }
-                    else -> PillButton("No episodes found", {}, modifier = Modifier.focusRequester(primary))
+                    else -> PillButton(
+                        "No episodes found",
+                        {},
+                        enabled = false,
+                        modifier = Modifier.focusRequester(primary)
+                    )
                 }
             }
         }

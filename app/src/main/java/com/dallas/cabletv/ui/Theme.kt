@@ -432,8 +432,8 @@ fun SidePanel(title: String, modifier: Modifier = Modifier, content: @Composable
 @Composable
 fun SectionLabel(text: String, modifier: Modifier = Modifier) {
     Text(
-        text.uppercase(),
-        style = TvType.CaptionStrong.copy(letterSpacing = 0.8.sp),
+        text,
+        style = TvType.CaptionStrong,
         color = Tv.Ink3,
         modifier = modifier
     )

@@ -276,9 +276,14 @@ class PhoneSignInServer(
     private fun page(message: String): String = """
         <!doctype html><html><head><meta charset="utf-8">
         <meta name="viewport" content="width=device-width,initial-scale=1">
-        <title>CableTV sign-in</title></head>
-        <body style="font-family:sans-serif;padding:24px;background:#05070f;color:#e8f4ff">
-        <p style="font-size:20px">$message</p></body></html>
+        <title>Cable TV sign-in</title>
+        <style>
+          body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0;padding:24px;background:#0d0f13;color:#f3f4f6}
+          main{max-width:680px;margin:0 auto;padding:20px;border-radius:12px;border:1px solid #2b3039;background:#171a20}
+          h1{margin:0 0 10px;font-size:20px;line-height:1.2}
+          p{margin:0;color:#b3b9c4;font-size:16px;line-height:1.45}
+        </style></head>
+        <body><main><h1>Cable TV sign-in</h1><p>$message</p></main></body></html>
     """.trimIndent()
 
     private fun formPage(pin: String, values: Map<String, String>, backupEnabled: Boolean): String {
@@ -320,22 +325,25 @@ class PhoneSignInServer(
         return """
         <!doctype html><html><head><meta charset="utf-8">
         <meta name="viewport" content="width=device-width,initial-scale=1">
-        <title>CableTV sign-in</title>
+        <title>Cable TV sign-in</title>
         <style>
-          body{font-family:sans-serif;margin:0;padding:16px;background:#05070f;color:#e8f4ff}
-          h1{font-size:22px;color:#3dff8c;margin:8px 0}
-          h2{font-size:16px;color:#ffb347;margin:24px 0 0}
-          p{color:#b8c8e6;font-size:15px}
-          label{display:block;margin-top:12px;font-size:15px;color:#b8c8e6}
-          input,textarea{width:100%;box-sizing:border-box;padding:12px;font-size:18px;border-radius:6px;
-                border:1px solid #1a2a4a;background:#0c1a36;color:#e8f4ff;margin-top:4px}
-          input[type=checkbox]{width:auto;transform:scale(1.25);margin-right:8px}
-          button{margin-top:24px;width:100%;padding:14px;font-size:18px;border:0;border-radius:6px;
-                 background:#3dff8c;color:#05070f;font-weight:bold}
-          a{color:#8ed4ff}
+          body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0;padding:16px;background:#0d0f13;color:#f3f4f6}
+          main{max-width:760px;margin:0 auto;padding:18px;border-radius:12px;border:1px solid #2b3039;background:#171a20}
+          h1{font-size:24px;line-height:1.2;margin:0 0 8px}
+          h2{font-size:16px;color:#f6a723;margin:22px 0 0}
+          p{color:#b3b9c4;font-size:15px;line-height:1.45;margin:8px 0 0}
+          label{display:block;margin-top:12px;font-size:14px;color:#b3b9c4}
+          input,textarea{width:100%;box-sizing:border-box;padding:12px;font-size:17px;border-radius:10px;
+                border:1px solid #2b3039;background:#20242c;color:#f3f4f6;margin-top:4px}
+          input:focus,textarea:focus{outline:none;border-color:#f6a723;box-shadow:0 0 0 2px rgba(246,167,35,.20)}
+          input[type=checkbox]{width:auto;transform:scale(1.15);margin-right:8px;accent-color:#f6a723}
+          button{margin-top:24px;width:100%;padding:14px;font-size:17px;border:0;border-radius:999px;
+                 background:#f6a723;color:#0d0f13;font-weight:700}
+          a{color:#f6c76a}
         </style></head>
         <body>
-        <h1>CableTV setup</h1>
+        <main>
+        <h1>Cable TV setup</h1>
         <p>Change live TV, library, and customization settings from your phone.</p>
         <form method="post" action="/">
           <input type="hidden" name="pin" value="$pin">
@@ -364,6 +372,7 @@ class PhoneSignInServer(
           <button type="submit">Send to TV</button>
         </form>
         $backupSection
+        </main>
         $script
         </body></html>
     """.trimIndent()
