@@ -35,8 +35,10 @@ import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import com.dallas.cabletv.data.GuideSelection
 import com.dallas.cabletv.data.LiveChannel
 import com.dallas.cabletv.data.Program
+import com.dallas.cabletv.data.guideSelection
 import kotlinx.coroutines.delay
 
 private const val SLOT = 30 * 60_000L
@@ -81,6 +83,7 @@ fun GuideScreen(
     group: String,
     onGroupChange: (String) -> Unit,
     onWatch: (LiveChannel) -> Unit,
+    onReplay: (LiveChannel, Program) -> Unit,
     onToggleFavorite: (LiveChannel) -> Unit,
     onPreviewBounds: (Rect?) -> Unit,
     showToast: (String) -> Unit
@@ -472,10 +475,11 @@ fun GuideScreen(
                                     },
                                     onProgram = { p ->
                                         focus = GuideFocus(i, p.start)
-                                        when {
-                                            isOnNow(p, now) -> onWatch(ch)
-                                            p.start > now -> showToast("${p.title} starts at ${formatTime(p.start)} on ${ch.name}")
-                                            else -> onWatch(ch)
+                                        when (guideSelection(p.start, p.end, now, p === NO_INFO, ch.catchup)) {
+                                            GuideSelection.WatchLive -> onWatch(ch)
+                                            GuideSelection.Replay -> onReplay(ch, p)
+                                            GuideSelection.Later -> showToast("${p.title} starts at ${formatTime(p.start)} on ${ch.name}")
+                                            GuideSelection.Unavailable -> showToast("${p.title} is not available to replay")
                                         }
                                     },
                                     onFocused = { start ->

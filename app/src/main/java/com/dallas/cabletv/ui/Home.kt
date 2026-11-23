@@ -41,6 +41,8 @@ fun HomeScreen(
     shelves: VodShelves,
     hasLive: Boolean,
     loadingChannels: Boolean,
+    channelError: String?,
+    onRetry: () -> Unit,
     onWatch: () -> Unit,
     onGuide: () -> Unit,
     onTune: (LiveChannel) -> Unit,
@@ -132,12 +134,29 @@ fun HomeScreen(
                                 Text("Live TV", style = TvType.Hero)
                                 Spacer(Modifier.height(6.dp))
                                 Text(
-                                    if (loadingChannels) "Finding your channels. This takes a few seconds the first time." else "Your channels did not load. Check your login in Settings.",
+                                    when {
+                                        loadingChannels -> "Finding your channels. This takes a few seconds the first time."
+                                        channelError != null -> "Your channels did not load. $channelError"
+                                        else -> "No channels came back from your provider."
+                                    },
                                     style = TvType.Body,
                                     color = Tv.Ink2
                                 )
                                 Spacer(Modifier.height(14.dp))
-                                PillButton("Guide", onGuide, icon = TvIcons.Guide, modifier = Modifier.focusRequester(firstButton))
+                                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                    if (!loadingChannels && channelError != null) {
+                                        PillButton("Try again", onRetry, icon = TvIcons.Replay, modifier = Modifier.focusRequester(firstButton))
+                                        PillButton("Settings", onSetUp, icon = TvIcons.Tv)
+                                    } else if (!loadingChannels) {
+                                        PillButton("Set up live TV", onSetUp, icon = TvIcons.Tv, modifier = Modifier.focusRequester(firstButton))
+                                    }
+                                    PillButton(
+                                        "Guide",
+                                        onGuide,
+                                        icon = TvIcons.Guide,
+                                        modifier = if (loadingChannels) Modifier.focusRequester(firstButton) else Modifier
+                                    )
+                                }
                             }
                             else -> {
                                 Text("Add live TV", style = TvType.Hero)
@@ -170,7 +189,7 @@ fun HomeScreen(
                 if (favoriteChannels.isNotEmpty()) {
                     shelf("fav", "Favorite channels") {
                         items(favoriteChannels, key = { it.id }) { ch ->
-                            ChannelCard(ch, guide.nowNext(ch)?.now, favorite = false, onClick = { onTune(ch) })
+                            ChannelCard(ch, guide.nowNext(ch)?.now, favorite = ch.id in favorites, onClick = { onTune(ch) })
                         }
                     }
                 }

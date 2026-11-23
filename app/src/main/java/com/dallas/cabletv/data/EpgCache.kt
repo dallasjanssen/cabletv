@@ -71,6 +71,12 @@ object EpgCache {
     /** True once a feed has been loaded, so screens can tell "no data yet" from "no data for this channel". */
     fun hasData(): Boolean = synchronized(lock) { programs.isNotEmpty() }
 
+    /** Shows on now or later whose titles contain [query]. Soonest first. */
+    fun programmesMatching(query: String, nowMs: Long = System.currentTimeMillis(), limit: Int = 30): List<Pair<String, Program>> {
+        val schedule = synchronized(lock) { programs }
+        return matchProgrammes(schedule, query, nowMs, limit)
+    }
+
     /**
      * Programmes that already aired on a channel inside [withinMs], newest first.
      * The feed itself only keeps one day, so a longer archive still shows that day.

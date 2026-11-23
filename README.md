@@ -6,13 +6,13 @@ A personal, sideloaded Android and Android TV app that pulls together:
 - **Program guide** from the provider's XMLTV feed, or the guide link in an M3U playlist
 - **On Demand** from your Jellyfin server
 
-It opens straight into live TV on the last channel you watched. Menus sit on top of the picture, so the channel keeps playing behind Home and in a corner of the guide, and Back always returns to it.
+It opens straight into live TV on the last channel you watched. Menus sit on top of the picture, so the channel keeps playing behind Home and in a corner of the guide. Back from live TV opens Home, and Back again leaves the app. Keep watching on Home returns to the picture.
 
 The screens are laid out for Android TV's 960 by 540 grid, with one typeface (Figtree), a dark low-glare background, and one focus style: whatever is selected turns white. Everything works with only the arrows, OK and Back. Channel and number keys are shortcuts for remotes that have them.
 
 ## Screens
 
-- **Live TV**: up and down change channel. OK opens a bar with Guide, Channel list, Favorite, Watch from the start (channels with catch-up) and Audio and captions. Left opens the channel list, and Left again opens its categories. The guide and the channel list share the category you pick.
+- **Live TV**: up and down change channel. OK opens a bar with Guide, Home, Search, Channel list, Favorite, Watch from the start (channels with catch-up) and Audio and captions. Left opens the channel list, and Left again opens its categories. The guide and the channel list share the category you pick. A replay can be paused and skipped; Back returns from the replay to the live channel. OK on a guide listing that has already started plays it from the beginning when the channel has catch-up.
 - **Home**: what is on now, with Keep watching and Guide buttons, then rows for favorite and recent channels, half-watched titles, and new movies and shows.
 - **Guide**: a time grid with a line for now, details of the highlighted show, and a preview of the channel playing. Left from a channel name picks a category. OK on a channel name adds it to favorites.
 - **Movies & Shows**: rows from Jellyfin and the provider. A title opens a details page with Resume, Start over, seasons and episodes. The player has its own controls and a panel for audio, captions and picture size.
@@ -25,10 +25,14 @@ The screens are laid out for Android TV's 960 by 540 grid, with one typeface (Fi
 | Action | Remote |
 | --- | --- |
 | Change channel | Up / down, or CH+ / CH- |
+| Previous channel | Last |
 | Everything you can do while watching | OK |
 | Channel list | Left |
 | Jump to a channel | Type the number (up to 4 digits), in live TV or the guide |
-| Back to what you were watching | Back |
+| Home, while watching | Back |
+| Leave the app | Back again, from Home |
+| Skip in a replay | Left 10 seconds, right 30 seconds |
+| Pause a replay | Play / pause. OK opens the options, which include Pause |
 | Skip 10 seconds in a movie | Left / right |
 | Pause a movie | OK, or play / pause |
 
