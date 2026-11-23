@@ -5,7 +5,9 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.LocalBringIntoViewSpec
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyListScope
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
@@ -24,13 +26,20 @@ import com.dallas.cabletv.data.Program
 import com.dallas.cabletv.data.VodItem
 
 /** A titled horizontal row of cards, as used on Home, Movies and Shows, and Search. */
-@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun Shelf(title: String, side: Dp, modifier: Modifier = Modifier, content: LazyListScope.() -> Unit) {
+    Shelf(title, side, rememberLazyListState(), modifier, content)
+}
+
+/** A shelf whose scroll position is kept by the caller, so it survives leaving the screen. */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+fun Shelf(title: String, side: Dp, state: LazyListState, modifier: Modifier = Modifier, content: LazyListScope.() -> Unit) {
     Column(modifier.fillMaxWidth().padding(bottom = 14.dp)) {
         Text(title, style = TvType.Section, modifier = Modifier.padding(horizontal = side))
         CompositionLocalProvider(LocalBringIntoViewSpec provides rememberEdgeSpec(side)) {
             LazyRow(
+                state = state,
                 contentPadding = PaddingValues(horizontal = side, vertical = 10.dp),
                 horizontalArrangement = Arrangement.spacedBy(14.dp)
             ) { content() }

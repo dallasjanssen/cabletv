@@ -29,7 +29,6 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.shadow
@@ -152,7 +151,9 @@ enum class FocusLook { Fill, Ring }
 
 /**
  * The one focusable building block. Every button, row, card and guide cell uses it, so focus looks
- * the same everywhere and works with a remote, a keyboard and touch.
+ * the same everywhere and works with a remote, a keyboard and touch. When [enabled] is false it
+ * looks dimmed and ignores OK and taps, but it keeps focus, so a button that turns itself off
+ * while busy does not drop the highlight somewhere else.
  */
 @Composable
 fun Focusable(
@@ -174,7 +175,11 @@ fun Focusable(
     val ring = look == FocusLook.Ring && focused
     Box(
         modifier
-            .graphicsLayer { scaleX = scale; scaleY = scale }
+            .graphicsLayer {
+                scaleX = scale
+                scaleY = scale
+                alpha = if (enabled) 1f else 0.45f
+            }
             .then(if (ring) Modifier.shadow(14.dp, shape) else Modifier)
             .onFocusChanged {
                 if (focused != it.isFocused) {
@@ -186,10 +191,9 @@ fun Focusable(
             .background(bg)
             .then(if (look == FocusLook.Ring) Modifier.border(2.dp, if (ring) Tv.Focus else Color.Transparent, shape) else Modifier)
             .clickable(
-                enabled = enabled,
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
-                onClick = onClick
+                onClick = { if (enabled) onClick() }
             ),
         contentAlignment = contentAlignment
     ) {
@@ -213,7 +217,7 @@ fun PillButton(
 ) {
     Focusable(
         onClick = onClick,
-        modifier = modifier.height(36.dp).alpha(if (enabled) 1f else 0.45f),
+        modifier = modifier.height(36.dp),
         shape = CircleShape,
         color = Tv.Glass,
         focusScale = 1.05f,
