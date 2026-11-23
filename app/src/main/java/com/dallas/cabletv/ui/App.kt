@@ -34,6 +34,7 @@ import com.dallas.cabletv.data.AppUpdater
 import com.dallas.cabletv.data.ChannelSource
 import com.dallas.cabletv.data.CrashLog
 import com.dallas.cabletv.data.EpgCache
+import com.dallas.cabletv.data.epgAddresses
 import com.dallas.cabletv.data.JellyfinClient
 import com.dallas.cabletv.data.LiveChannel
 import com.dallas.cabletv.data.Profile
@@ -162,13 +163,20 @@ fun CableApp(store: SettingsStore) {
     }
 
     // The full schedule is downloaded now and then hourly: from the provider login, or the playlist's guide link.
-    LaunchedEffect(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass, settings.m3uUrl, settings.stalkerUrl) {
+    LaunchedEffect(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass, settings.m3uUrl, settings.epgUrl, settings.stalkerUrl) {
         val s = settings
+        var announcedGuideFailure = false
         while (s.hasLiveSource) {
             withContext(Dispatchers.IO) {
                 runCatching {
                     val urls = ChannelSource.guideUrls(s)
-                    if (urls.isNotEmpty()) EpgCache.refreshAll(urls)
+                    if (urls.isNotEmpty()) EpgCache.refreshAll(urls) else emptyList()
+                }
+            }.onSuccess { failed ->
+                val typed = epgAddresses(s.epgUrl)
+                if (!announcedGuideFailure && typed.isNotEmpty() && failed.any { it in typed }) {
+                    announcedGuideFailure = true
+                    showToast("The guide link did not load. Check Guide URL in Settings, Live TV.")
                 }
             }
             guide.scheduleUpdated()
@@ -545,12 +553,12 @@ fun CableApp(store: SettingsStore) {
         scope.launch {
             var s = settings
             val problems = mutableListOf<String>()
-            val wantsLive = listOf("xs", "xu", "xp", "m3u", "su", "sm").any { !fields[it].isNullOrBlank() }
+            val wantsLive = listOf("xs", "xu", "xp", "m3u", "su", "sm", "epg").any { !fields[it].isNullOrBlank() }
             if (wantsLive) {
                 runCatching {
                     checkLiveLogin(
                         s, fields["xs"].orEmpty(), fields["xu"].orEmpty(), fields["xp"].orEmpty(), fields["m3u"].orEmpty(),
-                        fields["su"].orEmpty(), fields["sm"].orEmpty()
+                        fields["su"].orEmpty(), fields["sm"].orEmpty(), fields["epg"].orEmpty()
                     )
                 }
                     .onSuccess { s = it }

@@ -45,9 +45,17 @@ object ChannelSource {
                 }
             }.getOrNull()?.let { urls += it }
         }
+        urls += epgAddresses(s.epgUrl)
         return urls.distinct()
     }
 }
+
+/** Guide addresses typed by hand. Commas and spaces can separate more than one. */
+fun epgAddresses(raw: String): List<String> =
+    raw.split(',', '\n', '\r', ' ', '\t')
+        .map { it.trim() }
+        .filter { it.startsWith("http://", ignoreCase = true) || it.startsWith("https://", ignoreCase = true) }
+        .distinct()
 
 /**
  * A channel is hidden when its category matches a term exactly, or when its name

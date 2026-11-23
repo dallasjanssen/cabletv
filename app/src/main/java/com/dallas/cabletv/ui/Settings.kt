@@ -36,6 +36,7 @@ import androidx.compose.ui.unit.dp
 import com.dallas.cabletv.BuildConfig
 import com.dallas.cabletv.data.AppUpdater
 import com.dallas.cabletv.data.JellyfinClient
+import com.dallas.cabletv.data.epgAddresses
 import com.dallas.cabletv.data.LiveChannel
 import com.dallas.cabletv.data.Profile
 import com.dallas.cabletv.data.ProfileStore
@@ -69,12 +70,17 @@ suspend fun checkLiveLogin(
     pass: String,
     m3u: String,
     stalkerUrl: String = "",
-    stalkerMac: String = ""
+    stalkerMac: String = "",
+    epgUrl: String = ""
 ): Settings =
     withContext(Dispatchers.IO) {
         val playlist = m3u.trim()
         val portal = stalkerUrl.trim()
         val mac = stalkerMac.trim()
+        val guides = epgAddresses(epgUrl)
+        if (epgUrl.isNotBlank()) {
+            require(guides.isNotEmpty()) { "The guide link needs to start with http:// or https://" }
+        }
         // A pasted playlist link in the server field fills in a blank username and password.
         val (xs, xu, xp) = if (server.isNotBlank() || user.isNotBlank() || pass.isNotBlank()) {
             xtreamLoginFields(server, user, pass)
@@ -95,6 +101,7 @@ suspend fun checkLiveLogin(
             StalkerClient(portal, mac).connect()
         }
         if (!hasPortal && playlist.isEmpty() && !hasStalker) {
+            require(guides.isEmpty()) { "The guide link is ready, but the channels still need a provider login or a playlist" }
             require(false) { "Enter a provider login, a playlist link, or a portal" }
         }
         current.copy(
@@ -102,6 +109,7 @@ suspend fun checkLiveLogin(
             xtreamUser = xu,
             xtreamPass = xp,
             m3uUrl = playlist,
+            epgUrl = guides.joinToString(","),
             stalkerUrl = portal,
             stalkerMac = mac,
             subscriptionExpiryMs = expiry
@@ -123,6 +131,7 @@ private class Drafts(s: Settings) {
     var xu by mutableStateOf(s.xtreamUser)
     var xp by mutableStateOf(s.xtreamPass)
     var m3u by mutableStateOf(s.m3uUrl)
+    var epg by mutableStateOf(s.epgUrl)
     var su by mutableStateOf(s.stalkerUrl)
     var sm by mutableStateOf(s.stalkerMac)
     var js by mutableStateOf(s.jellyfinServer)
@@ -178,11 +187,13 @@ fun SettingsScreen(
         liveBusy = true
         liveMessage = "Checking your login"
         scope.launch {
-            runCatching { checkLiveLogin(latest, drafts.xs, drafts.xu, drafts.xp, drafts.m3u, drafts.su, drafts.sm) }
+            runCatching { checkLiveLogin(latest, drafts.xs, drafts.xu, drafts.xp, drafts.m3u, drafts.su, drafts.sm, drafts.epg) }
                 .onSuccess {
                     drafts.xs = it.xtreamServer
                     drafts.xu = it.xtreamUser
                     drafts.xp = it.xtreamPass
+                    drafts.m3u = it.m3uUrl
+                    drafts.epg = it.epgUrl
                     drafts.su = it.stalkerUrl
                     drafts.sm = it.stalkerMac
                     onSave(it)
@@ -222,12 +233,13 @@ fun SettingsScreen(
         fields["xu"]?.takeIf { it.isNotBlank() }?.let { drafts.xu = it.trim() }
         fields["xp"]?.takeIf { it.isNotEmpty() }?.let { drafts.xp = it }
         fields["m3u"]?.takeIf { it.isNotBlank() }?.let { drafts.m3u = it.trim() }
+        fields["epg"]?.takeIf { it.isNotBlank() }?.let { drafts.epg = it.trim() }
         fields["su"]?.takeIf { it.isNotBlank() }?.let { drafts.su = it.trim() }
         fields["sm"]?.takeIf { it.isNotBlank() }?.let { drafts.sm = it.trim() }
         fields["js"]?.takeIf { it.isNotBlank() }?.let { drafts.js = it.trim() }
         fields["ju"]?.takeIf { it.isNotBlank() }?.let { drafts.ju = it.trim() }
         fields["jp"]?.takeIf { it.isNotEmpty() }?.let { drafts.jp = it }
-        val live = listOf("xs", "xu", "xp", "m3u", "su", "sm").any { !fields[it].isNullOrBlank() }
+        val live = listOf("xs", "xu", "xp", "m3u", "su", "sm", "epg").any { !fields[it].isNullOrBlank() }
         val library = !fields["js"].isNullOrBlank() && !fields["ju"].isNullOrBlank()
         val results = mutableListOf<String>()
         phoneMessage = "Details received. Checking them now."
@@ -255,8 +267,8 @@ fun SettingsScreen(
             when (pane) {
                 SettingsPane.Phone -> PhonePane(phoneMessage, onReceived = { fromPhone(it) })
                 SettingsPane.Live -> LivePane(settings, channelCount, drafts, liveBusy, liveMessage, onSave = { saveLive() }, onSignOut = {
-                    onSave(settings.copy(xtreamServer = "", xtreamUser = "", xtreamPass = "", m3uUrl = "", stalkerUrl = "", stalkerMac = "", subscriptionExpiryMs = 0L))
-                    drafts.xs = ""; drafts.xu = ""; drafts.xp = ""; drafts.m3u = ""; drafts.su = ""; drafts.sm = ""
+                    onSave(settings.copy(xtreamServer = "", xtreamUser = "", xtreamPass = "", m3uUrl = "", epgUrl = "", stalkerUrl = "", stalkerMac = "", subscriptionExpiryMs = 0L))
+                    drafts.xs = ""; drafts.xu = ""; drafts.xp = ""; drafts.m3u = ""; drafts.epg = ""; drafts.su = ""; drafts.sm = ""
                     liveMessage = "Signed out of live TV."
                 })
                 SettingsPane.Library -> LibraryPane(settings, drafts, libraryBusy, libraryMessage, onSave = { saveLibrary() }, onSignOut = {
@@ -384,7 +396,7 @@ private fun LivePane(
     onSave: () -> Unit,
     onSignOut: () -> Unit
 ) {
-    PaneTitle("Live TV", "Your TV provider login. Channels and the guide come from here. A full playlist link pasted into Server fills in the username and password.")
+    PaneTitle("Live TV", "Your TV provider login. Channels come from here. If your provider gave you a separate guide link, paste it in Guide URL. A full playlist link pasted into Server fills in the username and password.")
     if (settings.hasLiveSource) {
         StatusChip(if (channelCount > 0) "Connected · $channelCount channels" else "Connected", ok = true)
     } else {
@@ -396,6 +408,7 @@ private fun LivePane(
         SettingsField("Username", drafts.xu) { drafts.xu = it }
         SettingsField("Password", drafts.xp, secret = true) { drafts.xp = it }
         SettingsField("Playlist link", drafts.m3u, placeholder = "Optional, kept alongside a login") { drafts.m3u = it }
+        SettingsField("Guide URL", drafts.epg, placeholder = "https://example.com/epg.xml") { drafts.epg = it }
         SettingsField("Stalker portal", drafts.su, placeholder = "http://portal.example/stalker_portal") { drafts.su = it }
         SettingsField("MAC address", drafts.sm, placeholder = "00:1A:79:00:00:00") { drafts.sm = it }
     }

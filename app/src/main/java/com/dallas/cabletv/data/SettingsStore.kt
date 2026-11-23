@@ -25,6 +25,7 @@ class SettingsStore(context: Context) {
         xtreamUser = prefs.getString(K_XU, "").orEmpty(),
         xtreamPass = prefs.getString(K_XP, "").orEmpty(),
         m3uUrl = prefs.getString(K_M3U, "").orEmpty(),
+        epgUrl = prefs.getString(K_EPG, "").orEmpty(),
         jellyfinServer = prefs.getString(K_JS, "").orEmpty(),
         jellyfinToken = prefs.getString(K_JT, "").orEmpty(),
         jellyfinUserId = prefs.getString(K_JU, "").orEmpty(),
@@ -57,6 +58,7 @@ class SettingsStore(context: Context) {
             .putString(K_XU, s.xtreamUser)
             .putString(K_XP, s.xtreamPass)
             .putString(K_M3U, s.m3uUrl)
+            .putString(K_EPG, s.epgUrl)
             .putString(K_JS, s.jellyfinServer)
             .putString(K_JT, s.jellyfinToken)
             .putString(K_JU, s.jellyfinUserId)
@@ -107,6 +109,7 @@ class SettingsStore(context: Context) {
         const val K_XU = "xtream_user"
         const val K_XP = "xtream_pass"
         const val K_M3U = "m3u_url"
+        const val K_EPG = "epg_url"
         const val K_JS = "jellyfin_server"
         const val K_JT = "jellyfin_token"
         const val K_JU = "jellyfin_user_id"
