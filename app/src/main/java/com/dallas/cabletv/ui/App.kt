@@ -35,6 +35,7 @@ import com.dallas.cabletv.data.ChannelSource
 import com.dallas.cabletv.data.CrashLog
 import com.dallas.cabletv.data.EpgCache
 import com.dallas.cabletv.data.epgAddresses
+import com.dallas.cabletv.data.guideRefreshMessage
 import com.dallas.cabletv.data.JellyfinClient
 import com.dallas.cabletv.data.LiveChannel
 import com.dallas.cabletv.data.Profile
@@ -162,24 +163,52 @@ fun CableApp(store: SettingsStore) {
         channelsLoading = false
     }
 
-    // The full schedule is downloaded now and then hourly: from the provider login, or the playlist's guide link.
-    LaunchedEffect(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass, settings.m3uUrl, settings.epgUrl, settings.stalkerUrl) {
+    // The full schedule is downloaded now, again when asked, and then hourly.
+    var guideReload by remember { mutableIntStateOf(0) }
+    var guideRefreshing by remember { mutableStateOf(false) }
+    fun refreshGuide() {
+        if (!settings.hasLiveSource) {
+            showToast("Add a live TV login before refreshing the guide")
+            return
+        }
+        if (!guideRefreshing) guideReload++
+    }
+    LaunchedEffect(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass, settings.m3uUrl, settings.epgUrl, settings.stalkerUrl, guideReload) {
         val s = settings
-        var announcedGuideFailure = false
+        val manual = guideReload > 0
+        var announced = false
+        if (!s.hasLiveSource) {
+            guideRefreshing = false
+            return@LaunchedEffect
+        }
         while (s.hasLiveSource) {
-            withContext(Dispatchers.IO) {
+            guideRefreshing = true
+            val outcome = withContext(Dispatchers.IO) {
                 runCatching {
                     val urls = ChannelSource.guideUrls(s)
-                    if (urls.isNotEmpty()) EpgCache.refreshAll(urls) else emptyList()
-                }
-            }.onSuccess { failed ->
-                val typed = epgAddresses(s.epgUrl)
-                if (!announcedGuideFailure && typed.isNotEmpty() && failed.any { it in typed }) {
-                    announcedGuideFailure = true
-                    showToast("The guide link did not load. Check Guide URL in Settings, Live TV.")
+                    val failed = if (urls.isEmpty()) emptyList() else EpgCache.refreshAll(urls)
+                    urls.size to failed
                 }
             }
-            guide.scheduleUpdated()
+            guideRefreshing = false
+            outcome.onSuccess { (attempted, failed) ->
+                guide.clearShort()
+                guide.scheduleUpdated()
+                val typed = epgAddresses(s.epgUrl)
+                if (!announced && typed.isNotEmpty() && failed.any { it in typed }) {
+                    announced = true
+                    showToast("The guide link did not load. Check Guide URL in Settings, Live TV.")
+                }
+                if (!announced && manual) {
+                    announced = true
+                    showToast(guideRefreshMessage(attempted, failed.size, s.hasStalker))
+                }
+            }.onFailure {
+                if (!announced && manual) {
+                    announced = true
+                    showToast("The guide did not load")
+                }
+            }
             delay(60 * 60 * 1000L)
         }
     }
@@ -700,7 +729,9 @@ fun CableApp(store: SettingsStore) {
                     onRecord = { ch, program -> record(ch, program) },
                     onToggleFavorite = toggleFavorite,
                     onPreviewBounds = { previewBounds = it },
-                    showToast = showToast
+                    showToast = showToast,
+                    guideRefreshing = guideRefreshing,
+                    onRefreshGuide = { refreshGuide() }
                 )
                 Screen.Multi -> MultiViewScreen(
                     channels = channels,
@@ -799,6 +830,8 @@ fun CableApp(store: SettingsStore) {
                         userState.setHiddenFilters(value)
                         hiddenTerms = value.split(',').map { it.trim().uppercase() }.filter { it.isNotEmpty() }
                     },
+                    guideRefreshing = guideRefreshing,
+                    onRefreshGuide = { refreshGuide() },
                     onJellyfinSave = { updated ->
                         if (updated.jellyfinToken.isBlank()) {
                             store.clearProfileJellyfin(profileId)

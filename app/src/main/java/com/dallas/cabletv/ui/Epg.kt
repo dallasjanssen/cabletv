@@ -40,6 +40,12 @@ class GuideData(private val scope: CoroutineScope) {
     private val pending = HashSet<String>()
     private val gate = Semaphore(3)
 
+    /** Drops the short now-and-next cache so those channels ask the provider again. */
+    fun clearShort() {
+        short.clear()
+        pending.clear()
+    }
+
     /** Call after the full schedule is downloaded, so screens pick it up. */
     fun scheduleUpdated() {
         version++

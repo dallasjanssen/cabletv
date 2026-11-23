@@ -50,6 +50,19 @@ object ChannelSource {
     }
 }
 
+/**
+ * What to tell the person after they ask for the guide again.
+ * [attempted] is how many guide links were downloaded. [failed] is how many of those did not load.
+ * A Stalker portal has no XMLTV file; its short listings are asked for again instead.
+ */
+fun guideRefreshMessage(attempted: Int, failed: Int, stalker: Boolean): String = when {
+    attempted == 0 && stalker -> "Guide updated"
+    attempted == 0 -> "No guide link is saved. Add one in Settings, Live TV."
+    failed >= attempted -> "The guide did not load"
+    failed > 0 -> "Part of the guide did not load"
+    else -> "Guide updated"
+}
+
 /** Guide addresses typed by hand. Commas and spaces can separate more than one. */
 fun epgAddresses(raw: String): List<String> =
     raw.split(',', '\n', '\r', ' ', '\t')

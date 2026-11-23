@@ -14,7 +14,7 @@ The screens are laid out for Android TV's 960 by 540 grid, with one typeface (Fi
 
 - **Live TV**: up and down change channel. OK opens a bar with Guide, Home, Search, Channel list, Favorite, Pause, Watch from the start, Record, Two channels, and Audio and captions. Left opens the channel list while you are at the live edge. After a pause, Left and Right move inside the few minutes already buffered. A replay can be paused and skipped; Back returns from the replay to the live channel. Playlist catch-up uses the tags in the M3U.
 - **Home**: what is on now, with Keep watching and Guide buttons, then rows for favorite and recent channels, half-watched titles, and new movies and shows.
-- **Guide**: a time grid covering tomorrow and the recent past, with a line for now, details of the highlighted show, and a preview of the channel playing. Left from a channel name picks a category. OK on a channel name offers Watch now and Favorite. OK on a show that has not started yet offers a reminder or a recording.
+- **Guide**: a time grid covering tomorrow and the recent past, with a line for now, details of the highlighted show, and a preview of the channel playing. Refresh guide downloads the listings again. Left from a channel name picks a category. Up from the category reaches Refresh guide. OK on a channel name offers Watch now and Favorite. OK on a show that has not started yet offers a reminder or a recording.
 - **Movies & Shows**: provider categories and Jellyfin genres, plus continue and recently added. A title opens a details page with the plot and year when the provider sends them. The next episode waits ten seconds and can be cancelled. Each profile can have its own Jellyfin login, so continue watching is not shared.
 - **Search**: an on-screen keyboard with results beside it, for channels, shows on now or later, movies and series.
 - **Settings**: phone setup, live TV (including a Guide URL and subscription expiry), Jellyfin, channel list, profiles, parental lock, recordings and updates. Hidden channels belong to the profile. Locked groups need the PIN before they play. Each section saves by itself.
@@ -68,7 +68,7 @@ Replace the IP with your TV's address. Accept the debugging prompt on the TV the
 
 - Jellyfin playback uses direct streams. If the TV cannot decode a file's codec, that title will fail. Transcoding can be added later.
 - Channels with no listings in the XMLTV feed fall back to the provider's now and next listing.
-- A playlist can name its guide with `url-tvg`. A provider that gives you a separate EPG address goes in Settings, Live TV, Guide URL. Xtream, a playlist and a Stalker portal can all be saved at once. The guide matches channels by their id, the same id the playlist calls `tvg-id`.
+- A playlist can name its guide with `url-tvg`. A provider that gives you a separate EPG address goes in Settings, Live TV, Guide URL. Refresh guide, on the Guide screen and in Settings, Live TV, downloads those listings again. The app also downloads them about once an hour. Xtream, a playlist and a Stalker portal can all be saved at once. The guide matches channels by their id, the same id the playlist calls `tvg-id`.
 - Recordings are one at a time. A future recording starts only while the app is still open. Pausing live TV only reaches what the player has already buffered, about three minutes.
 - Two channels at once uses two provider connections. A login that allows one stream will refuse one of them.
 
