@@ -68,6 +68,8 @@ data class Settings(
     val xtreamUser: String = "",
     val xtreamPass: String = "",
     val m3uUrl: String = "",
+    /** XMLTV guide address from the provider, used as well as any guide the login already includes. */
+    val epgUrl: String = "",
     val jellyfinServer: String = "",
     val jellyfinToken: String = "",
     val jellyfinUserId: String = "",

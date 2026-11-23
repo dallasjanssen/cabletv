@@ -154,6 +154,9 @@ class PhoneSignInServer(private val pin: String, private val onReceive: (Map<Str
           <h2>Live TV playlist (M3U, optional)</h2>
           <p>Kept as well as an Xtream login. Use it when you have a separate playlist.</p>
           <label>Playlist URL<input name="m3u" autocapitalize="off" autocorrect="off"></label>
+          <h2>Programme guide (XMLTV, optional)</h2>
+          <p>The EPG link from your provider. Used together with any guide the login already includes.</p>
+          <label>Guide URL<input name="epg" autocapitalize="off" autocorrect="off" placeholder="https://example.com/epg.xml"></label>
           <h2>Stalker / Ministra portal (optional)</h2>
           <label>Portal URL<input name="su" autocapitalize="off" autocorrect="off"></label>
           <label>MAC address<input name="sm" autocapitalize="off" autocorrect="off" placeholder="00:1A:79:00:00:00"></label>

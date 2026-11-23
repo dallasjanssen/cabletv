@@ -3,7 +3,7 @@
 A personal, sideloaded Android and Android TV app that pulls together:
 
 - **Live TV** from an Xtream Codes login, an M3U playlist, a Stalker / Ministra portal, or all of them together
-- **Program guide** from every XMLTV feed those logins provide, about two days ahead and two days behind
+- **Program guide** from the login, from a playlist, or from a guide link you paste in Settings, about two days ahead and two days behind
 - **On Demand** from your Jellyfin server and from the provider's movie and show categories
 
 It opens straight into live TV on the last channel you watched. Menus sit on top of the picture, so the channel keeps playing behind Home and in a corner of the guide. Back from live TV opens Home, and Back again leaves the app. Keep watching on Home returns to the picture.
@@ -17,7 +17,7 @@ The screens are laid out for Android TV's 960 by 540 grid, with one typeface (Fi
 - **Guide**: a time grid covering tomorrow and the recent past, with a line for now, details of the highlighted show, and a preview of the channel playing. Left from a channel name picks a category. OK on a channel name offers Watch now and Favorite. OK on a show that has not started yet offers a reminder or a recording.
 - **Movies & Shows**: provider categories and Jellyfin genres, plus continue and recently added. A title opens a details page with the plot and year when the provider sends them. The next episode waits ten seconds and can be cancelled. Each profile can have its own Jellyfin login, so continue watching is not shared.
 - **Search**: an on-screen keyboard with results beside it, for channels, shows on now or later, movies and series.
-- **Settings**: phone setup, live TV (including subscription expiry), Jellyfin, channel list, profiles, parental lock, recordings and updates. Hidden channels belong to the profile. Locked groups need the PIN before they play. Each section saves by itself.
+- **Settings**: phone setup, live TV (including a Guide URL and subscription expiry), Jellyfin, channel list, profiles, parental lock, recordings and updates. Hidden channels belong to the profile. Locked groups need the PIN before they play. Each section saves by itself.
 - **First launch**: with nothing set up, the app opens on a QR code. Focus starts on New code.
 
 ## Remote and keyboard controls
@@ -68,7 +68,7 @@ Replace the IP with your TV's address. Accept the debugging prompt on the TV the
 
 - Jellyfin playback uses direct streams. If the TV cannot decode a file's codec, that title will fail. Transcoding can be added later.
 - Channels with no listings in the XMLTV feed fall back to the provider's now and next listing.
-- A playlist needs a `url-tvg` link for guide data. Xtream, a playlist and a Stalker portal can all be saved at once.
+- A playlist can name its guide with `url-tvg`. A provider that gives you a separate EPG address goes in Settings, Live TV, Guide URL. Xtream, a playlist and a Stalker portal can all be saved at once. The guide matches channels by their id, the same id the playlist calls `tvg-id`.
 - Recordings are one at a time. A future recording starts only while the app is still open. Pausing live TV only reaches what the player has already buffered, about three minutes.
 - Two channels at once uses two provider connections. A login that allows one stream will refuse one of them.
 

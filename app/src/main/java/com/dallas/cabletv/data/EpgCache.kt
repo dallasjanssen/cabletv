@@ -38,9 +38,13 @@ object EpgCache {
         refreshUrl("$base/xmltv.php?username=${enc(user)}&password=${enc(pass)}")
     }
 
-    /** Downloads every guide and keeps them together. One feed failing leaves the others in place. */
-    fun refreshAll(urls: List<String>) {
+    /**
+     * Downloads every guide and keeps them together. One feed failing leaves the others in place.
+     * Returns the addresses that did not load.
+     */
+    fun refreshAll(urls: List<String>): List<String> {
         val merged = LinkedHashMap<String, MutableList<Program>>()
+        val failed = mutableListOf<String>()
         for (url in urls.distinct()) {
             runCatching {
                 val req = Request.Builder().url(url).header("User-Agent", PLAYER_USER_AGENT).build()
@@ -51,13 +55,14 @@ object EpgCache {
                         merged.getOrPut(id) { mutableListOf() }.addAll(list)
                     }
                 }
-            }
+            }.onFailure { failed += url }
         }
         if (merged.isNotEmpty()) {
             synchronized(lock) {
                 programs = merged.mapValues { (_, list) -> list.sortedBy { it.start } }
             }
         }
+        return failed
     }
 
     /** Downloads any XMLTV feed by URL and replaces the cache. Runs on a background thread. */

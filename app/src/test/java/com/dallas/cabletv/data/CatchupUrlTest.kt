@@ -57,6 +57,21 @@ class ReminderTest {
     }
 }
 
+class EpgAddressTest {
+    @Test
+    fun splitsSeveralGuideLinks() {
+        assertEquals(
+            listOf("https://a.example/epg.xml", "http://b.example/guide.xml"),
+            epgAddresses(" https://a.example/epg.xml, http://b.example/guide.xml ")
+        )
+    }
+
+    @Test
+    fun rejectsALinkThatIsNotAnAddress() {
+        assertEquals(emptyList<String>(), epgAddresses("epg.xml"))
+    }
+}
+
 class HlsAndPortalTest {
     @Test
     fun highestVariantIsChosen() {
