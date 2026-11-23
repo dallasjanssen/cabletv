@@ -18,6 +18,8 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
 
+const val PHONE_BACKUP_JSON_FIELD = "__backup_restore_json"
+
 /** Why the server closed itself. A normal stop or a received form does not use this. */
 enum class SignInEnd { TooManyWrongCodes, Expired }
 
@@ -25,14 +27,18 @@ enum class SignInEnd { TooManyWrongCodes, Expired }
  * A small web page served on the TV's own network while the sign-in screen is open.
  * The phone opens the address from the QR code, types the details there, and the TV
  * receives them. Every request must carry the six-digit code shown on the TV, and the
- * server closes as soon as details arrive, the sign-in screen is left, ten wrong codes
- * have been tried, or ten minutes have passed.
+ * server closes when the sign-in screen is left, ten wrong codes have been tried,
+ * or ten minutes have passed.
  *
  * Traffic on the home network is not encrypted. Use it on your own network only.
  */
 class PhoneSignInServer(
     private val pin: String,
     private val onReceive: (Map<String, String>) -> Unit,
+    /** Current values shown on the phone form when it opens. */
+    private val currentValues: () -> Map<String, String> = { emptyMap() },
+    /** Supplies a JSON backup when the phone asks to download one. */
+    private val backupJson: (() -> String)? = null,
     /** Called once, on a server thread, when the server closes itself. */
     private val onEnd: (SignInEnd) -> Unit = {},
     private val maxWrongCodes: Int = 10,
@@ -93,7 +99,7 @@ class PhoneSignInServer(
 
     /** Counts a wrong code. Closes the server on the tenth. */
     private fun noteWrong(sock: Socket) {
-        respond(sock, "403 Forbidden", page("Wrong code. Scan the code on the TV again."))
+        respondHtml(sock, "403 Forbidden", page("Wrong code. Scan the code on the TV again."))
         if (wrong.incrementAndGet() >= maxWrongCodes && running) {
             stop()
             onEnd(SignInEnd.TooManyWrongCodes)
@@ -129,18 +135,41 @@ class PhoneSignInServer(
                 }
 
                 val path = target.substringBefore('?')
+                val query = parseForm(target.substringAfter('?', ""))
                 when {
                     method == "GET" && path == "/" -> {
-                        val given = parseForm(target.substringAfter('?', "")).get("pin")
+                        val given = query["pin"]
                         when {
-                            given != null && sameCode(given) -> respond(sock, "200 OK", formPage(pin))
+                            given != null && sameCode(given) -> respondHtml(sock, "200 OK", formPage(pin, currentValues(), backupJson != null))
                             given != null -> noteWrong(sock)
-                            else -> respond(sock, "403 Forbidden", page("Scan the code on the TV."))
+                            else -> respondHtml(sock, "403 Forbidden", page("Scan the code on the TV."))
+                        }
+                    }
+                    method == "GET" && path == "/backup" -> {
+                        val given = query["pin"]
+                        when {
+                            given != null && !sameCode(given) -> noteWrong(sock)
+                            given == null || !sameCode(given) -> respondHtml(sock, "403 Forbidden", page("Scan the code on the TV."))
+                            backupJson == null -> respondHtml(sock, "404 Not Found", page("Backup is not available here."))
+                            else -> {
+                                val text = runCatching { backupJson.invoke() }.getOrElse {
+                                    respondHtml(sock, "500 Internal Server Error", page("Backup failed. Check the TV and try again."))
+                                    return
+                                }
+                                val name = "cabletv-backup-${System.currentTimeMillis()}.json"
+                                respondBytes(
+                                    sock,
+                                    "200 OK",
+                                    "application/json; charset=utf-8",
+                                    text.toByteArray(Charsets.UTF_8),
+                                    headers = listOf("Content-Disposition: attachment; filename=\"$name\"")
+                                )
+                            }
                         }
                     }
                     method == "POST" && path == "/" -> {
                         if (contentLength > MAX_BODY) {
-                            respond(sock, "413 Payload Too Large", page("That is too much data."))
+                            respondHtml(sock, "413 Payload Too Large", page("That is too much data."))
                             return
                         }
                         val body = ByteArray(contentLength.toInt())
@@ -153,18 +182,38 @@ class PhoneSignInServer(
                         val fields = parseForm(String(body, 0, read, Charsets.UTF_8))
                         if (sameCode(fields["pin"])) {
                             if (!running) {
-                                respond(sock, "403 Forbidden", page("This code has expired. Scan the code on the TV again."))
+                                respondHtml(sock, "403 Forbidden", page("This code has expired. Scan the code on the TV again."))
                                 return
                             }
                             val details = fields.filterKeys { it != "pin" }
-                            respond(sock, "200 OK", page("Sent. You can close this page and check the TV."))
-                            stop()
+                            respondHtml(sock, "200 OK", page("Sent. You can keep this page open and send more changes."))
                             onReceive(details)
                         } else {
                             noteWrong(sock)
                         }
                     }
-                    else -> respond(sock, "404 Not Found", page("Not found."))
+                    method == "POST" && path == "/restore" -> {
+                        if (contentLength > MAX_BODY) {
+                            respondText(sock, "413 Payload Too Large", "That file is too large.")
+                            return
+                        }
+                        val given = query["pin"]
+                        if (!sameCode(given)) {
+                            if (given != null) noteWrong(sock) else respondText(sock, "403 Forbidden", "Wrong code.")
+                            return
+                        }
+                        val body = ByteArray(contentLength.toInt())
+                        var read = 0
+                        while (read < body.size) {
+                            val n = input.read(body, read, body.size - read)
+                            if (n < 0) break
+                            read += n
+                        }
+                        val json = String(body, 0, read, Charsets.UTF_8)
+                        onReceive(mapOf(PHONE_BACKUP_JSON_FIELD to json))
+                        respondText(sock, "200 OK", "Backup sent to TV. Check the TV for restore status.")
+                    }
+                    else -> respondHtml(sock, "404 Not Found", page("Not found."))
                 }
             } catch (e: Exception) {
                 // A broken request is dropped. The TV keeps listening for the next one.
@@ -185,12 +234,24 @@ class PhoneSignInServer(
         return buf.toString("ISO-8859-1")
     }
 
-    private fun respond(sock: Socket, status: String, html: String) {
-        val bytes = html.toByteArray(Charsets.UTF_8)
+    private fun respondHtml(sock: Socket, status: String, html: String) {
+        respondBytes(sock, status, "text/html; charset=utf-8", html.toByteArray(Charsets.UTF_8))
+    }
+
+    private fun respondText(sock: Socket, status: String, text: String) {
+        respondBytes(sock, status, "text/plain; charset=utf-8", text.toByteArray(Charsets.UTF_8))
+    }
+
+    private fun respondBytes(sock: Socket, status: String, contentType: String, bytes: ByteArray, headers: List<String> = emptyList()) {
         val out = sock.getOutputStream()
         out.write(
-            ("HTTP/1.1 $status\r\nContent-Type: text/html; charset=utf-8\r\n" +
-                "Content-Length: ${bytes.size}\r\nConnection: close\r\n\r\n").toByteArray(Charsets.UTF_8)
+            buildString {
+                append("HTTP/1.1 $status\r\n")
+                append("Content-Type: $contentType\r\n")
+                headers.forEach { append(it).append("\r\n") }
+                append("Content-Length: ${bytes.size}\r\n")
+                append("Connection: close\r\n\r\n")
+            }.toByteArray(Charsets.UTF_8)
         )
         out.write(bytes)
         out.flush()
@@ -206,7 +267,7 @@ class PhoneSignInServer(
             }
 
     private companion object {
-        const val MAX_BODY = 16 * 1024
+        const val MAX_BODY = 2 * 1024 * 1024
         const val MAX_LINE = 8 * 1024
         const val MAX_HEADERS = 64
     }
@@ -219,7 +280,43 @@ class PhoneSignInServer(
         <p style="font-size:20px">$message</p></body></html>
     """.trimIndent()
 
-    private fun formPage(pin: String): String = """
+    private fun formPage(pin: String, values: Map<String, String>, backupEnabled: Boolean): String {
+        fun escAttr(text: String): String =
+            text.replace("&", "&amp;").replace("\"", "&quot;").replace("<", "&lt;").replace(">", "&gt;")
+        fun value(key: String): String = escAttr(values[key].orEmpty())
+        val strip = values["strip"]?.let {
+            it == "1" || it.equals("true", ignoreCase = true) || it.equals("on", ignoreCase = true)
+        } == true
+        val backupSection = if (!backupEnabled) "" else """
+          <h2>Backup and restore</h2>
+          <p>Download a full backup, or upload one from this phone.</p>
+          <p><a href="/backup?pin=$pin" style="color:#3dff8c;font-weight:bold">Download backup file</a></p>
+          <label>Upload backup file<input id="backupFile" type="file" accept=".json,application/json"></label>
+          <button type="button" onclick="uploadBackup()">Upload backup to TV</button>
+          <p id="restoreStatus" style="min-height:1.3em"></p>
+        """
+        val script = if (!backupEnabled) "" else """
+        <script>
+          async function uploadBackup(){
+            const status=document.getElementById('restoreStatus');
+            const file=document.getElementById('backupFile').files[0];
+            if(!file){status.textContent='Pick a backup file first.';return;}
+            status.textContent='Uploading...';
+            try{
+              const text=await file.text();
+              const response=await fetch('/restore?pin=$pin',{
+                method:'POST',
+                headers:{'Content-Type':'application/json'},
+                body:text
+              });
+              status.textContent=await response.text();
+            }catch(e){
+              status.textContent='Upload failed. Try again.';
+            }
+          }
+        </script>
+        """
+        return """
         <!doctype html><html><head><meta charset="utf-8">
         <meta name="viewport" content="width=device-width,initial-scale=1">
         <title>CableTV sign-in</title>
@@ -229,37 +326,47 @@ class PhoneSignInServer(
           h2{font-size:16px;color:#ffb347;margin:24px 0 0}
           p{color:#b8c8e6;font-size:15px}
           label{display:block;margin-top:12px;font-size:15px;color:#b8c8e6}
-          input{width:100%;box-sizing:border-box;padding:12px;font-size:18px;border-radius:6px;
+          input,textarea{width:100%;box-sizing:border-box;padding:12px;font-size:18px;border-radius:6px;
                 border:1px solid #1a2a4a;background:#0c1a36;color:#e8f4ff;margin-top:4px}
+          input[type=checkbox]{width:auto;transform:scale(1.25);margin-right:8px}
           button{margin-top:24px;width:100%;padding:14px;font-size:18px;border:0;border-radius:6px;
                  background:#3dff8c;color:#05070f;font-weight:bold}
+          a{color:#8ed4ff}
         </style></head>
         <body>
-        <h1>CableTV sign-in</h1>
-        <p>Fill in the details you need. Anything left empty keeps what the TV already has.</p>
+        <h1>CableTV setup</h1>
+        <p>Change live TV, library, and customization settings from your phone.</p>
         <form method="post" action="/">
           <input type="hidden" name="pin" value="$pin">
           <h2>Live TV (Xtream Codes)</h2>
-          <label>Server URL<input name="xs" autocapitalize="off" autocorrect="off"></label>
-          <label>Username<input name="xu" autocapitalize="off" autocorrect="off"></label>
-          <label>Password<input name="xp" type="password"></label>
+          <label>Server URL<input name="xs" autocapitalize="off" autocorrect="off" value="${value("xs")}"></label>
+          <label>Username<input name="xu" autocapitalize="off" autocorrect="off" value="${value("xu")}"></label>
+          <label>Password<input name="xp" type="password" value="${value("xp")}"></label>
           <h2>Live TV playlist (M3U, optional)</h2>
           <p>Kept as well as an Xtream login. Use it when you have a separate playlist.</p>
-          <label>Playlist URL<input name="m3u" autocapitalize="off" autocorrect="off"></label>
+          <label>Playlist URL<input name="m3u" autocapitalize="off" autocorrect="off" value="${value("m3u")}"></label>
           <h2>Programme guide (XMLTV, optional)</h2>
           <p>The EPG link from your provider. Used together with any guide the login already includes.</p>
-          <label>Guide URL<input name="epg" autocapitalize="off" autocorrect="off" placeholder="https://example.com/epg.xml"></label>
+          <label>Guide URL<input name="epg" autocapitalize="off" autocorrect="off" placeholder="https://example.com/epg.xml" value="${value("epg")}"></label>
           <h2>Stalker / Ministra portal (optional)</h2>
-          <label>Portal URL<input name="su" autocapitalize="off" autocorrect="off"></label>
-          <label>MAC address<input name="sm" autocapitalize="off" autocorrect="off" placeholder="00:1A:79:00:00:00"></label>
+          <label>Portal URL<input name="su" autocapitalize="off" autocorrect="off" value="${value("su")}"></label>
+          <label>MAC address<input name="sm" autocapitalize="off" autocorrect="off" placeholder="00:1A:79:00:00:00" value="${value("sm")}"></label>
           <h2>On demand (Jellyfin, optional)</h2>
-          <label>Server URL<input name="js" autocapitalize="off" autocorrect="off"></label>
+          <label>Server URL<input name="js" autocapitalize="off" autocorrect="off" value="${value("js")}"></label>
           <label>Username<input name="ju" autocapitalize="off" autocorrect="off"></label>
           <label>Password<input name="jp" type="password"></label>
+          <h2>Customizations</h2>
+          <label>Hidden channel groups (comma separated)<input name="hidden" autocapitalize="off" autocorrect="off" value="${value("hidden")}"></label>
+          <label>Locked groups and categories (comma separated)<input name="locked" autocapitalize="off" autocorrect="off" value="${value("locked")}"></label>
+          <input type="hidden" name="strip" value="0">
+          <label><input type="checkbox" name="strip" value="1" ${if (strip) "checked" else ""}>Show channel names without country prefixes</label>
           <button type="submit">Send to TV</button>
         </form>
+        $backupSection
+        $script
         </body></html>
     """.trimIndent()
+    }
 }
 
 /**

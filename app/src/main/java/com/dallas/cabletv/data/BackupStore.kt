@@ -17,8 +17,10 @@ class BackupStore(
 ) {
     private val appContext = context.applicationContext
 
+    fun backupJson(): String = exportJson()
+
     fun writeBackup(uri: Uri) {
-        val json = exportJson()
+        val json = backupJson()
         val stream = appContext.contentResolver.openOutputStream(uri)
             ?: throw IllegalArgumentException("Could not write that file.")
         stream.bufferedWriter(Charsets.UTF_8).use { it.write(json) }
@@ -28,6 +30,10 @@ class BackupStore(
         val stream = appContext.contentResolver.openInputStream(uri)
             ?: throw IllegalArgumentException("Could not read that file.")
         val json = stream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+        restoreBackup(json)
+    }
+
+    fun restoreBackup(json: String) {
         importJson(json)
     }
 

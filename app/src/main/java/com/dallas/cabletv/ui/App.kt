@@ -1114,6 +1114,8 @@ fun CableApp(store: SettingsStore) {
                             jfOverride = merged.jellyfinToken to merged.jellyfinUserId
                         }
                     },
+                    onBackupExportJson = { backupStore.backupJson() },
+                    onBackupRestoreJson = { json -> backupStore.restoreBackup(json) },
                     onBackupExport = { uri -> backupStore.writeBackup(uri) },
                     onBackupRestore = { uri -> backupStore.restoreBackup(uri) },
                     vodCategories = vodCategories,

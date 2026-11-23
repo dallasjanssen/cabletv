@@ -45,6 +45,7 @@ import com.dallas.cabletv.data.AppUpdater
 import com.dallas.cabletv.data.JellyfinClient
 import com.dallas.cabletv.data.epgAddresses
 import com.dallas.cabletv.data.LiveChannel
+import com.dallas.cabletv.data.PHONE_BACKUP_JSON_FIELD
 import com.dallas.cabletv.data.Profile
 import com.dallas.cabletv.data.ProfileStore
 import com.dallas.cabletv.data.Settings
@@ -83,6 +84,9 @@ private fun withHttpScheme(address: String): String {
     if (t.isEmpty() || Regex("^[A-Za-z][A-Za-z0-9+.-]*://").containsMatchIn(t)) return t
     return "http://$t"
 }
+
+private fun phoneBool(value: String?): Boolean =
+    value == "1" || value.equals("true", ignoreCase = true) || value.equals("on", ignoreCase = true)
 
 /**
  * Checks a TV provider login, a playlist, or a Stalker portal, and keeps whichever were filled in.
@@ -211,6 +215,8 @@ fun SettingsScreen(
     hiddenFilters: String,
     onHiddenFilters: (String) -> Unit,
     onJellyfinSave: (Settings) -> Unit,
+    onBackupExportJson: () -> String,
+    onBackupRestoreJson: (String) -> Unit,
     onBackupExport: suspend (Uri) -> Unit,
     onBackupRestore: suspend (Uri) -> Unit,
     guideRefreshing: Boolean,
@@ -299,6 +305,23 @@ fun SettingsScreen(
 
     // Details from the phone are filled in and saved right away, then the result is shown here.
     fun fromPhone(fields: Map<String, String>) {
+        fields[PHONE_BACKUP_JSON_FIELD]?.let { json ->
+            phoneMessage = "Backup received. Restoring it now."
+            scope.launch {
+                val result = withContext(Dispatchers.IO) { runCatching { onBackupRestoreJson(json) } }
+                result
+                    .onSuccess {
+                        suppressUnsavedNotice = true
+                        phoneMessage = "Backup restored. Reopening Settings."
+                        (context as? Activity)?.recreate()
+                    }
+                    .onFailure {
+                        phoneMessage = "Backup restore failed. ${(it.message ?: "Try another file").trimEnd('.')}."
+                    }
+            }
+            return
+        }
+
         fields["xs"]?.takeIf { it.isNotBlank() }?.let { drafts.xs = it.trim() }
         fields["xu"]?.takeIf { it.isNotBlank() }?.let { drafts.xu = it.trim() }
         fields["xp"]?.takeIf { it.isNotEmpty() }?.let { drafts.xp = it }
@@ -311,12 +334,13 @@ fun SettingsScreen(
         fields["jp"]?.takeIf { it.isNotEmpty() }?.let { drafts.jp = it }
         val live = listOf("xs", "xu", "xp", "m3u", "su", "sm", "epg").any { !fields[it].isNullOrBlank() }
         val library = !fields["js"].isNullOrBlank() && !fields["ju"].isNullOrBlank()
+        val hasCustom = fields.containsKey("hidden") || fields.containsKey("locked") || fields.containsKey("strip")
         val results = mutableListOf<String>()
         fun report(r: String) {
             results += r
             phoneMessage = results.joinToString(" ")
         }
-        if (!live && !library) {
+        if (!live && !library && !hasCustom) {
             phoneMessage = "Nothing was filled in on the phone."
             return
         }
@@ -325,6 +349,21 @@ fun SettingsScreen(
         // cannot write the old live login back over the new one.
         scope.launch {
             var current = latest
+            if (hasCustom) {
+                val hidden = fields["hidden"]?.trim()
+                val locked = fields["locked"]?.trim()
+                val strip = fields["strip"]?.let(::phoneBool)
+                if (hidden != null) onHiddenFilters(hidden)
+                val merged = current.copy(
+                    stripPrefixes = strip ?: current.stripPrefixes,
+                    lockedFilters = locked ?: current.lockedFilters
+                )
+                if (merged != current) {
+                    onSave(merged)
+                    current = merged
+                }
+                report("Customizations saved.")
+            }
             if (live) checkLive(current, ::report)?.let { current = it }
             if (library) signIn(current, ::report)
         }
@@ -377,6 +416,20 @@ fun SettingsScreen(
         }
     }
 
+    fun phoneValues(): Map<String, String> = mapOf(
+        "xs" to latest.xtreamServer,
+        "xu" to latest.xtreamUser,
+        "xp" to latest.xtreamPass,
+        "m3u" to latest.m3uUrl,
+        "epg" to latest.epgUrl,
+        "su" to latest.stalkerUrl,
+        "sm" to latest.stalkerMac,
+        "js" to latest.jellyfinServer,
+        "hidden" to hiddenFilters,
+        "locked" to latest.lockedFilters,
+        "strip" to if (latest.stripPrefixes) "1" else "0"
+    )
+
     val listRequesters = remember { SettingsPane.entries.associateWith { FocusRequester() } }
     val focusManager = LocalFocusManager.current
     LaunchedEffect(Unit) {
@@ -393,7 +446,12 @@ fun SettingsScreen(
 
         val paneContent: @Composable ColumnScope.() -> Unit = {
             when (pane) {
-                SettingsPane.Phone -> PhonePane(phoneMessage, onReceived = { fromPhone(it) })
+                SettingsPane.Phone -> PhonePane(
+                    message = phoneMessage,
+                    currentValues = { phoneValues() },
+                    backupJson = onBackupExportJson,
+                    onReceived = { fromPhone(it) }
+                )
                 SettingsPane.Live -> LivePane(settings, channelCount, drafts, liveBusy, liveMessage, guideRefreshing, onRefreshGuide, onSave = { saveLive() }, onSignOut = {
                     onSave(settings.copy(xtreamServer = "", xtreamUser = "", xtreamPass = "", m3uUrl = "", epgUrl = "", stalkerUrl = "", stalkerMac = "", subscriptionExpiryMs = 0L))
                     drafts.xs = ""; drafts.xu = ""; drafts.xp = ""; drafts.m3u = ""; drafts.epg = ""; drafts.su = ""; drafts.sm = ""
@@ -519,12 +577,17 @@ private fun Message(text: String?) {
 }
 
 @Composable
-private fun PhonePane(message: String?, onReceived: (Map<String, String>) -> Unit) {
+private fun PhonePane(
+    message: String?,
+    currentValues: () -> Map<String, String>,
+    backupJson: () -> String,
+    onReceived: (Map<String, String>) -> Unit
+) {
     PaneTitle(
         "Set up with your phone",
-        "Typing server addresses with a remote is slow. Show a code, scan it with your phone, and fill in your details there. They are checked and saved here as soon as you send them."
+        "Typing with a remote is slow. Show a code, scan it, and manage setup, customizations, and backups from your phone."
     )
-    PhoneSignInPanel(autoStart = false, onReceived = onReceived)
+    PhoneSignInPanel(autoStart = false, onReceived = onReceived, currentValues = currentValues, backupJson = backupJson)
     Message(message)
 }
 
