@@ -12,12 +12,12 @@ The screens are laid out for Android TV's 960 by 540 grid, with one typeface (Fi
 
 ## Screens
 
-- **Live TV**: up and down change channel. OK opens a bar with Guide, Channel list, Favorite, Watch from the start (channels with catch-up) and Audio and captions. Left opens the channel list.
+- **Live TV**: up and down change channel. OK opens a bar with Guide, Channel list, Favorite, Watch from the start (channels with catch-up) and Audio and captions. Left opens the channel list, and Left again opens its categories. The guide and the channel list share the category you pick.
 - **Home**: what is on now, with Keep watching and Guide buttons, then rows for favorite and recent channels, half-watched titles, and new movies and shows.
 - **Guide**: a time grid with a line for now, details of the highlighted show, and a preview of the channel playing. Left from a channel name picks a category. OK on a channel name adds it to favorites.
 - **Movies & Shows**: rows from Jellyfin and the provider. A title opens a details page with Resume, Start over, seasons and episodes. The player has its own controls and a panel for audio, captions and picture size.
 - **Search**: an on-screen keyboard with results beside it, for channels, shows on now, movies and series.
-- **Settings**: sections for phone setup, live TV, Jellyfin, channel list, profiles, parental lock and updates. Each section saves by itself.
+- **Settings**: sections for phone setup, live TV, Jellyfin, channel list, profiles, parental lock and updates. Each section saves by itself. If the app ever closes unexpectedly, Updates shows the error so it can be reported.
 - **First launch**: with nothing set up, the app opens on a QR code so setup happens on a phone.
 
 ## Remote and keyboard controls

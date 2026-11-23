@@ -32,6 +32,7 @@ import androidx.compose.ui.zIndex
 import com.dallas.cabletv.BuildConfig
 import com.dallas.cabletv.data.AppUpdater
 import com.dallas.cabletv.data.ChannelSource
+import com.dallas.cabletv.data.CrashLog
 import com.dallas.cabletv.data.EpgCache
 import com.dallas.cabletv.data.JellyfinClient
 import com.dallas.cabletv.data.LiveChannel
@@ -82,6 +83,8 @@ fun CableApp(store: SettingsStore) {
     // Where a movie page was opened from, so Back returns there.
     var vodOrigin by remember { mutableStateOf(Screen.OnDemand) }
     var settingsPane by remember { mutableStateOf(SettingsPane.Phone) }
+    // The category picked in the guide or the channel list. Both show the same one.
+    var channelGroup by remember { mutableStateOf(GROUP_ALL) }
 
     // ------------------------------------------------------------ Toasts
     var toast by remember { mutableStateOf<String?>(null) }
@@ -95,6 +98,10 @@ fun CableApp(store: SettingsStore) {
             delay(2800)
             toast = null
         }
+    }
+    var lastCrash by remember { mutableStateOf(CrashLog.read(context)) }
+    LaunchedEffect(Unit) {
+        if (CrashLog.takeNotice(context)) showToast("The app closed unexpectedly last time. Details are in Settings, Updates.")
     }
 
     // ------------------------------------------------------------ Channels and guide
@@ -410,6 +417,8 @@ fun CableApp(store: SettingsStore) {
                     guide = guide,
                     favorites = favorites,
                     recents = recents,
+                    group = channelGroup,
+                    onGroupChange = { channelGroup = it },
                     loading = channelsLoading,
                     error = channelError,
                     canReplay = xtream != null,
@@ -480,6 +489,8 @@ fun CableApp(store: SettingsStore) {
                     recents = recents,
                     guide = guide,
                     loading = channelsLoading,
+                    group = channelGroup,
+                    onGroupChange = { channelGroup = it },
                     onWatch = { ch ->
                         tuneTo(ch)
                         go(Screen.Live)
@@ -554,6 +565,11 @@ fun CableApp(store: SettingsStore) {
                     updateBusy = updateBusy,
                     onCheckUpdate = { checkForUpdate(manual = true) },
                     onInstallUpdate = { installUpdate(it) },
+                    lastCrash = lastCrash,
+                    onClearCrash = {
+                        CrashLog.clear(context)
+                        lastCrash = null
+                    },
                     showToast = showToast
                 )
             }

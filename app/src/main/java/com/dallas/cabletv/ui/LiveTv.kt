@@ -188,6 +188,8 @@ fun LiveTvScreen(
     guide: GuideData,
     favorites: Set<String>,
     recents: List<String>,
+    group: String,
+    onGroupChange: (String) -> Unit,
     loading: Boolean,
     error: String?,
     canReplay: Boolean,
@@ -280,10 +282,6 @@ fun LiveTvScreen(
                     KeyEvent.KEYCODE_LAST_CHANNEL -> return@onPreviewKeyEvent false
                 }
                 if (panel == LivePanel.Options && code == KeyEvent.KEYCODE_DPAD_DOWN) {
-                    close()
-                    return@onPreviewKeyEvent true
-                }
-                if (panel == LivePanel.Channels && code == KeyEvent.KEYCODE_DPAD_RIGHT) {
                     close()
                     return@onPreviewKeyEvent true
                 }
@@ -418,10 +416,13 @@ fun LiveTvScreen(
                 favorites = favorites,
                 recents = recents,
                 guide = guide,
+                group = group,
+                onGroupChange = onGroupChange,
                 onPick = {
                     close()
                     tune(it)
-                }
+                },
+                onClose = { close() }
             )
         }
 
@@ -594,9 +595,11 @@ private fun OptionsBar(
     }
 }
 
-private enum class ListTab(val label: String) { All("All"), Favorites("Favorites"), Recent("Recent") }
-
-/** The channel list over the left of the picture. The highlight moves without changing channel until OK. */
+/**
+ * The channel list over the left of the picture. The highlight moves without changing channel until
+ * OK. The category at the top is shared with the guide. Left, or OK on the category, opens the list of
+ * categories beside it.
+ */
 @Composable
 private fun ChannelListPanel(
     channels: List<LiveChannel>,
@@ -604,74 +607,133 @@ private fun ChannelListPanel(
     favorites: Set<String>,
     recents: List<String>,
     guide: GuideData,
-    onPick: (Int) -> Unit
+    group: String,
+    onGroupChange: (String) -> Unit,
+    onPick: (Int) -> Unit,
+    onClose: () -> Unit
 ) {
-    var tab by remember { mutableStateOf(ListTab.All) }
-    val shown: List<Int> = remember(tab, channels, favorites, recents) {
-        when (tab) {
-            ListTab.All -> channels.indices.toList()
-            ListTab.Favorites -> channels.indices.filter { channels[it].id in favorites }
-            ListTab.Recent -> recents.mapNotNull { id -> channels.indexOfFirst { it.id == id }.takeIf { it >= 0 } }
-        }
+    var picking by remember { mutableStateOf(false) }
+    val groups = remember(channels) { groupsOf(channels) }
+    val indexById = remember(channels) { channels.withIndex().associate { it.value.id to it.index } }
+    val shown: List<Int> = remember(group, channels, favorites, recents) {
+        channelsIn(group, channels, favorites, recents).mapNotNull { indexById[it.id] }
     }
     val listState = rememberLazyListState()
     val start = remember { FocusRequester() }
+    val categoryButton = remember { FocusRequester() }
     val startPos = shown.indexOf(currentIndex).coerceAtLeast(0)
-    LaunchedEffect(tab) {
-        if (shown.isNotEmpty()) {
-            listState.scrollToItem((startPos - 3).coerceAtLeast(0))
+
+    BackHandler(enabled = picking) { picking = false }
+
+    // Focus lands on the channel playing, or the first in the category, whenever the list is shown.
+    LaunchedEffect(group, picking) {
+        if (picking) return@LaunchedEffect
+        if (shown.isEmpty()) {
             withFrameNanos { }
-            runCatching { start.requestFocus() }
+            runCatching { categoryButton.requestFocus() }
+            return@LaunchedEffect
+        }
+        listState.scrollToItem((startPos - 3).coerceAtLeast(0))
+        repeat(3) {
+            withFrameNanos { }
+            if (runCatching { start.requestFocus() }.isSuccess) return@LaunchedEffect
         }
     }
 
     BoxWithConstraints {
-        SidePanel("Channels", Modifier.width(minOf(340.dp, maxWidth * 0.88f))) {
-            Row(Modifier.padding(horizontal = 24.dp).padding(bottom = 10.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                ListTab.entries.forEach { t -> Chip(t.label, selected = t == tab, onClick = { tab = t }) }
-            }
-            if (shown.isEmpty()) {
-                Text(
-                    if (tab == ListTab.Favorites) "No favorites yet. Use Add to favorites while watching." else "Channels you watch show up here.",
-                    style = TvType.Small,
-                    color = Tv.Ink2,
-                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp)
+        val narrow = maxWidth < 600.dp
+        val panelWidth = minOf(340.dp, maxWidth * 0.88f)
+        Row {
+            if (picking) {
+                CategoryPanel(
+                    title = "Categories",
+                    items = categoryItems(groups),
+                    selected = group,
+                    countOf = { g -> channelsIn(g, channels, favorites, recents).size },
+                    onPick = { g ->
+                        onGroupChange(g)
+                        picking = false
+                    },
+                    onClose = { picking = false }
                 )
             }
-            LazyColumn(Modifier.weight(1f), state = listState, contentPadding = PaddingValues(horizontal = 12.dp, vertical = 2.dp)) {
-                itemsIndexed(shown, key = { _, i -> channels[i].id }) { pos, i ->
-                    val ch = channels[i]
-                    val now = guide.nowNext(ch)?.now
+            if (!picking || !narrow) {
+                SidePanel(
+                    "Channels",
+                    Modifier
+                        .width(panelWidth)
+                        .onPreviewKeyEvent { ev ->
+                            if (ev.type != KeyEventType.KeyDown || picking) return@onPreviewKeyEvent false
+                            when (ev.nativeKeyEvent.keyCode) {
+                                KeyEvent.KEYCODE_DPAD_LEFT -> { picking = true; true }
+                                KeyEvent.KEYCODE_DPAD_RIGHT -> { onClose(); true }
+                                else -> false
+                            }
+                        }
+                ) {
                     Focusable(
-                        onClick = { onPick(i) },
-                        modifier = (if (pos == startPos) Modifier.focusRequester(start) else Modifier).fillMaxWidth(),
-                        shape = RoundedCornerShape(9.dp)
+                        onClick = { picking = true },
+                        modifier = Modifier.padding(horizontal = 24.dp).padding(bottom = 10.dp).fillMaxWidth().height(32.dp).focusRequester(categoryButton),
+                        shape = RoundedCornerShape(8.dp),
+                        color = Tv.Surface2,
+                        contentAlignment = Alignment.CenterStart
                     ) {
-                        Row(Modifier.padding(horizontal = 10.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Text(
-                                ch.number.toString(),
-                                style = TvType.SmallStrong,
-                                color = if (LocalFocused.current) Tv.FocusInk else if (i == currentIndex) Tv.Accent else Tv.Ink3,
-                                modifier = Modifier.width(34.dp),
-                                maxLines = 1
-                            )
-                            ChannelLogo(ch, Modifier.size(52.dp, 30.dp), compact = true)
-                            Spacer(Modifier.width(12.dp))
-                            Column(Modifier.weight(1f)) {
-                                Text(ch.name, style = TvType.BodyStrong, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                Text(now?.title ?: "No guide information", style = TvType.Caption, color = ink3, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                if (now != null) {
-                                    Spacer(Modifier.height(5.dp))
-                                    ProgressBar(progressOf(now), Modifier.widthIn(max = 150.dp).fillMaxWidth(), height = 3.dp)
+                        Row(Modifier.padding(start = 12.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Text(group, style = TvType.SmallStrong, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                            Text("${shown.size}", style = TvType.Caption, color = ink3)
+                            Spacer(Modifier.width(6.dp))
+                            Icon(TvIcons.ChevronDown, contentDescription = null, modifier = Modifier.size(16.dp))
+                        }
+                    }
+                    if (shown.isEmpty()) {
+                        Text(
+                            when (group) {
+                                GROUP_FAVORITES -> "No favorites yet. Use Add to favorites while watching."
+                                GROUP_RECENT -> "Channels you watch show up here."
+                                else -> "No channels in this category."
+                            },
+                            style = TvType.Small,
+                            color = Tv.Ink2,
+                            modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp)
+                        )
+                    }
+                    LazyColumn(Modifier.weight(1f), state = listState, contentPadding = PaddingValues(horizontal = 12.dp, vertical = 2.dp)) {
+                        itemsIndexed(shown, key = { _, i -> channels[i].id }) { pos, i ->
+                            val ch = channels[i]
+                            val now = guide.nowNext(ch)?.now
+                            Focusable(
+                                onClick = { onPick(i) },
+                                modifier = (if (pos == startPos) Modifier.focusRequester(start) else Modifier).fillMaxWidth(),
+                                shape = RoundedCornerShape(9.dp)
+                            ) {
+                                Row(Modifier.padding(horizontal = 10.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                    Text(
+                                        ch.number.toString(),
+                                        style = TvType.SmallStrong,
+                                        color = if (LocalFocused.current) Tv.FocusInk else if (i == currentIndex) Tv.Accent else Tv.Ink3,
+                                        modifier = Modifier.width(34.dp),
+                                        maxLines = 1
+                                    )
+                                    ChannelLogo(ch, Modifier.size(52.dp, 30.dp), compact = true)
+                                    Spacer(Modifier.width(12.dp))
+                                    Column(Modifier.weight(1f)) {
+                                        Text(ch.name, style = TvType.BodyStrong, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                        Text(now?.title ?: "No guide information", style = TvType.Caption, color = ink3, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                        if (now != null) {
+                                            Spacer(Modifier.height(5.dp))
+                                            ProgressBar(progressOf(now), Modifier.widthIn(max = 150.dp).fillMaxWidth(), height = 3.dp)
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
+                    Row(Modifier.padding(horizontal = 24.dp).padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                        KeyHint("OK", "Watch")
+                        KeyHint("\u25C0", "Categories")
+                        KeyHint("\u25B6", "Close")
+                    }
                 }
-            }
-            Row(Modifier.padding(horizontal = 24.dp).padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                KeyHint("OK", "Watch")
-                KeyHint("▶", "Close")
             }
         }
     }
