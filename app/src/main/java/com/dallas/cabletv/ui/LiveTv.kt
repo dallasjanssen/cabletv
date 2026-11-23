@@ -167,6 +167,12 @@ class LivePlayer(context: Context) {
     }
 
     /** Moves within a replay. A live broadcast is left alone. */
+    /** Jumps back to the live edge after a pause or a short rewind. */
+    fun backToLive() {
+        exo.seekToDefaultPosition()
+        exo.play()
+    }
+
     fun seekBy(deltaMs: Long) {
         val duration = exo.duration
         var target = exo.currentPosition + deltaMs
@@ -239,6 +245,8 @@ fun LiveTvScreen(
     onOpenSearch: () -> Unit,
     onLastChannel: () -> Unit,
     onExit: () -> Unit,
+    onMultiView: () -> Unit,
+    onRecord: (LiveChannel, Program) -> Unit,
     showToast: (String) -> Unit
 ) {
     val context = LocalContext.current
@@ -328,30 +336,32 @@ fun LiveTvScreen(
                     KeyEvent.KEYCODE_GUIDE -> { onOpenGuide(); return@onPreviewKeyEvent true }
                     KeyEvent.KEYCODE_LAST_CHANNEL -> { panel = LivePanel.None; onLastChannel(); return@onPreviewKeyEvent true }
                     KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
-                        if (replaying) player.togglePause()
-                        return@onPreviewKeyEvent replaying
+                        player.togglePause()
+                        return@onPreviewKeyEvent true
                     }
                     KeyEvent.KEYCODE_MEDIA_PLAY -> {
-                        if (replaying) player.exo.play()
-                        return@onPreviewKeyEvent replaying
+                        player.exo.play()
+                        return@onPreviewKeyEvent true
                     }
                     KeyEvent.KEYCODE_MEDIA_PAUSE -> {
-                        if (replaying) player.exo.pause()
-                        return@onPreviewKeyEvent replaying
+                        player.exo.pause()
+                        return@onPreviewKeyEvent true
                     }
                     KeyEvent.KEYCODE_MEDIA_REWIND -> {
-                        if (replaying) {
+                        if (replaying || !atLiveEdge(player)) {
                             player.seekBy(-10_000)
                             bannerTick++
+                            return@onPreviewKeyEvent true
                         }
-                        return@onPreviewKeyEvent replaying
+                        return@onPreviewKeyEvent false
                     }
                     KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> {
-                        if (replaying) {
+                        if (replaying || !atLiveEdge(player)) {
                             player.seekBy(30_000)
                             bannerTick++
+                            return@onPreviewKeyEvent true
                         }
-                        return@onPreviewKeyEvent replaying
+                        return@onPreviewKeyEvent false
                     }
                 }
                 if (panel == LivePanel.Options && code == KeyEvent.KEYCODE_DPAD_DOWN) {
@@ -367,7 +377,7 @@ fun LiveTvScreen(
                     KeyEvent.KEYCODE_DPAD_UP -> { tune(index + 1); true }
                     KeyEvent.KEYCODE_DPAD_DOWN -> { tune(index - 1); true }
                     KeyEvent.KEYCODE_DPAD_LEFT -> {
-                        if (replaying && !player.failed) {
+                        if (!player.failed && (replaying || !atLiveEdge(player))) {
                             player.seekBy(-10_000)
                             bannerTick++
                         } else if (channels.isNotEmpty()) {
@@ -376,7 +386,7 @@ fun LiveTvScreen(
                         true
                     }
                     KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                        if (replaying && !player.failed) player.seekBy(30_000)
+                        if (!player.failed && (replaying || !atLiveEdge(player))) player.seekBy(30_000)
                         bannerTick++
                         true
                     }
@@ -498,7 +508,15 @@ fun LiveTvScreen(
                 onHome = onOpenHome,
                 onSearch = onOpenSearch,
                 onChannels = { panel = LivePanel.Channels },
+                behind = !replaying && !atLiveEdge(player),
                 onPause = { player.togglePause() },
+                onJumpLive = { player.backToLive() },
+                onMultiView = onMultiView,
+                onRecord = {
+                    val showing = nn?.now
+                    if (showing == null) showToast("There is nothing to record right now")
+                    else onRecord(current, showing)
+                },
                 onSeek = {
                     player.seekBy(it)
                     bannerTick++
@@ -657,6 +675,14 @@ private fun ChannelBanner(channel: LiveChannel, nn: NowNext?, isFavorite: Boolea
     }
 }
 
+/** True while live playback is at the edge, so Left still opens the channel list. */
+private fun atLiveEdge(player: LivePlayer): Boolean {
+    if (player.failed) return true
+    if (!player.playing && player.exo.playbackState == Player.STATE_READY) return false
+    val offset = player.exo.currentLiveOffset
+    return offset == C.TIME_UNSET || offset < 12_000L
+}
+
 /** Everything you can do while watching, as buttons. Opens with OK. */
 @Composable
 private fun OptionsBar(
@@ -672,9 +698,13 @@ private fun OptionsBar(
     onChannels: () -> Unit,
     onFavorite: () -> Unit,
     onReplay: () -> Unit,
+    behind: Boolean,
     onPause: () -> Unit,
     onSeek: (Long) -> Unit,
     onReturnToLive: () -> Unit,
+    onJumpLive: () -> Unit,
+    onMultiView: () -> Unit,
+    onRecord: () -> Unit,
     onTracks: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -754,14 +784,17 @@ private fun OptionsBar(
                     onFavorite,
                     icon = if (isFavorite) TvIcons.StarFilled else TvIcons.Star
                 )
-                if (replaying) {
+                if (replaying || behind) {
                     PillButton(if (playing) "Pause" else "Play", onPause, icon = if (playing) TvIcons.Pause else TvIcons.Play)
                     PillButton("Back 10 seconds", { onSeek(-10_000) }, icon = TvIcons.Back)
                     PillButton("Forward 30 seconds", { onSeek(30_000) }, icon = TvIcons.Next)
-                    PillButton("Back to live", onReturnToLive, icon = TvIcons.Replay)
-                } else if (canReplay) {
-                    PillButton("Watch from the start", onReplay, icon = TvIcons.Replay)
+                    PillButton("Back to live", if (replaying) onReturnToLive else onJumpLive, icon = TvIcons.Replay)
+                } else {
+                    PillButton(if (playing) "Pause" else "Play", onPause, icon = if (playing) TvIcons.Pause else TvIcons.Play)
+                    if (canReplay) PillButton("Watch from the start", onReplay, icon = TvIcons.Replay)
                 }
+                PillButton("Record", onRecord, icon = TvIcons.Play)
+                PillButton("Two channels", onMultiView, icon = TvIcons.Tv)
                 PillButton("Audio and captions", onTracks, icon = TvIcons.Captions)
             }
         }
@@ -918,7 +951,8 @@ private fun ReplayPanel(channel: LiveChannel, now: Program?, onPick: (Program) -
     // Shows inside the provider's archive window. One day when the provider does not say.
     val past = remember(channel.id, channel.archiveDays) {
         val day = 24L * 3_600_000L
-        EpgCache.pastPrograms(channel.epgId, if (channel.archiveDays > 0) channel.archiveDays * day else day).take(30)
+        val days = if (channel.archiveDays > 0) channel.archiveDays.coerceAtMost(2) else 2
+        EpgCache.pastPrograms(channel.epgId, days * day)
     }
     val items = listOfNotNull(now) + past
     val first = remember { FocusRequester() }
@@ -954,7 +988,7 @@ private fun ReplayPanel(channel: LiveChannel, now: Program?, onPick: (Program) -
             }
         }
         Text(
-            "Your provider keeps about a day of shows for ${channel.name}.",
+            "About ${if (channel.archiveDays > 0) channel.archiveDays.coerceAtMost(2) else 2} days of ${channel.name} are listed. Rewind on a live channel only reaches the last few minutes.",
             style = TvType.Caption,
             color = Tv.Ink3,
             modifier = Modifier.padding(horizontal = 24.dp).padding(top = 8.dp)

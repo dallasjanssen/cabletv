@@ -66,6 +66,25 @@ data class VodShelves(
 
 private fun keyOf(item: VodItem) = "${item.source}:${item.id}"
 
+private fun libraryRows(shelves: VodShelves): List<Pair<String, List<VodItem>>> {
+    fun grouped(title: String, items: List<VodItem>): List<Pair<String, List<VodItem>>> {
+        if (items.isEmpty()) return emptyList()
+        val groups = items.groupBy { it.category.ifBlank { title } }
+        return if (groups.size <= 1) {
+            listOf(title to items)
+        } else {
+            groups.map { (name, list) ->
+                val label = if (name.equals(title, true)) title else "$title · $name"
+                label to list
+            }
+        }
+    }
+    return listOfNotNull(
+        shelves.continueWatching.takeIf { it.isNotEmpty() }?.let { "Continue watching" to it },
+        shelves.recent.takeIf { it.isNotEmpty() }?.let { "Recently added" to it }
+    ) + grouped("Movies", shelves.movies) + grouped("Shows", shelves.series)
+}
+
 /**
  * Movies and shows from Jellyfin and the TV provider. Picking a title opens its details page,
  * which plays, resumes, or lists the episodes. Back steps out one level at a time.
@@ -79,10 +98,18 @@ fun OnDemandScreen(
     pendingVod: VodItem?,
     onPendingConsumed: () -> Unit,
     onPlaybackEnded: () -> Unit,
-    onLeaveDetail: () -> Unit
+    onLeaveDetail: () -> Unit,
+    jellyfinToken: String = "",
+    jellyfinUserId: String = ""
 ) {
-    val jellyfin = remember(settings) {
-        if (settings.hasJellyfin) JellyfinClient(settings.jellyfinServer, settings.jellyfinToken, settings.jellyfinUserId) else null
+    val token = jellyfinToken.ifBlank { settings.jellyfinToken }
+    val userId = jellyfinUserId.ifBlank { settings.jellyfinUserId }
+    val jellyfin = remember(settings.jellyfinServer, token, userId) {
+        if (settings.jellyfinServer.isNotBlank() && token.isNotBlank() && userId.isNotBlank()) {
+            JellyfinClient(settings.jellyfinServer, token, userId)
+        } else {
+            null
+        }
     }
     val xtream = remember(settings) {
         if (settings.hasXtream) XtreamClient(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass) else null
@@ -160,6 +187,7 @@ fun OnDemandScreen(
             }
             DetailScreen(
                 item = openDetail,
+                xtream = xtream,
                 episodes = episodes,
                 store = userState,
                 resumeTick = resumeTick,
@@ -193,12 +221,7 @@ private fun Library(
     focusKey: String?,
     onOpen: (String, VodItem) -> Unit
 ) {
-    val rows = listOfNotNull(
-        shelves.continueWatching.takeIf { it.isNotEmpty() }?.let { "Continue watching" to it },
-        shelves.recent.takeIf { it.isNotEmpty() }?.let { "Recently added" to it },
-        shelves.movies.takeIf { it.isNotEmpty() }?.let { "Movies" to it },
-        shelves.series.takeIf { it.isNotEmpty() }?.let { "Shows" to it }
-    )
+    val rows = libraryRows(shelves)
     var focused by remember { mutableStateOf(rows.firstOrNull()?.second?.firstOrNull()) }
     val target = focusKey ?: rows.firstOrNull()?.let { (t, list) -> "$t|${keyOf(list.first())}" }
     val requester = remember { FocusRequester() }
@@ -289,12 +312,28 @@ private fun metaParts(item: VodItem): List<String> = listOfNotNull(
 @Composable
 private fun DetailScreen(
     item: VodItem,
+    xtream: XtreamClient?,
     episodes: List<VodItem>?,
     store: UserStateStore,
     resumeTick: Int,
     focusEpisodeId: String?,
     onPlay: (VodItem, Boolean) -> Unit
 ) {
+    var details by remember(item.id) { mutableStateOf(item) }
+    LaunchedEffect(item.id) {
+        if (item.source == "xtream" && item.type == "Movie" && item.overview.isNullOrBlank() && xtream != null) {
+            val extra = withContext(Dispatchers.IO) { runCatching { xtream.movieDetails(item.id) }.getOrNull() }
+            if (extra != null) {
+                details = item.copy(
+                    name = extra.name.ifBlank { item.name },
+                    year = extra.year ?: item.year,
+                    overview = extra.overview ?: item.overview,
+                    backdropUrl = extra.backdropUrl ?: item.backdropUrl,
+                    runtimeMinutes = extra.runtimeMinutes ?: item.runtimeMinutes
+                )
+            }
+        }
+    }
     val primary = remember { FocusRequester() }
     val episodeFocus = remember { FocusRequester() }
     val isSeries = item.type == "Series"
@@ -325,7 +364,7 @@ private fun DetailScreen(
         val side = gutter(narrow)
         Box(Modifier.align(Alignment.TopEnd).fillMaxHeight().width(maxWidth * 0.72f)) {
             AsyncImage(
-                model = item.backdropUrl ?: item.posterUrl.takeIf { it.isNotBlank() },
+                model = details.backdropUrl ?: details.posterUrl.takeIf { it.isNotBlank() },
                 contentDescription = null,
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxSize().alpha(0.55f)
@@ -337,11 +376,11 @@ private fun DetailScreen(
         val info: @Composable ColumnScope.() -> Unit = {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Badge(if (isSeries) "Series" else "Movie")
-                metaParts(item).filter { it != "Series" }.forEach { Text(it, style = TvType.Small, color = Tv.Ink2) }
+                metaParts(details).filter { it != "Series" }.forEach { Text(it, style = TvType.Small, color = Tv.Ink2) }
                 if (isSeries && seasons.isNotEmpty()) Text("${seasons.size} season${if (seasons.size == 1) "" else "s"}", style = TvType.Small, color = Tv.Ink2)
             }
-            Text(item.name, style = TvType.Display, maxLines = 3, overflow = TextOverflow.Ellipsis)
-            item.overview?.let { Text(it, style = TvType.Body, color = Tv.Ink2, maxLines = if (narrow) 4 else 6, overflow = TextOverflow.Ellipsis) }
+            Text(details.name, style = TvType.Display, maxLines = 3, overflow = TextOverflow.Ellipsis)
+            details.overview?.let { Text(it, style = TvType.Body, color = Tv.Ink2, maxLines = if (narrow) 4 else 6, overflow = TextOverflow.Ellipsis) }
             if (!isSeries && resumeMs > 0) {
                 val total = item.runtimeMinutes?.let { it * 60_000L }
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -475,6 +514,12 @@ private fun VodPlayer(
     val latestNext by rememberUpdatedState(nextEpisode)
     val latestOnNext by rememberUpdatedState(onPlayNext)
     val latestExit by rememberUpdatedState(onExit)
+    var pendingNext by remember { mutableStateOf<VodItem?>(null) }
+    LaunchedEffect(pendingNext?.id) {
+        val next = pendingNext ?: return@LaunchedEffect
+        delay(10_000)
+        if (pendingNext?.id == next.id) latestOnNext(next)
+    }
     val root = remember { FocusRequester() }
     val seek = remember { FocusRequester() }
 
@@ -496,7 +541,7 @@ private fun VodPlayer(
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (playbackState == Player.STATE_ENDED) {
                     val next = latestNext
-                    if (next != null) latestOnNext(next) else latestExit()
+                    if (next != null) pendingNext = next else latestExit()
                 }
             }
         }
@@ -664,6 +709,24 @@ private fun VodPlayer(
                 onClose = { tracks = false },
                 modifier = Modifier.align(Alignment.CenterEnd)
             )
+        }
+
+        pendingNext?.let { next ->
+            Column(
+                Modifier.align(Alignment.Center).clip(RoundedCornerShape(16.dp)).background(Color(0xE6101218)).padding(22.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text("Next: ${next.name}", style = TvType.Title, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text("Starts in a few seconds", style = TvType.Small, color = Tv.Ink2)
+                Spacer(Modifier.height(12.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    PillButton("Play now", { latestOnNext(next) }, icon = TvIcons.Play)
+                    PillButton("Cancel", {
+                        pendingNext = null
+                        latestExit()
+                    })
+                }
+            }
         }
 
         if (failed) {

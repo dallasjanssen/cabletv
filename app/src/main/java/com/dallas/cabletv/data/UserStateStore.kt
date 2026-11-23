@@ -102,10 +102,40 @@ class UserStateStore(context: Context, profileId: String = ProfileStore.DEFAULT_
 
     private fun resumeKey(item: VodItem): String = "${item.source}:${item.id}"
 
+    /** Null until this profile has chosen its own hidden list. The shared settings are the fallback. */
+    fun hiddenFilters(): String? = if (prefs.contains(K_HIDDEN)) prefs.getString(K_HIDDEN, "") else null
+
+    fun setHiddenFilters(value: String) {
+        prefs.edit().putString(K_HIDDEN, value).apply()
+    }
+
+    fun reminders(): List<Reminder> {
+        val arr = JSONArray(prefs.getString(K_REMIND, "[]") ?: "[]")
+        return (0 until arr.length()).mapNotNull { i ->
+            val o = arr.optJSONObject(i) ?: return@mapNotNull null
+            Reminder(o.optString("channel"), o.optString("name"), o.optString("title"), o.optLong("start"))
+        }
+    }
+
+    fun toggleReminder(reminder: Reminder): Boolean {
+        val key = reminderKey(reminder)
+        val list = reminders().toMutableList()
+        val removed = list.removeAll { reminderKey(it) == key }
+        if (!removed) list += reminder
+        val arr = JSONArray()
+        list.take(40).forEach {
+            arr.put(JSONObject().put("channel", it.channelId).put("name", it.channelName).put("title", it.title).put("start", it.start))
+        }
+        prefs.edit().putString(K_REMIND, arr.toString()).apply()
+        return !removed
+    }
+
     private companion object {
         const val K_FAV = "favorites"
         const val K_RECENT = "recent_channels"
         const val K_RESUME = "resume_points"
+        const val K_HIDDEN = "hidden_filters"
+        const val K_REMIND = "reminders"
         const val MAX_RECENT = 20
     }
 }

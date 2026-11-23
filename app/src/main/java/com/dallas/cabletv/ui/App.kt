@@ -39,12 +39,23 @@ import com.dallas.cabletv.data.LiveChannel
 import com.dallas.cabletv.data.Profile
 import com.dallas.cabletv.data.Program
 import com.dallas.cabletv.data.ProfileStore
+import com.dallas.cabletv.data.Recording
+import com.dallas.cabletv.data.RecordingService
+import com.dallas.cabletv.data.RecordingStore
+import com.dallas.cabletv.data.Reminder
+import com.dallas.cabletv.data.ScheduledRecording
 import com.dallas.cabletv.data.SettingsStore
+import com.dallas.cabletv.data.StalkerClient
 import com.dallas.cabletv.data.UserStateStore
 import com.dallas.cabletv.data.VodItem
 import com.dallas.cabletv.data.XtreamClient
 import com.dallas.cabletv.data.displayName
+import com.dallas.cabletv.data.dueReminders
+import com.dallas.cabletv.data.dueSchedule
 import com.dallas.cabletv.data.isHidden
+import com.dallas.cabletv.data.isLocked
+import com.dallas.cabletv.data.m3uCatchupUrl
+import com.dallas.cabletv.data.reminderKey
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -52,10 +63,10 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import kotlin.math.roundToInt
 
-enum class Screen { Live, Home, Guide, OnDemand, Search, Settings, Welcome }
+enum class Screen { Live, Home, Guide, OnDemand, Search, Settings, Welcome, Multi }
 
 /** Which PIN pad, if any, is on screen. */
-private enum class PinPurpose { NONE, UNLOCK, SET_NEW, SET_CONFIRM, REMOVE }
+private enum class PinPurpose { NONE, UNLOCK, SET_NEW, SET_CONFIRM, REMOVE, CONTENT }
 
 private fun Tab.toScreen(): Screen = when (this) {
     Tab.Home -> Screen.Home
@@ -107,10 +118,16 @@ fun CableApp(store: SettingsStore) {
 
     // ------------------------------------------------------------ Channels and guide
     var loadedChannels by remember { mutableStateOf<List<LiveChannel>>(emptyList()) }
-    val channels = remember(loadedChannels, settings.hiddenFilters, settings.stripPrefixes) {
+    var hiddenTerms by remember { mutableStateOf(settings.hiddenTerms) }
+    var contentUnlocked by remember { mutableStateOf(false) }
+    var pinSet by remember { mutableStateOf(store.hasPin()) }
+    var pinPurpose by remember { mutableStateOf(PinPurpose.NONE) }
+    var pinError by remember { mutableStateOf<String?>(null) }
+    var afterUnlock by remember { mutableStateOf<(() -> Unit)?>(null) }
+    val channels = remember(loadedChannels, hiddenTerms, settings.stripPrefixes) {
         loadedChannels
             .distinctBy { it.id }
-            .filterNot { isHidden(it, settings.hiddenTerms) }
+            .filterNot { isHidden(it, hiddenTerms) }
             .map { if (settings.stripPrefixes) it.copy(name = displayName(it.name)) else it }
     }
     var channelsLoading by remember { mutableStateOf(false) }
@@ -123,11 +140,17 @@ fun CableApp(store: SettingsStore) {
     val xtream = remember(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass) {
         if (settings.hasXtream) XtreamClient(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass) else null
     }
+    val stalker = remember(settings.stalkerUrl, settings.stalkerMac) {
+        if (settings.hasStalker) StalkerClient(settings.stalkerUrl, settings.stalkerMac) else null
+    }
     val guide = remember { GuideData(scope) }
-    SideEffect { guide.epg = xtream }
+    SideEffect {
+        guide.epg = xtream
+        guide.stalker = stalker
+    }
 
     // Reload the channel list only when the live login changes. Hiding channels does not reload.
-    LaunchedEffect(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass, settings.m3uUrl, channelReload) {
+    LaunchedEffect(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass, settings.m3uUrl, settings.stalkerUrl, settings.stalkerMac, channelReload) {
         loadedChannels = emptyList()
         channelError = null
         if (!settings.hasLiveSource) return@LaunchedEffect
@@ -139,13 +162,13 @@ fun CableApp(store: SettingsStore) {
     }
 
     // The full schedule is downloaded now and then hourly: from the provider login, or the playlist's guide link.
-    LaunchedEffect(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass, settings.m3uUrl) {
+    LaunchedEffect(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass, settings.m3uUrl, settings.stalkerUrl) {
         val s = settings
         while (s.hasLiveSource) {
             withContext(Dispatchers.IO) {
                 runCatching {
-                    if (s.hasXtream) EpgCache.refresh(s.xtreamServer, s.xtreamUser, s.xtreamPass)
-                    else ChannelSource.guideUrl(s)?.let { EpgCache.refreshUrl(it) }
+                    val urls = ChannelSource.guideUrls(s)
+                    if (urls.isNotEmpty()) EpgCache.refreshAll(urls)
                 }
             }
             guide.scheduleUpdated()
@@ -184,7 +207,15 @@ fun CableApp(store: SettingsStore) {
     fun switchProfile(id: String) {
         profileStore.setActive(id)
         profileId = id
+        contentUnlocked = false
     }
+    LaunchedEffect(userState, settings.hiddenFilters) {
+        val raw = userState.hiddenFilters() ?: settings.hiddenFilters
+        hiddenTerms = raw.split(',').map { it.trim().uppercase() }.filter { it.isNotEmpty() }
+    }
+    var jfOverride by remember(profileId) { mutableStateOf(store.profileJellyfin(profileId)) }
+    val jellyfinToken = jfOverride?.first ?: settings.jellyfinToken
+    val jellyfinUserId = jfOverride?.second ?: settings.jellyfinUserId
 
     // ------------------------------------------------------------ Live player
     val live = remember { LivePlayer(context) }
@@ -194,15 +225,31 @@ fun CableApp(store: SettingsStore) {
     // The channel keeps playing behind Home and in the guide's preview. Elsewhere it stops, so a
     // provider that allows one stream at a time can play movies.
     val liveActive = settings.hasLiveSource && screen in setOf(Screen.Live, Screen.Home, Screen.Guide)
-    val playUrl = replayUrl ?: current?.streamUrl
-    LaunchedEffect(playUrl, liveActive) {
+    val channelLocked = current != null && isLocked(current.name, current.group, settings.lockedTerms, pinSet) && !contentUnlocked
+    LaunchedEffect(channelLocked, current?.id) {
+        if (channelLocked && pinPurpose == PinPurpose.NONE) {
+            pinError = null
+            pinPurpose = PinPurpose.CONTENT
+        }
+    }
+    val playUrl = if (channelLocked) null else replayUrl ?: current?.streamUrl
+    LaunchedEffect(playUrl, liveActive, current?.origin) {
         if (!liveActive || playUrl == null) {
             live.stop()
             return@LaunchedEffect
         }
         // A short wait means holding a key only loads the channel you stop on.
         delay(250)
-        live.play(playUrl, if (replayUrl == null) current?.fallbackStreamUrl else null)
+        val url = if (replayUrl == null && current?.origin == "stalker") {
+            val cmd = current.streamUrl
+            val portal = stalker
+            if (portal == null) null
+            else withContext(Dispatchers.IO) { runCatching { portal.resolveLink(cmd) }.getOrNull() }
+        } else {
+            playUrl
+        }
+        if (url == null) showToast("That channel did not start")
+        else live.play(url, if (replayUrl == null) current?.fallbackStreamUrl else null)
     }
     // Remember the channel on screen, so the next launch returns to it and it joins Recently watched.
     LaunchedEffect(current?.id, profileId) {
@@ -214,15 +261,26 @@ fun CableApp(store: SettingsStore) {
     }
     lateinit var open: (Screen) -> Unit
 
-    fun tuneToIndex(i: Int) {
-        if (channels.isEmpty()) return
-        val next = ((i % channels.size) + channels.size) % channels.size
+    fun applyTune(next: Int) {
         val nowId = channels.getOrNull(tuneIndex)?.id
         val nextId = channels[next].id
         if (restoredChannel && nowId != null && nowId != nextId) priorChannelId = nowId
         tuneIndex = next
         restoredChannel = true
         replayUrl = null
+    }
+
+    fun tuneToIndex(i: Int) {
+        if (channels.isEmpty()) return
+        val next = ((i % channels.size) + channels.size) % channels.size
+        val ch = channels[next]
+        if (isLocked(ch.name, ch.group, settings.lockedTerms, pinSet) && !contentUnlocked) {
+            afterUnlock = { applyTune(next) }
+            pinError = null
+            pinPurpose = PinPurpose.CONTENT
+            return
+        }
+        applyTune(next)
     }
 
     fun tuneTo(ch: LiveChannel) {
@@ -237,9 +295,26 @@ fun CableApp(store: SettingsStore) {
     }
 
     fun startReplay(ch: LiveChannel, program: Program) {
-        val client = xtream
-        if (client == null) {
+        if (!ch.catchup || ch.origin == "stalker") {
             showToast("${program.title} is not available to replay")
+            return
+        }
+        if (isLocked(ch.name, ch.group, settings.lockedTerms, pinSet) && !contentUnlocked) {
+            afterUnlock = { startReplay(ch, program) }
+            pinError = null
+            pinPurpose = PinPurpose.CONTENT
+            return
+        }
+        fun begin(url: String) {
+            if (channels.getOrNull(tuneIndex)?.id != ch.id) tuneTo(ch)
+            replayUrl = url
+            open(Screen.Live)
+            showToast("Playing ${program.title} from the start")
+        }
+        val client = xtream
+        if (ch.origin != "xtream" || client == null) {
+            val local = m3uCatchupUrl(ch.streamUrl, ch.catchupType, ch.catchupSource, program.start, program.end)
+            if (local == null) showToast("${program.title} is not available to replay") else begin(local)
             return
         }
         if (channels.getOrNull(tuneIndex)?.id != ch.id) tuneTo(ch)
@@ -258,6 +333,52 @@ fun CableApp(store: SettingsStore) {
         }
     }
 
+    fun remind(ch: LiveChannel, program: Program) {
+        val added = userState.toggleReminder(Reminder(ch.id, ch.name, program.title, program.start))
+        showToast(if (added) "Reminder set for ${program.title}" else "Reminder removed")
+    }
+
+    fun record(ch: LiveChannel, program: Program) {
+        if (isLocked(ch.name, ch.group, settings.lockedTerms, pinSet) && !contentUnlocked) {
+            afterUnlock = { record(ch, program) }
+            pinError = null
+            pinPurpose = PinPurpose.CONTENT
+            return
+        }
+        if (ch.origin == "stalker") {
+            showToast("Recording is not available for this portal")
+            return
+        }
+        if (RecordingService.isBusy()) {
+            showToast("A recording is already running")
+            return
+        }
+        val id = "${ch.id.hashCode()}-${program.start}"
+        val storeFiles = RecordingStore(context.filesDir)
+        fun startWith(url: String) {
+            val nowMs = System.currentTimeMillis()
+            if (program.start > nowMs + 20_000) {
+                storeFiles.addSchedule(ScheduledRecording(id, ch.id, ch.name, program.title, url, program.start, program.end))
+                showToast("Will record ${program.title}. Leave the app open until it starts. This uses another connection.")
+            } else {
+                RecordingService.start(context, id, url, program.title, ch.name, program.end)
+                showToast("Recording ${program.title}. This uses another connection.")
+            }
+        }
+        val client = xtream
+        if (ch.origin == "xtream" && client != null && ch.catchup) {
+            scope.launch {
+                val url = withContext(Dispatchers.IO) {
+                    runCatching { client.resolveTimeshiftUrl(ch.id, program.start, program.end) }.getOrNull()
+                } ?: ch.streamUrl
+                startWith(url)
+            }
+            return
+        }
+        val local = if (ch.catchup) m3uCatchupUrl(ch.streamUrl, ch.catchupType, ch.catchupSource, program.start, program.end) else null
+        startWith(local ?: ch.streamUrl)
+    }
+
     // ------------------------------------------------------------ Movies and shows
     var shelvesTick by remember { mutableIntStateOf(0) }
     var providerVod by remember { mutableStateOf<Pair<List<VodItem>, List<VodItem>>>(emptyList<VodItem>() to emptyList()) }
@@ -268,24 +389,37 @@ fun CableApp(store: SettingsStore) {
         providerError = null
         val xt = xtream ?: return@LaunchedEffect
         providerLoading = true
-        withContext(Dispatchers.IO) { runCatching { xt.vodMovies() to xt.vodSeries() } }
+        withContext(Dispatchers.IO) { runCatching { xt.vodMovies(1500) to xt.vodSeries(800) } }
             .onSuccess { providerVod = it }
             .onFailure { providerError = it.message ?: "Your provider did not answer" }
         providerLoading = false
     }
     var jellyfinShelves by remember { mutableStateOf<Pair<List<VodItem>, List<VodItem>>>(emptyList<VodItem>() to emptyList()) }
+    var jellyfinBrowse by remember { mutableStateOf<Pair<List<VodItem>, List<VodItem>>>(emptyList<VodItem>() to emptyList()) }
     var jellyfinError by remember { mutableStateOf<String?>(null) }
     var jellyfinLoading by remember { mutableStateOf(false) }
-    LaunchedEffect(settings.jellyfinServer, settings.jellyfinToken, settings.jellyfinUserId, shelvesTick) {
+    LaunchedEffect(settings.jellyfinServer, jellyfinToken, jellyfinUserId, shelvesTick) {
         jellyfinError = null
-        if (!settings.hasJellyfin) {
+        if (settings.jellyfinServer.isBlank() || jellyfinToken.isBlank() || jellyfinUserId.isBlank()) {
             jellyfinShelves = emptyList<VodItem>() to emptyList()
+            jellyfinBrowse = emptyList<VodItem>() to emptyList()
             return@LaunchedEffect
         }
-        val jf = JellyfinClient(settings.jellyfinServer, settings.jellyfinToken, settings.jellyfinUserId)
+        val jf = JellyfinClient(settings.jellyfinServer, jellyfinToken, jellyfinUserId)
         jellyfinLoading = true
-        withContext(Dispatchers.IO) { runCatching { jf.continueWatching() to jf.recentlyAdded() } }
-            .onSuccess { jellyfinShelves = it }
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val cont = jf.continueWatching()
+                val recent = jf.recentlyAdded(40)
+                val movies = runCatching { jf.browse("Movie") }.getOrDefault(emptyList())
+                val shows = runCatching { jf.browse("Series") }.getOrDefault(emptyList())
+                (cont to recent) to (movies to shows)
+            }
+        }
+            .onSuccess {
+                jellyfinShelves = it.first
+                jellyfinBrowse = it.second
+            }
             .onFailure { jellyfinError = it.message ?: "Jellyfin did not answer" }
         jellyfinLoading = false
     }
@@ -293,8 +427,8 @@ fun CableApp(store: SettingsStore) {
     val shelves = VodShelves(
         continueWatching = (localResume + jellyfinShelves.first).distinctBy { it.source + ":" + it.id },
         recent = jellyfinShelves.second,
-        movies = providerVod.first,
-        series = providerVod.second,
+        movies = (providerVod.first + jellyfinBrowse.first).distinctBy { it.source + ":" + it.id },
+        series = (providerVod.second + jellyfinBrowse.second).distinctBy { it.source + ":" + it.id },
         loading = providerLoading || jellyfinLoading,
         error = jellyfinError ?: providerError
     )
@@ -349,14 +483,34 @@ fun CableApp(store: SettingsStore) {
         }
     }
 
+    var dueReminder by remember { mutableStateOf<Reminder?>(null) }
+    var firedReminders by remember { mutableStateOf(setOf<String>()) }
+    val reminderStore by rememberUpdatedState(userState)
+    LaunchedEffect(profileId) {
+        firedReminders = emptySet()
+        while (true) {
+            dueReminder = dueReminders(reminderStore.reminders(), System.currentTimeMillis(), firedReminders).firstOrNull()
+            delay(15_000)
+        }
+    }
+    LaunchedEffect(Unit) {
+        val finished = mutableSetOf<String>()
+        while (true) {
+            val item = dueSchedule(RecordingStore(context.filesDir).schedule(), System.currentTimeMillis(), finished).firstOrNull()
+            if (item != null && !RecordingService.isBusy()) {
+                finished += item.id
+                RecordingService.start(context, item.id, item.url, item.title, item.channelName, item.end)
+                showToast("Recording ${item.title}")
+            }
+            delay(20_000)
+        }
+    }
+
     LaunchedEffect(Unit) { checkForUpdate(manual = false) }
 
     // ------------------------------------------------------------ Parental lock
-    var pinSet by remember { mutableStateOf(store.hasPin()) }
     var settingsUnlocked by remember { mutableStateOf(false) }
-    var pinPurpose by remember { mutableStateOf(PinPurpose.NONE) }
     var pinFirst by remember { mutableStateOf("") }
-    var pinError by remember { mutableStateOf<String?>(null) }
 
     // ------------------------------------------------------------ Navigation
     fun go(target: Screen) {
@@ -391,9 +545,14 @@ fun CableApp(store: SettingsStore) {
         scope.launch {
             var s = settings
             val problems = mutableListOf<String>()
-            val wantsLive = listOf("xs", "xu", "xp", "m3u").any { !fields[it].isNullOrBlank() }
+            val wantsLive = listOf("xs", "xu", "xp", "m3u", "su", "sm").any { !fields[it].isNullOrBlank() }
             if (wantsLive) {
-                runCatching { checkLiveLogin(s, fields["xs"].orEmpty(), fields["xu"].orEmpty(), fields["xp"].orEmpty(), fields["m3u"].orEmpty()) }
+                runCatching {
+                    checkLiveLogin(
+                        s, fields["xs"].orEmpty(), fields["xu"].orEmpty(), fields["xp"].orEmpty(), fields["m3u"].orEmpty(),
+                        fields["su"].orEmpty(), fields["sm"].orEmpty()
+                    )
+                }
                     .onSuccess { s = it }
                     .onFailure { problems += "Live TV: ${it.message}." }
             }
@@ -459,7 +618,9 @@ fun CableApp(store: SettingsStore) {
                     onGroupChange = { channelGroup = it },
                     loading = channelsLoading,
                     error = channelError,
-                    canReplay = xtream != null,
+                    canReplay = true,
+                    onMultiView = { go(Screen.Multi) },
+                    onRecord = { ch, program -> record(ch, program) },
                     replaying = replayUrl != null,
                     onTune = { tuneToIndex(it) },
                     onToggleFavorite = toggleFavorite,
@@ -494,9 +655,18 @@ fun CableApp(store: SettingsStore) {
                         go(Screen.Live)
                     },
                     onOpenVod = { item ->
-                        vodOrigin = Screen.Home
-                        pendingVod = item
-                        go(Screen.OnDemand)
+                        fun openItem() {
+                            vodOrigin = Screen.Home
+                            pendingVod = item
+                            go(Screen.OnDemand)
+                        }
+                        if (isLocked(item.name, item.category, settings.lockedTerms, pinSet) && !contentUnlocked) {
+                            afterUnlock = { openItem() }
+                            pinError = null
+                            pinPurpose = PinPurpose.CONTENT
+                        } else {
+                            openItem()
+                        }
                     },
                     onSetUp = {
                         settingsPane = SettingsPane.Live
@@ -518,13 +688,25 @@ fun CableApp(store: SettingsStore) {
                         go(Screen.Live)
                     },
                     onReplay = { ch, program -> startReplay(ch, program) },
+                    onRemind = { ch, program -> remind(ch, program) },
+                    onRecord = { ch, program -> record(ch, program) },
                     onToggleFavorite = toggleFavorite,
                     onPreviewBounds = { previewBounds = it },
                     showToast = showToast
                 )
+                Screen.Multi -> MultiViewScreen(
+                    channels = channels,
+                    start = index,
+                    onExit = { ch ->
+                        tuneTo(ch)
+                        go(Screen.Live)
+                    }
+                )
                 Screen.OnDemand -> OnDemandScreen(
                     nav = nav,
                     settings = settings,
+                    jellyfinToken = jellyfinToken,
+                    jellyfinUserId = jellyfinUserId,
                     shelves = shelves,
                     userState = userState,
                     pendingVod = pendingVod,
@@ -548,9 +730,18 @@ fun CableApp(store: SettingsStore) {
                     },
                     onOpenProgramme = { ch, program -> startReplay(ch, program) },
                     onOpenVod = { item ->
-                        vodOrigin = Screen.Search
-                        pendingVod = item
-                        go(Screen.OnDemand)
+                        fun openItem() {
+                            vodOrigin = Screen.Search
+                            pendingVod = item
+                            go(Screen.OnDemand)
+                        }
+                        if (isLocked(item.name, item.category, settings.lockedTerms, pinSet) && !contentUnlocked) {
+                            afterUnlock = { openItem() }
+                            pinError = null
+                            pinPurpose = PinPurpose.CONTENT
+                        } else {
+                            openItem()
+                        }
                     }
                 )
                 Screen.Settings -> SettingsScreen(
@@ -594,7 +785,35 @@ fun CableApp(store: SettingsStore) {
                         CrashLog.clear(context)
                         lastCrash = null
                     },
-                    showToast = showToast
+                    showToast = showToast,
+                    hiddenFilters = hiddenTerms.joinToString(","),
+                    onHiddenFilters = { value ->
+                        userState.setHiddenFilters(value)
+                        hiddenTerms = value.split(',').map { it.trim().uppercase() }.filter { it.isNotEmpty() }
+                    },
+                    onJellyfinSave = { updated ->
+                        if (updated.jellyfinToken.isBlank()) {
+                            store.clearProfileJellyfin(profileId)
+                            jfOverride = null
+                            if (profileId == ProfileStore.DEFAULT_ID) {
+                                store.save(updated)
+                                settings = updated
+                            }
+                        } else if (profileId == ProfileStore.DEFAULT_ID) {
+                            store.clearProfileJellyfin(profileId)
+                            jfOverride = null
+                            store.save(updated)
+                            settings = updated
+                        } else {
+                            if (settings.jellyfinServer != updated.jellyfinServer) {
+                                val serverOnly = settings.copy(jellyfinServer = updated.jellyfinServer)
+                                store.save(serverOnly)
+                                settings = serverOnly
+                            }
+                            store.saveProfileJellyfin(profileId, updated.jellyfinToken, updated.jellyfinUserId)
+                            jfOverride = updated.jellyfinToken to updated.jellyfinUserId
+                        }
+                    }
                 )
             }
         }
@@ -662,6 +881,25 @@ fun CableApp(store: SettingsStore) {
                     },
                     onCancel = { pinPurpose = PinPurpose.NONE }
                 )
+                PinPurpose.CONTENT -> PinPad(
+                    title = "Enter your PIN",
+                    subtitle = pinError ?: "This is locked.",
+                    onComplete = { entered ->
+                        if (store.checkPin(entered)) {
+                            contentUnlocked = true
+                            pinPurpose = PinPurpose.NONE
+                            val next = afterUnlock
+                            afterUnlock = null
+                            next?.invoke()
+                        } else {
+                            pinError = "That PIN did not match. Try again."
+                        }
+                    },
+                    onCancel = {
+                        pinPurpose = PinPurpose.NONE
+                        afterUnlock = null
+                    }
+                )
                 PinPurpose.REMOVE -> PinPad(
                     title = "Turn off the lock",
                     subtitle = pinError ?: "Enter the current PIN.",
@@ -677,6 +915,31 @@ fun CableApp(store: SettingsStore) {
                     },
                     onCancel = { pinPurpose = PinPurpose.NONE }
                 )
+            }
+        }
+
+        dueReminder?.let { reminder ->
+            Column(
+                Modifier.align(Alignment.TopCenter).padding(top = 24.dp).zIndex(5f)
+                    .clip(RoundedCornerShape(16.dp)).background(Tv.Surface3).padding(18.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text("${reminder.title} is starting on ${reminder.channelName}", style = TvType.BodyStrong)
+                Spacer(Modifier.height(10.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    PillButton("Watch", {
+                        firedReminders = firedReminders + reminderKey(reminder)
+                        dueReminder = null
+                        channels.firstOrNull { it.id == reminder.channelId }?.let { ch ->
+                            tuneTo(ch)
+                            go(Screen.Live)
+                        }
+                    })
+                    PillButton("Dismiss", {
+                        firedReminders = firedReminders + reminderKey(reminder)
+                        dueReminder = null
+                    })
+                }
             }
         }
 

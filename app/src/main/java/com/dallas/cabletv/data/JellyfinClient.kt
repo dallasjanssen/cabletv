@@ -93,7 +93,8 @@ class JellyfinClient(server: String, private val token: String, private val user
                 episode = if (type == "Episode") o.optInt("IndexNumber", 0).takeIf { it > 0 } else null,
                 seriesName = o.optString("SeriesName").takeIf { it.isNotBlank() },
                 runtimeMinutes = (o.optLong("RunTimeTicks", 0L) / 600_000_000L).toInt().takeIf { it > 0 },
-                progress = userData?.optDouble("PlayedPercentage", 0.0)?.takeIf { it > 0.0 }?.let { (it / 100.0).toFloat() }
+                progress = userData?.optDouble("PlayedPercentage", 0.0)?.takeIf { it > 0.0 }?.let { (it / 100.0).toFloat() },
+                category = o.optJSONArray("Genres")?.optString(0)?.takeIf { it.isNotBlank() }.orEmpty()
             )
         }
 
@@ -101,13 +102,13 @@ class JellyfinClient(server: String, private val token: String, private val user
         mapItems(
             getJson(
                 "/Users/$userId/Items?IncludeItemTypes=Movie,Series&Recursive=true" +
-                    "&SortBy=DateCreated&SortOrder=Descending&Limit=$limit&Fields=Overview"
+                    "&SortBy=DateCreated&SortOrder=Descending&Limit=$limit&Fields=Overview,Genres"
             ).getJSONArray("Items")
         )
 
     fun continueWatching(limit: Int = 20): List<VodItem> =
         mapItems(
-            getJson("/Users/$userId/Items/Resume?Limit=$limit&MediaTypes=Video&Fields=Overview")
+            getJson("/Users/$userId/Items/Resume?Limit=$limit&MediaTypes=Video&Fields=Overview,Genres")
                 .getJSONArray("Items")
         )
 
@@ -117,10 +118,19 @@ class JellyfinClient(server: String, private val token: String, private val user
         return mapItems(
             getJson(
                 "/Users/$userId/Items?searchTerm=$encoded&IncludeItemTypes=Movie,Series" +
-                    "&Recursive=true&Limit=$limit&Fields=Overview"
+                    "&Recursive=true&Limit=$limit&Fields=Overview,Genres"
             ).getJSONArray("Items")
         )
     }
+
+    /** A browsable slice of the library, grouped later by [VodItem.category]. */
+    fun browse(type: String, limit: Int = 400): List<VodItem> =
+        mapItems(
+            getJson(
+                "/Users/$userId/Items?IncludeItemTypes=$type&Recursive=true" +
+                    "&SortBy=SortName&SortOrder=Ascending&Limit=$limit&Fields=Overview,Genres"
+            ).getJSONArray("Items")
+        )
 
     fun episodes(seriesId: String): List<VodItem> =
         mapItems(

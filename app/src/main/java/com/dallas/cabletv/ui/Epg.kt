@@ -8,6 +8,7 @@ import com.dallas.cabletv.data.EpgCache
 import com.dallas.cabletv.data.LiveChannel
 import com.dallas.cabletv.data.NowNext
 import com.dallas.cabletv.data.Program
+import com.dallas.cabletv.data.StalkerClient
 import com.dallas.cabletv.data.XtreamClient
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -23,6 +24,7 @@ import kotlinx.coroutines.withContext
  */
 class GuideData(private val scope: CoroutineScope) {
     var epg: XtreamClient? = null
+    var stalker: StalkerClient? = null
         set(value) {
             if (field != value) {
                 field = value
@@ -75,11 +77,18 @@ class GuideData(private val scope: CoroutineScope) {
     }
 
     private fun request(ch: LiveChannel) {
-        val client = epg ?: return
+        val xtream = epg
+        val portal = stalker
+        if (ch.origin != "stalker" && xtream == null) return
+        if (ch.origin == "stalker" && portal == null) return
         if (!pending.add(ch.id)) return
         scope.launch {
             val result = withContext(Dispatchers.IO) {
-                gate.withPermit { runCatching { client.nowNext(ch.id) }.getOrNull() }
+                gate.withPermit {
+                    runCatching {
+                        if (ch.origin == "stalker") portal!!.shortEpg(ch.id) else xtream!!.nowNext(ch.id)
+                    }.getOrNull()
+                }
             }
             pending.remove(ch.id)
             // A failed lookup is remembered as empty, so it is retried later instead of on every redraw.

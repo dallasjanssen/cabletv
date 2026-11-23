@@ -117,10 +117,10 @@ fun WelcomeScreen(
     onUseRemote: () -> Unit
 ) {
     val (code, problem, open) = rememberPhoneSignIn(autoStart = true, onReceived = onReceived)
-    val remoteButton = remember { FocusRequester() }
+    val codeButton = remember { FocusRequester() }
     LaunchedEffect(Unit) {
         withFrameNanos { }
-        runCatching { remoteButton.requestFocus() }
+        runCatching { codeButton.requestFocus() }
     }
     BoxWithConstraints(
         Modifier.fillMaxSize().background(Brush.radialGradient(listOf(Color(0xFF1A2130), Tv.Bg), radius = 1400f, center = androidx.compose.ui.geometry.Offset(Float.POSITIVE_INFINITY, 0f)))
@@ -148,8 +148,8 @@ fun WelcomeScreen(
                 Spacer(Modifier.height(4.dp))
                 if (message != null) Text(message, style = TvType.SmallStrong, color = if (busy) Tv.Ink2 else Tv.Accent)
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    PillButton("Use the remote instead", onUseRemote, modifier = Modifier.focusRequester(remoteButton))
-                    if (code == null && !busy) PillButton("Show a new code", open, icon = TvIcons.Phone)
+                    PillButton("New code", open, icon = TvIcons.Phone, modifier = Modifier.focusRequester(codeButton))
+                    PillButton("Use the remote instead", onUseRemote)
                 }
             }
         }
