@@ -79,9 +79,14 @@ private class Tile(context: Context) {
     private fun load(target: String) {
         url = target
         failed = false
-        exo.setMediaItem(MediaItem.fromUri(target))
-        exo.prepare()
-        exo.playWhenReady = true
+        runCatching {
+            exo.setMediaItem(MediaItem.fromUri(target))
+            exo.prepare()
+            exo.playWhenReady = true
+        }.onFailure {
+            buffering = false
+            failed = true
+        }
     }
 
     /** Lets go of the provider connection. */

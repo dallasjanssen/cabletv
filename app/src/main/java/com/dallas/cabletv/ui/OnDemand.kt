@@ -719,13 +719,19 @@ private fun VodPlayer(
     LaunchedEffect(item.streamUrl) {
         failed = false
         val start = if (startOver) 0L else store.resumePosition(item)
-        player.trackSelectionParameters = player.trackSelectionParameters.buildUpon().clearOverrides().build()
-        player.setMediaItem(MediaItem.fromUri(item.streamUrl), start)
-        player.prepare()
-        // A title that starts while the app is in the background waits, paused.
-        player.playWhenReady = lifecycle?.currentState?.isAtLeast(Lifecycle.State.STARTED) != false
-        controls = true
-        lastKey = System.currentTimeMillis()
+        val started = runCatching {
+            player.trackSelectionParameters = player.trackSelectionParameters.buildUpon().clearOverrides().build()
+            player.setMediaItem(MediaItem.fromUri(item.streamUrl), start)
+            player.prepare()
+            // A title that starts while the app is in the background waits, paused.
+            player.playWhenReady = lifecycle?.currentState?.isAtLeast(Lifecycle.State.STARTED) != false
+            controls = true
+            lastKey = System.currentTimeMillis()
+        }.isSuccess
+        if (!started) {
+            failed = true
+            return@LaunchedEffect
+        }
         jellyfin?.let { c -> withContext(Dispatchers.IO) { runCatching { c.reportStart(item.id, start) } } }
     }
 

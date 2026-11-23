@@ -35,7 +35,7 @@ fun newPlayer(context: Context, compact: Boolean = false): ExoPlayer {
         DefaultLoadControl.Builder()
             .setBufferDurationsMs(15_000, LIVE_BUFFER_MS, 1_500, 3_000)
             .setBackBuffer(LIVE_BUFFER_MS, true)
-            .setTargetBufferBytes(100 * 1024 * 1024)
+            .setTargetBufferBytes(64 * 1024 * 1024)
             .setPrioritizeTimeOverSizeThresholds(true)
             .build()
     }
@@ -43,13 +43,27 @@ fun newPlayer(context: Context, compact: Boolean = false): ExoPlayer {
         .setUsage(C.USAGE_MEDIA)
         .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
         .build()
-    return ExoPlayer.Builder(context)
-        .setLoadControl(load)
-        .setMediaSourceFactory(DefaultMediaSourceFactory(http))
-        .setAudioAttributes(audio, !compact)
-        .setHandleAudioBecomingNoisy(true)
-        .build()
-        .also { TrackMemory.apply(context, it) }
+    fun build(loadControl: DefaultLoadControl): ExoPlayer =
+        ExoPlayer.Builder(context)
+            .setLoadControl(loadControl)
+            .setMediaSourceFactory(DefaultMediaSourceFactory(http))
+            .setAudioAttributes(audio, !compact)
+            .setHandleAudioBecomingNoisy(true)
+            .build()
+            .also { TrackMemory.apply(context, it) }
+
+    return runCatching { build(load) }.getOrElse { first ->
+        // Some devices fail to create codec state under pressure. Retry once with a lighter buffer.
+        val fallbackLoad = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(8_000, 20_000, 1_500, 3_000)
+            .setBackBuffer(0, false)
+            .setTargetBufferBytes(24 * 1024 * 1024)
+            .build()
+        runCatching {
+            System.gc()
+            build(fallbackLoad)
+        }.getOrElse { throw first }
+    }
 }
 
 /**
