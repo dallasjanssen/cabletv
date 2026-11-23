@@ -1,8 +1,9 @@
 name: Android build
 
+# Builds only run for pushes to main. Use "Run workflow" on the Actions tab to build another branch by hand.
 on:
   push:
-  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
