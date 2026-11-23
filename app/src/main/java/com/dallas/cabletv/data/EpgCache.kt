@@ -4,6 +4,15 @@ import android.util.Xml
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.xmlpull.v1.XmlPullParser
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
+import java.io.DataInput
+import java.io.DataInputStream
+import java.io.DataOutput
+import java.io.DataOutputStream
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.io.InputStream
 import java.net.URLEncoder
 import java.time.DateTimeException
@@ -14,6 +23,7 @@ import java.util.Locale
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.GZIPInputStream
+import java.util.zip.GZIPOutputStream
 
 /**
  * The full programme schedule from an XMLTV feed. The feed comes from the Xtream
@@ -98,6 +108,49 @@ object EpgCache {
             val body = resp.body ?: error("Empty XMLTV response")
             load(body.byteStream())
         }
+    }
+
+    /**
+     * Writes the listings in memory to [file], so the next start can show them before it downloads.
+     * [key] says which logins they came from (see [guideCacheKey]). The copy is written to a temp
+     * file first, so a write that is cut off never replaces a good copy.
+     */
+    fun saveTo(file: File, key: String) {
+        val (saved, names) = synchronized(lock) { programs to aliases }
+        if (saved.isEmpty()) return
+        val dir = file.parentFile ?: return
+        dir.mkdirs()
+        val tmp = File(dir, file.name + ".tmp")
+        DataOutputStream(BufferedOutputStream(GZIPOutputStream(FileOutputStream(tmp)), 64 * 1024)).use { out ->
+            writeSavedGuide(out, key, System.currentTimeMillis(), saved, names)
+        }
+        if (!tmp.renameTo(file)) {
+            file.delete()
+            if (!tmp.renameTo(file)) tmp.delete()
+        }
+    }
+
+    /**
+     * Loads listings saved by [saveTo] for the same [key]. Nothing changes when listings are already
+     * in memory, or the file is missing, damaged, or was saved for other logins. Returns when the
+     * copy was saved, or null when nothing was loaded.
+     */
+    fun restoreFrom(file: File, key: String): Long? {
+        if (!file.exists()) return null
+        val saved = try {
+            DataInputStream(BufferedInputStream(GZIPInputStream(FileInputStream(file)), 64 * 1024)).use {
+                readSavedGuide(it, key, System.currentTimeMillis())
+            }
+        } catch (e: Exception) {
+            null
+        } ?: return null
+        if (saved.programs.isEmpty()) return null
+        synchronized(lock) {
+            if (programs.isNotEmpty()) return null
+            programs = saved.programs
+            aliases = saved.aliases
+        }
+        return saved.savedAt
     }
 
     /** Reads an XMLTV feed and replaces the cache with it. */
@@ -337,6 +390,91 @@ internal fun mergeSchedules(feeds: List<Map<String, List<Program>>>): Map<String
         for ((id, list) in feed) merged.getOrPut(id) { mutableListOf() }.addAll(list)
     }
     return merged.mapValues { (_, list) -> dedupeByStart(list) }
+}
+
+/** Bumped when the saved format changes, so an older file is ignored instead of misread. */
+private const val SAVED_GUIDE_VERSION = 1
+/** writeUTF takes at most 65535 bytes, and a character can take three. */
+private const val MAX_SAVED_CHARS = 20_000
+
+/** Listings read back from the device. */
+internal class SavedGuide(val savedAt: Long, val programs: Map<String, List<Program>>, val aliases: Map<String, String>)
+
+/**
+ * Which logins and guide links a saved copy belongs to. A hash, so the file never holds the links,
+ * which can carry the Xtream password.
+ */
+fun guideCacheKey(s: Settings): String {
+    val text = listOf(s.xtreamServer, s.xtreamUser, s.xtreamPass, s.m3uUrl, s.epgUrl).joinToString("\u0000")
+    val digest = java.security.MessageDigest.getInstance("SHA-256").digest(text.toByteArray(Charsets.UTF_8))
+    return digest.joinToString("") { String.format(Locale.US, "%02x", it) }
+}
+
+private fun savedText(s: String): String = if (s.length > MAX_SAVED_CHARS) s.take(MAX_SAVED_CHARS) else s
+
+internal fun writeSavedGuide(
+    out: DataOutput,
+    key: String,
+    savedAt: Long,
+    programs: Map<String, List<Program>>,
+    aliases: Map<String, String>
+) {
+    out.writeInt(SAVED_GUIDE_VERSION)
+    out.writeUTF(key)
+    out.writeLong(savedAt)
+    out.writeInt(programs.size)
+    for ((id, list) in programs) {
+        out.writeUTF(savedText(id))
+        out.writeInt(list.size)
+        for (p in list) {
+            out.writeUTF(savedText(p.title))
+            out.writeLong(p.start)
+            out.writeLong(p.end)
+            out.writeUTF(savedText(p.desc))
+        }
+    }
+    out.writeInt(aliases.size)
+    for ((name, id) in aliases) {
+        out.writeUTF(savedText(name))
+        out.writeUTF(savedText(id))
+    }
+}
+
+/**
+ * Reads a copy written by [writeSavedGuide]. Null when it is another format or was saved for other
+ * logins. Programmes that ended before the guide's window are dropped.
+ */
+internal fun readSavedGuide(input: DataInput, key: String, nowMs: Long): SavedGuide? {
+    if (input.readInt() != SAVED_GUIDE_VERSION) return null
+    if (input.readUTF() != key) return null
+    val savedAt = input.readLong()
+    val from = nowMs - EpgCache.BEHIND_MS
+    val channels = input.readInt()
+    if (channels < 0) return null
+    val programs = HashMap<String, List<Program>>(minOf(channels, 20_000) * 2)
+    repeat(channels) {
+        val id = input.readUTF()
+        val count = input.readInt()
+        if (count < 0) return null
+        val list = ArrayList<Program>(minOf(count, 2_000))
+        repeat(count) {
+            val title = input.readUTF()
+            val start = input.readLong()
+            val end = input.readLong()
+            val desc = input.readUTF()
+            if (end > from && end > start) list += Program(title, start, end, desc)
+        }
+        if (list.isNotEmpty()) programs[id] = list
+    }
+    val aliasCount = input.readInt()
+    if (aliasCount < 0) return null
+    val aliases = HashMap<String, String>(minOf(aliasCount, 20_000) * 2)
+    repeat(aliasCount) {
+        val name = input.readUTF()
+        val id = input.readUTF()
+        if (id in programs) aliases[name] = id
+    }
+    return SavedGuide(savedAt, programs, aliases)
 }
 
 internal data class ParsedGuide(

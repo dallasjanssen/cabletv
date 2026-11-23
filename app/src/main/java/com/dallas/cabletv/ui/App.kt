@@ -43,6 +43,7 @@ import com.dallas.cabletv.data.CrashLog
 import com.dallas.cabletv.data.EpgCache
 import com.dallas.cabletv.data.epgAddresses
 import com.dallas.cabletv.data.friendlyError
+import com.dallas.cabletv.data.guideCacheKey
 import com.dallas.cabletv.data.guideRefreshMessage
 import com.dallas.cabletv.data.JellyfinClient
 import com.dallas.cabletv.data.LiveChannel
@@ -73,6 +74,9 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import kotlin.math.roundToInt
+
+/** How often the guide is downloaded again while the app is open. */
+private const val GUIDE_REFRESH_MS = 60 * 60 * 1000L
 
 enum class Screen { Live, Home, Guide, OnDemand, Search, Settings, Welcome, Multi }
 
@@ -206,7 +210,9 @@ fun CableApp(store: SettingsStore) {
         channelsLoading = false
     }
 
-    // The full schedule is downloaded now, again when asked, and then hourly.
+    // The full schedule is downloaded now, again when asked, and then hourly. A copy is kept on the
+    // device, so the next start shows listings straight away.
+    val guideFile = remember { File(context.cacheDir, "guide/listings.bin") }
     var guideReload by remember { mutableIntStateOf(0) }
     var guideReloadSeen by remember { mutableIntStateOf(0) }
     var guideRefreshing by remember { mutableStateOf(false) }
@@ -225,7 +231,20 @@ fun CableApp(store: SettingsStore) {
         var announced = false
         if (!s.hasLiveSource) {
             guideRefreshing = false
+            // No live login, so the saved listings belong to nobody.
+            withContext(Dispatchers.IO) { runCatching { guideFile.delete() } }
             return@LaunchedEffect
+        }
+        val key = guideCacheKey(s)
+        // The saved copy shows straight away. When it is less than an hour old, the next download
+        // waits until it is an hour old, as if the app had stayed open.
+        if (!manual) {
+            val savedAt = withContext(Dispatchers.IO) { runCatching { EpgCache.restoreFrom(guideFile, key) }.getOrNull() }
+            if (savedAt != null) {
+                guide.scheduleUpdated()
+                val age = System.currentTimeMillis() - savedAt
+                if (age in 0 until GUIDE_REFRESH_MS) delay(GUIDE_REFRESH_MS - age)
+            }
         }
         while (s.hasLiveSource) {
             guideRefreshing = true
@@ -233,6 +252,8 @@ fun CableApp(store: SettingsStore) {
                 runCatching {
                     val urls = ChannelSource.guideUrls(s)
                     val failed = if (urls.isEmpty()) emptyList() else EpgCache.refreshAll(urls)
+                    // Saved only when at least one guide loaded in full, so an old copy never looks new.
+                    if (failed.size < urls.size) runCatching { EpgCache.saveTo(guideFile, key) }
                     urls.size to failed
                 }
             }
@@ -256,7 +277,7 @@ fun CableApp(store: SettingsStore) {
                 }
             }
             manual = false
-            delay(60 * 60 * 1000L)
+            delay(GUIDE_REFRESH_MS)
         }
     }
 
