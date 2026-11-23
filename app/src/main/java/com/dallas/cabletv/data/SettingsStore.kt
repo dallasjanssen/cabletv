@@ -132,12 +132,47 @@ class SettingsStore(context: Context) {
         return stored.substringAfter(':') == hash(saltHex, pin)
     }
 
+    /** Plain values from secure preferences, used to export a full device backup. */
+    fun backupEntries(): Map<String, Any> =
+        prefs.all.mapNotNull { (key, value) ->
+            if (key.startsWith(RESERVED_PREFIX)) return@mapNotNull null
+            when (value) {
+                is String, is Boolean, is Int, is Long, is Float -> key to value
+                is Set<*> -> {
+                    @Suppress("UNCHECKED_CAST")
+                    val clean = (value as? Set<String>) ?: return@mapNotNull null
+                    key to clean
+                }
+                else -> null
+            }
+        }.toMap()
+
+    /** Replaces secure preferences from a backup. */
+    fun restoreEntries(values: Map<String, Any>) {
+        val edit = prefs.edit().clear()
+        values.forEach { (key, value) ->
+            if (key.startsWith(RESERVED_PREFIX)) return@forEach
+            when (value) {
+                is String -> edit.putString(key, value)
+                is Boolean -> edit.putBoolean(key, value)
+                is Int -> edit.putInt(key, value)
+                is Long -> edit.putLong(key, value)
+                is Float -> edit.putFloat(key, value)
+                is Set<*> -> {
+                    @Suppress("UNCHECKED_CAST")
+                    edit.putStringSet(key, value as? Set<String>)
+                }
+            }
+        }
+        edit.apply()
+    }
+
     private fun hash(saltHex: String, pin: String): String {
         val digest = MessageDigest.getInstance("SHA-256").digest((saltHex + pin).toByteArray(Charsets.UTF_8))
         return digest.joinToString("") { "%02x".format(it) }
     }
 
-    private companion object {
+    companion object {
         const val PREFS_NAME = "cabletv_secure_prefs"
         const val K_LAST_CHANNEL = "last_channel_id"
         const val K_XS = "xtream_server"
@@ -155,6 +190,7 @@ class SettingsStore(context: Context) {
         const val K_STALKER_MAC = "stalker_mac"
         const val K_EXPIRY = "subscription_expiry"
         const val K_PIN = "parental_pin"
+        private const val RESERVED_PREFIX = "__androidx_security_crypto_"
 
         private fun jfTokenKey(profileId: String) = "jf_token_$profileId"
         private fun lastChannelKey(profileId: String) = "last_channel_$profileId"

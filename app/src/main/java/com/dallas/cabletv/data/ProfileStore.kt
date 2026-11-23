@@ -14,7 +14,7 @@ data class Profile(val id: String, val name: String)
 class ProfileStore(context: Context) {
 
     private val appContext = context.applicationContext
-    private val prefs = context.getSharedPreferences("cabletv_profiles", Context.MODE_PRIVATE)
+    private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
     fun profiles(): List<Profile> {
         return try {
@@ -57,6 +57,39 @@ class ProfileStore(context: Context) {
         runCatching { appContext.deleteSharedPreferences(userStatePrefsName(id)) }
     }
 
+    /** Plain values from profile preferences, used for backup and restore. */
+    fun backupEntries(): Map<String, Any> =
+        prefs.all.mapNotNull { (key, value) ->
+            when (value) {
+                is String, is Boolean, is Int, is Long, is Float -> key to value
+                is Set<*> -> {
+                    @Suppress("UNCHECKED_CAST")
+                    val clean = (value as? Set<String>) ?: return@mapNotNull null
+                    key to clean
+                }
+                else -> null
+            }
+        }.toMap()
+
+    /** Replaces profile preferences from a backup. */
+    fun restoreEntries(values: Map<String, Any>) {
+        val edit = prefs.edit().clear()
+        values.forEach { (key, value) ->
+            when (value) {
+                is String -> edit.putString(key, value)
+                is Boolean -> edit.putBoolean(key, value)
+                is Int -> edit.putInt(key, value)
+                is Long -> edit.putLong(key, value)
+                is Float -> edit.putFloat(key, value)
+                is Set<*> -> {
+                    @Suppress("UNCHECKED_CAST")
+                    edit.putStringSet(key, value as? Set<String>)
+                }
+            }
+        }
+        edit.apply()
+    }
+
     private fun save(list: List<Profile>) {
         val arr = JSONArray()
         list.forEach { p -> arr.put(JSONObject().put("id", p.id).put("name", p.name)) }
@@ -68,6 +101,7 @@ class ProfileStore(context: Context) {
 
     companion object {
         const val DEFAULT_ID = "default"
+        const val PREFS_NAME = "cabletv_profiles"
         private const val K_LIST = "profile_list"
         private const val K_ACTIVE = "active_profile"
     }

@@ -38,6 +38,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import com.dallas.cabletv.BuildConfig
 import com.dallas.cabletv.data.AppUpdater
+import com.dallas.cabletv.data.BackupStore
 import com.dallas.cabletv.data.ChannelSource
 import com.dallas.cabletv.data.CrashLog
 import com.dallas.cabletv.data.EpgCache
@@ -99,6 +100,7 @@ fun CableApp(store: SettingsStore) {
 
     // ------------------------------------------------------------ Profiles
     val profileStore = remember { ProfileStore(context) }
+    val backupStore = remember { BackupStore(context, store, profileStore) }
     var profiles by remember { mutableStateOf(profileStore.profiles()) }
     var profileId by remember { mutableStateOf(profileStore.active()) }
 
@@ -1112,6 +1114,8 @@ fun CableApp(store: SettingsStore) {
                             jfOverride = merged.jellyfinToken to merged.jellyfinUserId
                         }
                     },
+                    onBackupExport = { uri -> backupStore.writeBackup(uri) },
+                    onBackupRestore = { uri -> backupStore.restoreBackup(uri) },
                     vodCategories = vodCategories,
                     jellyfinSignedIn = jellyfinSignedIn
                 )

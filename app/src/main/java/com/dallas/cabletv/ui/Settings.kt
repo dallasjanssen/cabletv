@@ -1,6 +1,10 @@
 package com.dallas.cabletv.ui
 
+import android.app.Activity
+import android.net.Uri
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.layout.*
@@ -57,6 +61,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 
 enum class SettingsPane(val label: String, val icon: ImageVector) {
     Phone("Set up with your phone", TvIcons.Phone),
@@ -66,6 +73,7 @@ enum class SettingsPane(val label: String, val icon: ImageVector) {
     Profiles("Profiles", TvIcons.People),
     Lock("Parental lock", TvIcons.Lock),
     Recordings("Recordings", TvIcons.Download),
+    Backup("Backup & restore", TvIcons.Download),
     Updates("Updates", TvIcons.Download)
 }
 
@@ -203,11 +211,14 @@ fun SettingsScreen(
     hiddenFilters: String,
     onHiddenFilters: (String) -> Unit,
     onJellyfinSave: (Settings) -> Unit,
+    onBackupExport: suspend (Uri) -> Unit,
+    onBackupRestore: suspend (Uri) -> Unit,
     guideRefreshing: Boolean,
     onRefreshGuide: () -> Unit,
     vodCategories: List<String> = emptyList(),
     jellyfinSignedIn: Boolean = settings.hasJellyfin
 ) {
+    val context = LocalContext.current
     var pane by rememberSaveable { mutableStateOf(startPane) }
     var narrowOpen by rememberSaveable { mutableStateOf(false) }
     val drafts = remember { Drafts(settings) }
@@ -217,13 +228,16 @@ fun SettingsScreen(
     var libraryBusy by remember { mutableStateOf(false) }
     var libraryMessage by remember { mutableStateOf<String?>(null) }
     var phoneMessage by remember { mutableStateOf<String?>(null) }
+    var backupBusy by remember { mutableStateOf(false) }
+    var backupMessage by remember { mutableStateOf<String?>(null) }
+    var suppressUnsavedNotice by remember { mutableStateOf(false) }
     val latest by rememberUpdatedState(settings)
     val latestToast by rememberUpdatedState(showToast)
 
     // Leaving Settings with typed changes that were never saved says so, instead of losing them quietly.
     DisposableEffect(Unit) {
         onDispose {
-            if (drafts.unsaved(latest)) latestToast("Changes in Settings were not saved.")
+            if (!suppressUnsavedNotice && drafts.unsaved(latest)) latestToast("Changes in Settings were not saved.")
         }
     }
 
@@ -316,6 +330,53 @@ fun SettingsScreen(
         }
     }
 
+    fun backupName(): String {
+        val stamp = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss")
+            .withZone(ZoneId.systemDefault())
+            .format(Instant.now())
+        return "cabletv-backup-$stamp.json"
+    }
+
+    val createBackup = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
+        if (uri == null) {
+            backupMessage = "Backup cancelled."
+            return@rememberLauncherForActivityResult
+        }
+        scope.launch {
+            backupBusy = true
+            backupMessage = "Saving backup"
+            val result = withContext(Dispatchers.IO) { runCatching { onBackupExport(uri) } }
+            backupBusy = false
+            backupMessage = result.fold(
+                onSuccess = { "Backup saved." },
+                onFailure = { "Backup failed. ${(it.message ?: "Try another file location").trimEnd('.')}." }
+            )
+        }
+    }
+
+    val restoreBackup = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri == null) {
+            backupMessage = "Restore cancelled."
+            return@rememberLauncherForActivityResult
+        }
+        scope.launch {
+            backupBusy = true
+            backupMessage = "Restoring backup"
+            suppressUnsavedNotice = true
+            val result = withContext(Dispatchers.IO) { runCatching { onBackupRestore(uri) } }
+            backupBusy = false
+            result
+                .onSuccess {
+                    backupMessage = "Backup restored. Reopening the app."
+                    (context as? Activity)?.recreate()
+                }
+                .onFailure {
+                    suppressUnsavedNotice = false
+                    backupMessage = "Restore failed. ${(it.message ?: "Try another backup file").trimEnd('.')}."
+                }
+        }
+    }
+
     val listRequesters = remember { SettingsPane.entries.associateWith { FocusRequester() } }
     val focusManager = LocalFocusManager.current
     LaunchedEffect(Unit) {
@@ -346,6 +407,12 @@ fun SettingsScreen(
                 SettingsPane.Profiles -> ProfilesPane(profiles, activeProfileId, onSwitchProfile, onAddProfile, onRemoveProfile, showToast)
                 SettingsPane.Lock -> LockPane(pinSet, onSetPin, onRemovePin, settings, allChannels, vodCategories, onSave)
                 SettingsPane.Recordings -> RecordingsPane(listRequesters.getValue(SettingsPane.Recordings))
+                SettingsPane.Backup -> BackupPane(
+                    busy = backupBusy,
+                    message = backupMessage,
+                    onBackup = { if (!backupBusy) createBackup.launch(backupName()) },
+                    onRestore = { if (!backupBusy) restoreBackup.launch(arrayOf("application/json", "text/plain", "*/*")) }
+                )
                 SettingsPane.Updates -> UpdatesPane(update, updateMessage, updateBusy, onCheckUpdate, onInstallUpdate, lastCrash, onClearCrash)
             }
         }
@@ -719,6 +786,31 @@ private fun LockPane(
             }
         }
     }
+}
+
+@Composable
+private fun BackupPane(
+    busy: Boolean,
+    message: String?,
+    onBackup: () -> Unit,
+    onRestore: () -> Unit
+) {
+    PaneTitle(
+        "Backup & restore",
+        "Save all settings to a file and bring them back later, including logins, profiles, favorites and resume points."
+    )
+    Text(
+        "Keep backups private. They include login details and access tokens.",
+        style = TvType.Small,
+        color = Tv.Ink2,
+        modifier = Modifier.widthIn(max = 560.dp)
+    )
+    Spacer(Modifier.height(14.dp))
+    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        PillButton(if (busy) "Working" else "Backup now", onBackup, icon = TvIcons.Download, enabled = !busy)
+        PillButton(if (busy) "Working" else "Restore backup", onRestore, icon = TvIcons.Check, enabled = !busy)
+    }
+    Message(message)
 }
 
 @Composable
