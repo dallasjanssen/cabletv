@@ -3,30 +3,41 @@ package com.dallas.cabletv.data
 import android.util.Base64
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import org.json.JSONArray
 import org.json.JSONObject
-import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
 /**
- * Talks to an Xtream Codes style IPTV panel using its JSON API.
- * Channels, categories and the short guide all come from player_api.php.
+ * Talks to an Xtream Codes style IPTV panel.
+ * Account info decides the live format, the catch-up clock, and whether the login is still valid.
  */
-class XtreamClient(server: String, private val user: String, private val pass: String) {
+class XtreamClient(server: String, user: String, pass: String) {
 
-    private val base = server.trim().trimEnd('/')
+    private val base = normalizeXtreamServerUrl(server)
+    private val user = user.trim()
+    private val pass = pass.trim()
 
     private val http = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
         .build()
 
-    private fun enc(value: String): String = URLEncoder.encode(value, "UTF-8")
+    private val probeHttp = http.newBuilder()
+        .connectTimeout(8, TimeUnit.SECONDS)
+        .readTimeout(8, TimeUnit.SECONDS)
+        .build()
+
+    private val portalLock = Any()
+    private var portalCache: PortalInfo? = null
+    private var catchupVariant: CatchupVariant? = null
+    private var catchupMissKey: String? = null
+    private var catchupMissAt: Long = 0L
 
     private fun creds(): String = "username=${enc(user)}&password=${enc(pass)}"
 
-    private fun get(url: String): String {
-        val req = Request.Builder().url(url).header("User-Agent", "CableTV/1.0").build()
-        http.newCall(req).execute().use { resp ->
+    private fun get(url: String, client: OkHttpClient = http): String {
+        val req = Request.Builder().url(url).header("User-Agent", PLAYER_USER_AGENT).build()
+        client.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) error("HTTP ${resp.code}")
             return resp.body?.string() ?: error("Empty response from provider")
         }
@@ -39,58 +50,75 @@ class XtreamClient(server: String, private val user: String, private val pass: S
         return get(sb.toString())
     }
 
-    fun login(): Boolean =
-        JSONObject(api()).optJSONObject("user_info")?.optInt("auth", 0) == 1
+    /** Throws when the account is missing, rejected, or expired. */
+    fun requireActive() {
+        val info = readPortal() ?: error("Could not read the provider account")
+        remember(info)
+        when (info.status) {
+            PortalStatus.ACTIVE -> return
+            PortalStatus.EXPIRED -> error("Provider subscription has expired")
+            PortalStatus.INACTIVE -> error("Live TV login failed. Check server, user and password.")
+            PortalStatus.UNAVAILABLE -> error("Could not read the provider account")
+        }
+    }
 
     fun liveChannels(): List<LiveChannel> {
+        val info = portalForStreams()
         val categories = mutableMapOf<String, String>()
-        val cats = org.json.JSONArray(api("get_live_categories"))
+        val cats = JSONArray(api("get_live_categories"))
         for (i in 0 until cats.length()) {
             val c = cats.getJSONObject(i)
             categories[c.optString("category_id")] = c.optString("category_name")
         }
 
-        val arr = org.json.JSONArray(api("get_live_streams"))
+        val arr = JSONArray(api("get_live_streams"))
         return (0 until arr.length()).map { i ->
             val o = arr.getJSONObject(i)
             val id = o.optString("stream_id")
+            val (primary, fallback) = liveStreamUrls(base, user, pass, id, info.formats)
+            val (catchup, days) = catchupOffered(jsonValue(o, "tv_archive"), jsonValue(o, "tv_archive_duration"))
             LiveChannel(
                 id = id,
                 number = o.optInt("num", i + 1),
                 name = o.optString("name"),
                 logo = o.optString("stream_icon").takeIf { it.isNotBlank() },
                 group = categories[o.optString("category_id")] ?: "Other",
-                streamUrl = "$base/live/${enc(user)}/${enc(pass)}/$id.ts",
+                streamUrl = primary,
                 epgId = o.optString("epg_channel_id").takeIf { it.isNotBlank() },
-                catchup = o.optString("tv_archive") == "1"
+                catchup = catchup,
+                archiveDays = days,
+                fallbackStreamUrl = fallback
             )
         }.sortedBy { it.number }
     }
 
     /** Newest movies on the provider, by the date the panel added them. */
     fun vodMovies(limit: Int = 60): List<VodItem> {
-        val arr = org.json.JSONArray(api("get_vod_streams"))
+        val arr = JSONArray(api("get_vod_streams"))
         return (0 until arr.length()).map { i ->
             val o = arr.getJSONObject(i)
             val id = o.optString("stream_id")
-            val ext = o.optString("container_extension").ifBlank { "mp4" }
             VodItem(
                 id = id,
                 name = o.optString("name"),
                 year = null,
                 overview = null,
                 posterUrl = o.optString("stream_icon"),
-                streamUrl = "$base/movie/${enc(user)}/${enc(pass)}/$id.$ext",
+                streamUrl = contentStreamUrl(
+                    base, user, pass, "movie", id,
+                    o.optString("container_extension"),
+                    o.optString("direct_source")
+                ),
                 type = "Movie",
                 source = "xtream",
-                addedAt = o.optLong("added")
+                addedAt = recentlyAddedEpochSeconds(jsonLong(o, "added"), jsonLong(o, "last_modified"), series = false)
             )
         }.sortedByDescending { it.addedAt }.take(limit)
     }
 
     /** Newest series on the provider. Episodes load separately when one is opened. */
     fun vodSeries(limit: Int = 60): List<VodItem> {
-        val arr = org.json.JSONArray(api("get_series"))
+        val arr = JSONArray(api("get_series"))
         return (0 until arr.length()).map { i ->
             val o = arr.getJSONObject(i)
             VodItem(
@@ -102,7 +130,7 @@ class XtreamClient(server: String, private val user: String, private val pass: S
                 streamUrl = "",
                 type = "Series",
                 source = "xtream",
-                addedAt = o.optLong("last_modified")
+                addedAt = recentlyAddedEpochSeconds(jsonLong(o, "added"), jsonLong(o, "last_modified"), series = true)
             )
         }.sortedByDescending { it.addedAt }.take(limit)
     }
@@ -120,7 +148,6 @@ class XtreamClient(server: String, private val user: String, private val pass: S
             for (i in 0 until list.length()) {
                 val e = list.getJSONObject(i)
                 val id = e.optString("id")
-                val ext = e.optString("container_extension").ifBlank { "mp4" }
                 val number = e.optInt("episode_num", 0)
                 val title = e.optString("title")
                 val item = VodItem(
@@ -129,7 +156,11 @@ class XtreamClient(server: String, private val user: String, private val pass: S
                     year = null,
                     overview = null,
                     posterUrl = "",
-                    streamUrl = "$base/series/${enc(user)}/${enc(pass)}/$id.$ext",
+                    streamUrl = contentStreamUrl(
+                        base, user, pass, "series", id,
+                        e.optString("container_extension"),
+                        e.optString("direct_source")
+                    ),
                     type = "Episode",
                     source = "xtream"
                 )
@@ -141,13 +172,34 @@ class XtreamClient(server: String, private val user: String, private val pass: S
             .map { it.third }
     }
 
-    /** Replay URL for a programme that already aired on a channel with catch-up. Times are UTC. */
-    fun timeshiftUrl(streamId: String, startMs: Long, stopMs: Long): String {
-        val fmt = java.text.SimpleDateFormat("yyyy-MM-dd:HH-mm", java.util.Locale.US)
-        fmt.timeZone = java.util.TimeZone.getTimeZone("UTC")
-        val minutes = ((stopMs - startMs) / 60_000L).coerceAtLeast(1L)
-        val stamp = fmt.format(java.util.Date(startMs))
-        return "$base/timeshift/${enc(user)}/${enc(pass)}/$minutes/$stamp/$streamId.ts"
+    /**
+     * Replay address for a programme that already aired.
+     * The working catch-up shape is probed once and remembered. A miss is remembered
+     * for a minute for that programme, then the plain timeshift address is used.
+     */
+    fun resolveTimeshiftUrl(streamId: String, startMs: Long, stopMs: Long): String {
+        val info = portalForStreams()
+        synchronized(portalLock) {
+            catchupVariant?.let { return buildCatchup(it, info.timezone, streamId, startMs, stopMs) }
+            val key = "$streamId@$startMs"
+            if (catchupMissKey == key && System.currentTimeMillis() - catchupMissAt < 60_000L) {
+                return buildCatchup(CatchupVariant.REST_TS, info.timezone, streamId, startMs, stopMs)
+            }
+        }
+        val chosen = runCatching {
+            chooseCatchupVariant(info.formats) { variant ->
+                probeStatus(buildCatchup(variant, info.timezone, streamId, startMs, stopMs))
+            }
+        }.getOrNull()
+        synchronized(portalLock) {
+            if (chosen != null) {
+                catchupVariant = chosen
+            } else {
+                catchupMissKey = "$streamId@$startMs"
+                catchupMissAt = System.currentTimeMillis()
+            }
+        }
+        return buildCatchup(chosen ?: CatchupVariant.REST_TS, info.timezone, streamId, startMs, stopMs)
     }
 
     fun nowNext(streamId: String): NowNext {
@@ -170,9 +222,135 @@ class XtreamClient(server: String, private val user: String, private val pass: S
         )
     }
 
+    private fun buildCatchup(
+        variant: CatchupVariant,
+        timezone: String?,
+        streamId: String,
+        startMs: Long,
+        stopMs: Long
+    ): String = catchupUrl(base, user, pass, streamId, startMs, stopMs, timezone, variant)
+
+    private fun probeStatus(url: String): Int = try {
+        val req = Request.Builder()
+            .url(url)
+            .header("User-Agent", PLAYER_USER_AGENT)
+            .header("Range", "bytes=0-1023")
+            .build()
+        probeHttp.newCall(req).execute().use { it.code }
+    } catch (e: Exception) {
+        -1
+    }
+
+    private fun portalForStreams(): PortalInfo {
+        synchronized(portalLock) {
+            portalCache?.let { cached ->
+                when (cached.status) {
+                    PortalStatus.EXPIRED -> error("Provider subscription has expired")
+                    PortalStatus.INACTIVE -> error("Live TV login was rejected")
+                    else -> return cached
+                }
+            }
+        }
+        val info = readPortal() ?: PortalInfo(PortalStatus.ACTIVE, emptyList(), null)
+        when (info.status) {
+            PortalStatus.EXPIRED -> error("Provider subscription has expired")
+            PortalStatus.INACTIVE -> error("Live TV login was rejected")
+            else -> remember(info)
+        }
+        return info
+    }
+
+    private fun remember(info: PortalInfo) {
+        synchronized(portalLock) { portalCache = info }
+    }
+
+    /**
+     * Account info from whichever action this panel actually implements.
+     * get_account_info, a bare call, and get_profile are tried. An active or
+     * expired answer wins over a rejection from an action the panel does not mean.
+     * The search stops once the panel clock is known, or the account is expired.
+     */
+    private fun readPortal(): PortalInfo? {
+        var found: PortalInfo? = null
+        for (action in listOf("get_account_info", null, "get_profile")) {
+            val candidate = readAccountAction(action) ?: continue
+            val info = preferAccount(found, candidate)
+            found = info
+            if (info.status == PortalStatus.EXPIRED || info.timezone != null) break
+        }
+        return found
+    }
+
+    private fun readAccountAction(action: String?): PortalInfo? = try {
+        val json = JSONObject(api(action))
+        val userInfo = json.optJSONObject("user_info")
+        val status = userInfo?.let {
+            resolvePortalStatus(jsonValue(it, "auth"), it.optString("status"), jsonValue(it, "exp_date"))
+        }
+        if (userInfo == null || status == null || status == PortalStatus.UNAVAILABLE) {
+            null
+        } else {
+            val server = json.optJSONObject("server_info")
+            PortalInfo(
+                status = status,
+                formats = formatsOf(userInfo),
+                timezone = resolveServerTimezone(
+                    server?.optString("timezone"),
+                    server?.optString("time_now"),
+                    server?.let { jsonValue(it, "timestamp_now") }
+                )
+            )
+        }
+    } catch (e: Exception) {
+        null
+    }
+
+    /** Expired beats everything. Active beats a rejection. Missing timezone and formats are filled in. */
+    private fun preferAccount(current: PortalInfo?, candidate: PortalInfo): PortalInfo {
+        if (current == null) return candidate
+        val status = when {
+            current.status == PortalStatus.EXPIRED || candidate.status == PortalStatus.EXPIRED -> PortalStatus.EXPIRED
+            current.status == PortalStatus.ACTIVE || candidate.status == PortalStatus.ACTIVE -> PortalStatus.ACTIVE
+            else -> current.status
+        }
+        return PortalInfo(
+            status = status,
+            formats = current.formats.ifEmpty { candidate.formats },
+            timezone = current.timezone ?: candidate.timezone
+        )
+    }
+
+    private fun formatsOf(userInfo: JSONObject): List<String> {
+        val raw = jsonValue(userInfo, "allowed_output_formats")
+        return when (raw) {
+            is JSONArray -> (0 until raw.length()).mapNotNull { raw.optString(it).trim().takeIf { s -> s.isNotEmpty() } }
+            is String -> raw.split(',').map { it.trim() }.filter { it.isNotEmpty() }
+            else -> emptyList()
+        }
+    }
+
+    private fun jsonLong(o: JSONObject, key: String): Long? = when (val value = jsonValue(o, key)) {
+        is Number -> value.toLong()
+        is String -> value.trim().toLongOrNull()
+        else -> null
+    }
+
+    private fun jsonValue(o: JSONObject, key: String): Any? {
+        if (!o.has(key) || o.isNull(key)) return null
+        return o.get(key)
+    }
+
+    private fun enc(value: String): String = java.net.URLEncoder.encode(value, "UTF-8").replace("+", "%20")
+
     private fun decodeB64(s: String): String = try {
         String(Base64.decode(s, Base64.DEFAULT), Charsets.UTF_8)
     } catch (e: IllegalArgumentException) {
         s
     }
+
+    private data class PortalInfo(
+        val status: PortalStatus,
+        val formats: List<String>,
+        val timezone: String?
+    )
 }
