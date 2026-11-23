@@ -17,10 +17,10 @@ import java.util.zip.GZIPInputStream
 
 /**
  * The full programme schedule from an XMLTV feed. The feed comes from the Xtream
- * login, or from the guide link inside an M3U playlist. Programmes from the last day
- * to twelve hours ahead are kept, so catch-up has something to show. Channels are
- * matched by their epg_channel_id or the playlist's tvg-id, ignoring case and
- * punctuation. A channel name can also match the guide's display name.
+ * login, from the guide link inside an M3U playlist, or from a Guide URL. Programmes
+ * from about two days behind to two days ahead are kept, so catch-up has something
+ * to show. Channels are matched by their epg_channel_id or the playlist's tvg-id,
+ * ignoring case and punctuation. A channel name can also match the guide's display name.
  */
 object EpgCache {
 
@@ -52,7 +52,7 @@ object EpgCache {
      */
     fun refreshAll(urls: List<String>): List<String> {
         val generation = refreshGeneration.incrementAndGet()
-        val merged = LinkedHashMap<String, MutableList<Program>>()
+        val feeds = mutableListOf<Map<String, List<Program>>>()
         val names = mutableListOf<Pair<String, String>>()
         val failed = mutableListOf<String>()
         for (url in urls.distinct()) {
@@ -62,15 +62,14 @@ object EpgCache {
                     if (!resp.isSuccessful) error("XMLTV returned HTTP ${resp.code}")
                     val body = resp.body ?: error("Empty XMLTV response")
                     val parsed = parse(body.byteStream())
-                    parsed.programs.forEach { (id, list) ->
-                        merged.getOrPut(id) { mutableListOf() }.addAll(list)
-                    }
+                    feeds += parsed.programs
                     names += parsed.names
                 }
             }.onFailure { failed += url }
         }
-        if (merged.isNotEmpty() && generation == refreshGeneration.get()) {
-            val stored = merged.mapValues { (_, list) -> list.sortedBy { it.start } }
+        // Two feeds often carry the same listings, so each show is kept once.
+        val stored = mergeSchedules(feeds)
+        if (stored.isNotEmpty() && generation == refreshGeneration.get()) {
             val keys = buildEpgAliases(stored.keys, names)
             synchronized(lock) {
                 if (generation == refreshGeneration.get()) {
@@ -125,40 +124,85 @@ object EpgCache {
     /** True once a feed has been loaded, so screens can tell "no data yet" from "no data for this channel". */
     fun hasData(): Boolean = synchronized(lock) { programs.isNotEmpty() }
 
-    /** Shows on now or later whose titles contain [query]. Soonest first. */
-    fun programmesMatching(query: String, nowMs: Long = System.currentTimeMillis(), limit: Int = 30): List<Pair<String, Program>> {
+    /**
+     * Shows on now or later whose titles contain [query], ignoring case, accents and punctuation.
+     * Soonest first. [keys], when given, limits the search to those guide channels.
+     */
+    fun programmesMatching(
+        query: String,
+        nowMs: Long = System.currentTimeMillis(),
+        limit: Int = 30,
+        keys: Set<String>? = null
+    ): List<Pair<String, Program>> {
         val schedule = synchronized(lock) { programs }
-        return matchProgrammes(schedule, query, nowMs, limit)
+        return matchProgrammes(schedule, query, nowMs, limit, keys)
     }
 
     /**
+     * The guide channel whose listings [schedule] shows for this channel, or null when there is none.
+     * Search uses it, so a show is found on the same channels the guide shows it on.
+     */
+    fun scheduleKey(epgId: String?, name: String? = null, now: Long = System.currentTimeMillis()): String? =
+        synchronized(lock) {
+            val idKey = keyFor(epgId)
+            val nameKey = keyFor(name)
+            val byId = idKey?.let { programs[it] }.orEmpty()
+            val byName = nameKey?.let { programs[it] }.orEmpty()
+            val chosen = chooseListings(byId, byName, now)
+            when {
+                chosen.isEmpty() -> null
+                chosen === byId -> idKey
+                else -> nameKey
+            }
+        }
+
+    /**
      * Programmes that already aired on a channel inside [withinMs], newest first.
-     * The feed itself only keeps one day, so a longer archive still shows that day.
+     * The feed keeps about two days, so a longer archive still shows those two days.
      */
     fun pastPrograms(epgId: String?, withinMs: Long = DAY_MS, name: String? = null): List<Program> {
         val list = synchronized(lock) { listFor(epgId).ifEmpty { listFor(name) } }
         return finishedWithin(list, System.currentTimeMillis(), withinMs)
     }
 
-    private fun listFor(key: String?): List<Program> {
-        if (key.isNullOrBlank()) return emptyList()
-        programs[key]?.let { return it }
+    private fun listFor(key: String?): List<Program> = keyFor(key)?.let { programs[it] }.orEmpty()
+
+    /** The id stored in the schedule for an id or display name, or null. Call while holding [lock]. */
+    private fun keyFor(key: String?): String? {
+        if (key.isNullOrBlank()) return null
+        if (programs.containsKey(key)) return key
         val norm = normalizeEpgKey(key)
-        if (norm.isEmpty()) return emptyList()
-        val canonical = aliases[norm] ?: return emptyList()
-        return programs[canonical].orEmpty()
+        if (norm.isEmpty()) return null
+        return aliases[norm]
     }
 
     private fun enc(value: String): String = URLEncoder.encode(value, "UTF-8").replace("+", "%20")
 
-    /** Reads XMLTV with a streaming parser, keeping only the window around now. A gzip body is inflated first. */
+    /**
+     * Reads XMLTV with a streaming parser, keeping only the window around now. A gzip body is inflated first.
+     * A feed that breaks part way (a cut off download, a bad character) keeps what was read before the break.
+     */
     internal fun parse(input: InputStream): ParsedGuide {
         val now = System.currentTimeMillis()
         val from = now - BEHIND_MS
         val to = now + AHEAD_MS
         val out = HashMap<String, MutableList<Program>>()
         val names = mutableListOf<Pair<String, String>>()
+        try {
+            readFeed(input, from, to, out, names)
+        } catch (e: Exception) {
+            if (out.isEmpty()) throw e
+        }
+        return ParsedGuide(out.mapValues { (_, list) -> tidySchedule(list, from, to) }, names)
+    }
 
+    private fun readFeed(
+        input: InputStream,
+        from: Long,
+        to: Long,
+        out: HashMap<String, MutableList<Program>>,
+        names: MutableList<Pair<String, String>>
+    ) {
         val parser = Xml.newPullParser()
         parser.setInput(ungzipIfNeeded(input), null)
 
@@ -199,7 +243,8 @@ object EpgCache {
                 }
                 XmlPullParser.TEXT -> {
                     if (inTitle) title += parser.text
-                    if (inDesc) desc += parser.text
+                    // Long descriptions are cut short, so a big feed does not fill the memory.
+                    if (inDesc && desc.length <= MAX_DESC) desc += parser.text
                     if (inDisplay) display += parser.text
                 }
                 XmlPullParser.END_TAG -> when (parser.name) {
@@ -214,9 +259,11 @@ object EpgCache {
                     "channel" -> inChannel = false
                     "programme" -> {
                         val ch = channel
-                        if (ch != null && start > 0L && stop > from && start < to) {
+                        // A programme with no stop time is kept for now. tidySchedule gives it one.
+                        val open = stop <= 0L && start > from - OPEN_END_SLACK_MS
+                        if (ch != null && start > 0L && start < to && (stop > from || open)) {
                             out.getOrPut(ch) { mutableListOf() }
-                                .add(Program(title.trim(), start, stop, desc.trim()))
+                                .add(Program(title.trim(), start, if (open) 0L else stop, clipDesc(desc)))
                         }
                         channel = null
                     }
@@ -224,8 +271,61 @@ object EpgCache {
             }
             event = parser.next()
         }
-        return ParsedGuide(out.mapValues { (_, list) -> list.sortedBy { it.start } }, names)
     }
+}
+
+/** Longest programme description kept, in characters. */
+private const val MAX_DESC = 400
+/** A programme with no stop time and no next programme is given half an hour. */
+private const val OPEN_END_MS = 30 * 60_000L
+/** How far before the kept window a programme with no stop time may start and still be read. */
+private const val OPEN_END_SLACK_MS = 12 * 3_600_000L
+
+internal fun clipDesc(raw: String): String {
+    val text = raw.trim()
+    return if (text.length <= MAX_DESC) text else text.take(MAX_DESC).trimEnd() + "…"
+}
+
+/**
+ * One programme per start time, sorted. Two programmes on one channel cannot start at the same
+ * instant, so a repeat is a duplicate. The one with a description is kept, then the one with a stop time.
+ */
+internal fun dedupeByStart(list: List<Program>): List<Program> {
+    if (list.size < 2) return list
+    val out = ArrayList<Program>(list.size)
+    for (p in list.sortedBy { it.start }) {
+        val last = out.lastOrNull()
+        if (last == null || last.start != p.start) {
+            out += p
+            continue
+        }
+        val better = (last.desc.isBlank() && p.desc.isNotBlank()) ||
+            (last.desc.isBlank() == p.desc.isBlank() && last.end <= 0L && p.end > 0L)
+        if (better) out[out.lastIndex] = p
+    }
+    return out
+}
+
+/** Gives a programme with no stop time (end 0) the next programme's start, or half an hour. [sorted] has one programme per start. */
+internal fun fillMissingStops(sorted: List<Program>): List<Program> {
+    if (sorted.none { it.end <= 0L }) return sorted
+    return sorted.mapIndexed { i, p ->
+        if (p.end > 0L) p else p.copy(end = sorted.getOrNull(i + 1)?.start ?: (p.start + OPEN_END_MS))
+    }
+}
+
+/** A channel's programmes from one feed: no duplicates, every stop time filled in, inside [from] to [to]. */
+internal fun tidySchedule(list: List<Program>, from: Long, to: Long): List<Program> =
+    fillMissingStops(dedupeByStart(list)).filter { it.end > from && it.start < to }
+
+/** Joins several feeds by channel id. A show that two feeds both carry is kept once. */
+internal fun mergeSchedules(feeds: List<Map<String, List<Program>>>): Map<String, List<Program>> {
+    if (feeds.size == 1) return feeds[0]
+    val merged = LinkedHashMap<String, MutableList<Program>>()
+    for (feed in feeds) {
+        for ((id, list) in feed) merged.getOrPut(id) { mutableListOf() }.addAll(list)
+    }
+    return merged.mapValues { (_, list) -> dedupeByStart(list) }
 }
 
 internal data class ParsedGuide(
@@ -233,9 +333,15 @@ internal data class ParsedGuide(
     val names: List<Pair<String, String>>
 )
 
-/** Letters and digits only, so `TNT.us` and `tnt us` can meet. */
-internal fun normalizeEpgKey(raw: String): String =
-    raw.lowercase(Locale.US).replace(Regex("[^a-z0-9]"), "")
+/** Letters and digits only, so `TNT.us` and `tnt us` can meet. Called for every channel, so it avoids a regex. */
+internal fun normalizeEpgKey(raw: String): String {
+    val out = StringBuilder(raw.length)
+    for (c in raw) {
+        val l = c.lowercaseChar()
+        if (l in 'a'..'z' || l in '0'..'9') out.append(l)
+    }
+    return out.toString()
+}
 
 internal fun epgIdsMatch(channelId: String?, storedId: String): Boolean {
     if (channelId.isNullOrBlank()) return false
@@ -274,24 +380,30 @@ internal fun chooseListings(byId: List<Program>, byName: List<Program>, now: Lon
     return byId.ifEmpty { byName }
 }
 
-private val COMPACT_XMLTV_TIME = Regex("""^(\d{14})(?:\s*([+-]\d{2}:?\d{2}|Z|UTC|GMT))?$""", RegexOption.IGNORE_CASE)
+private val COMPACT_XMLTV_TIME = Regex("""^(\d{14}|\d{12})(?:\s*([+-]\d{2}:?\d{2}|Z|UTC|GMT))?$""", RegexOption.IGNORE_CASE)
 private val ISO_XMLTV_TIME = Regex("""^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:\s*([+-]\d{2}:?\d{2}|Z|UTC|GMT))?$""", RegexOption.IGNORE_CASE)
 
-/** XMLTV start and stop. A missing zone is UTC. A time this cannot read is 0. */
+private val XMLTV_OFFSET = Regex("""^([+-])(\d{2}):?(\d{2})$""")
+private val SECONDS_FORMAT = DateTimeFormatter.ofPattern("yyyyMMddHHmmss", Locale.US)
+private val MINUTES_FORMAT = DateTimeFormatter.ofPattern("yyyyMMddHHmm", Locale.US)
+private val ISO_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss", Locale.US)
+
+/** XMLTV start and stop, with or without seconds. A missing zone is UTC. A time this cannot read is 0. */
 internal fun xmltvTimeMs(raw: String?): Long {
     val s = raw?.trim().orEmpty()
     if (s.isEmpty()) return 0L
     COMPACT_XMLTV_TIME.matchEntire(s)?.let { m ->
-        return xmltvStamp(m.groupValues[1], "yyyyMMddHHmmss", m.groupValues[2])
+        val digits = m.groupValues[1]
+        return xmltvStamp(digits, if (digits.length == 12) MINUTES_FORMAT else SECONDS_FORMAT, m.groupValues[2])
     }
     ISO_XMLTV_TIME.matchEntire(s)?.let { m ->
-        return xmltvStamp("${m.groupValues[1]}T${m.groupValues[2]}", "yyyy-MM-dd'T'HH:mm:ss", m.groupValues[3])
+        return xmltvStamp("${m.groupValues[1]}T${m.groupValues[2]}", ISO_FORMAT, m.groupValues[3])
     }
     return 0L
 }
 
-private fun xmltvStamp(text: String, pattern: String, zoneRaw: String): Long = try {
-    val local = LocalDateTime.parse(text, DateTimeFormatter.ofPattern(pattern, Locale.US))
+private fun xmltvStamp(text: String, format: DateTimeFormatter, zoneRaw: String): Long = try {
+    val local = LocalDateTime.parse(text, format)
     local.toInstant(xmltvOffset(zoneRaw)).toEpochMilli()
 } catch (e: DateTimeException) {
     0L
@@ -300,7 +412,7 @@ private fun xmltvStamp(text: String, pattern: String, zoneRaw: String): Long = t
 private fun xmltvOffset(raw: String): ZoneOffset {
     val z = raw.trim()
     if (z.isEmpty() || z.equals("Z", true) || z.equals("UTC", true) || z.equals("GMT", true)) return ZoneOffset.UTC
-    val m = Regex("""^([+-])(\d{2}):?(\d{2})$""").matchEntire(z) ?: return ZoneOffset.UTC
+    val m = XMLTV_OFFSET.matchEntire(z) ?: return ZoneOffset.UTC
     val sign = if (m.groupValues[1] == "-") -1 else 1
     val seconds = sign * (m.groupValues[2].toInt() * 3600 + m.groupValues[3].toInt() * 60)
     return ZoneOffset.ofTotalSeconds(seconds)

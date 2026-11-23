@@ -26,6 +26,21 @@ class XmltvTimeTest {
     }
 
     @Test
+    fun readsTimesWithoutSeconds() {
+        assertEquals(elevenUtc, xmltvTimeMs("202611231100 +0000"))
+        assertEquals(elevenUtc, xmltvTimeMs("202611231100"))
+        assertEquals(elevenUtc - 5 * 3_600_000L - 45 * 60_000L, xmltvTimeMs("202611231100 +0545"))
+        assertEquals(0L, xmltvTimeMs("2026112311"))
+    }
+
+    @Test
+    fun keysIgnoreCaseAndPunctuation() {
+        assertEquals("tntus", normalizeEpgKey("TNT.us"))
+        assertEquals("bbcone1", normalizeEpgKey(" BBC One (1) "))
+        assertEquals("", normalizeEpgKey("-. "))
+    }
+
+    @Test
     fun oneKeyCannotMeanTwoChannels() {
         val aliases = buildEpgAliases(
             setOf("TNT.us"),

@@ -50,17 +50,31 @@ fun HomeScreen(
     onSetUp: () -> Unit
 ) {
     val firstButton = remember { FocusRequester() }
-    LaunchedEffect(Unit) {
-        withFrameNanos { }
-        runCatching { firstButton.requestFocus() }
-    }
     var inRows by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     val showPicture = hasLive && current != null
+    // True while anything on Home has focus, so focus lost with a replaced button can be put back.
+    var screenHasFocus by remember { mutableStateOf(false) }
+    var focusedOnce by remember { mutableStateOf(false) }
+    // Which buttons the top section shows. They change when the channels finish loading.
+    val heroState = when {
+        showPicture -> 0
+        hasLive && loadingChannels -> 1
+        hasLive && channelError != null -> 2
+        hasLive -> 3
+        else -> 4
+    }
+    LaunchedEffect(heroState) {
+        repeat(2) { withFrameNanos { } }
+        // The first time, focus starts on the first button. After that it only comes back when it was lost.
+        if (!focusedOnce || !screenHasFocus) {
+            if (runCatching { firstButton.requestFocus() }.isSuccess) focusedOnce = true
+        }
+    }
     val dim by animateFloatAsState(if (inRows || !showPicture) 1f else 0f, tween(350), label = "dim")
 
-    TabScaffold(Tab.Home, nav) { narrow ->
+    TabScaffold(Tab.Home, nav, modifier = Modifier.onFocusChanged { screenHasFocus = it.hasFocus }) { narrow ->
         val side = gutter(narrow)
         // Shading over the live picture, so text stays readable.
         Box(
@@ -104,6 +118,8 @@ fun HomeScreen(
                             .padding(bottom = 22.dp),
                         verticalArrangement = Arrangement.Bottom
                     ) {
+                        // Ticks, so the progress bar and the time left keep moving.
+                        val clock = rememberNow()
                         when {
                             showPicture && current != null -> {
                                 val now = guide.nowNext(current)?.now
@@ -120,8 +136,8 @@ fun HomeScreen(
                                     Spacer(Modifier.height(6.dp))
                                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                                         Text(formatRange(now), style = TvType.Small, color = Tv.Ink2)
-                                        ProgressBar(progressOf(now), Modifier.width(140.dp))
-                                        Text(timeLeft(now), style = TvType.Small, color = Tv.Ink2)
+                                        ProgressBar(progressOf(now, clock), Modifier.width(140.dp))
+                                        Text(timeLeft(now, clock), style = TvType.Small, color = Tv.Ink2)
                                     }
                                 }
                                 Spacer(Modifier.height(14.dp))
