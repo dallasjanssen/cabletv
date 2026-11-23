@@ -1,94 +1,167 @@
 package com.dallas.cabletv.data
 
-import java.io.BufferedReader
-import java.io.InputStreamReader
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
+import java.io.ByteArrayOutputStream
+import java.io.IOException
+import java.io.InputStream
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.SocketTimeoutException
 import java.net.URLDecoder
+import java.security.MessageDigest
 import java.util.Collections
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
+
+/** Why the server closed itself. A normal stop or a received form does not use this. */
+enum class SignInEnd { TooManyWrongCodes, Expired }
 
 /**
  * A small web page served on the TV's own network while the sign-in screen is open.
  * The phone opens the address from the QR code, types the details there, and the TV
  * receives them. Every request must carry the six-digit code shown on the TV, and the
- * server closes as soon as details arrive or the sign-in screen is left.
+ * server closes as soon as details arrive, the sign-in screen is left, ten wrong codes
+ * have been tried, or ten minutes have passed.
  *
  * Traffic on the home network is not encrypted. Use it on your own network only.
  */
-class PhoneSignInServer(private val pin: String, private val onReceive: (Map<String, String>) -> Unit) {
+class PhoneSignInServer(
+    private val pin: String,
+    private val onReceive: (Map<String, String>) -> Unit,
+    /** Called once, on a server thread, when the server closes itself. */
+    private val onEnd: (SignInEnd) -> Unit = {},
+    private val maxWrongCodes: Int = 10,
+    private val lifetimeMs: Long = 10 * 60_000L
+) {
 
     private var server: ServerSocket? = null
+    private var pool: ExecutorService? = null
     @Volatile private var running = false
+    private val wrong = AtomicInteger(0)
 
-    /** Starts listening and returns the port in use. */
+    /** Starts listening and returns the port in use. Falls back to any free port when [port] is taken. */
     fun start(port: Int = 8080): Int {
-        val s = ServerSocket(port)
+        val s = try {
+            ServerSocket(port)
+        } catch (e: IOException) {
+            ServerSocket(0)
+        }
+        s.soTimeout = 1_000
         server = s
+        pool = Executors.newFixedThreadPool(4)
         running = true
+        val deadline = System.currentTimeMillis() + lifetimeMs
         Thread {
             while (running) {
+                if (System.currentTimeMillis() >= deadline) {
+                    if (running) {
+                        stop()
+                        onEnd(SignInEnd.Expired)
+                    }
+                    break
+                }
                 val client = try {
                     s.accept()
+                } catch (e: SocketTimeoutException) {
+                    continue
                 } catch (e: Exception) {
                     break
                 }
-                Thread { handle(client) }.start()
+                try {
+                    pool?.execute { handle(client) }
+                } catch (e: Exception) {
+                    runCatching { client.close() }
+                }
             }
-        }.start()
+        }.also { it.isDaemon = true }.start()
         return s.localPort
     }
 
     fun stop() {
         running = false
         runCatching { server?.close() }
+        runCatching { pool?.shutdown() }
+    }
+
+    private fun sameCode(given: String?): Boolean =
+        given != null && MessageDigest.isEqual(given.toByteArray(Charsets.UTF_8), pin.toByteArray(Charsets.UTF_8))
+
+    /** Counts a wrong code. Closes the server on the tenth. */
+    private fun noteWrong(sock: Socket) {
+        respond(sock, "403 Forbidden", page("Wrong code. Scan the code on the TV again."))
+        if (wrong.incrementAndGet() >= maxWrongCodes && running) {
+            stop()
+            onEnd(SignInEnd.TooManyWrongCodes)
+        }
     }
 
     private fun handle(socket: Socket) {
         socket.use { sock ->
             try {
-                val reader = BufferedReader(InputStreamReader(sock.getInputStream(), Charsets.UTF_8))
-                val requestLine = reader.readLine() ?: return
+                sock.soTimeout = 10_000
+                val input = sock.getInputStream().buffered()
+                val requestLine = readLine(input, MAX_LINE) ?: return
                 val parts = requestLine.split(' ')
                 val method = parts.getOrElse(0) { "" }
                 val target = parts.getOrElse(1) { "/" }
 
-                var contentLength = 0
+                var contentLength = 0L
+                var headers = 0
                 while (true) {
-                    val line = reader.readLine() ?: break
+                    val line = readLine(input, MAX_LINE) ?: break
                     if (line.isEmpty()) break
-                    if (line.startsWith("Content-Length:", ignoreCase = true)) {
-                        contentLength = line.substringAfter(':').trim().toIntOrNull() ?: 0
+                    if (++headers > MAX_HEADERS) {
+                        respond(sock, "431 Request Header Fields Too Large", page("Request too large."))
+                        return
                     }
+                    if (line.startsWith("Content-Length:", ignoreCase = true)) {
+                        contentLength = line.substringAfter(':').trim().toLongOrNull() ?: -1L
+                    }
+                }
+                if (contentLength < 0L) {
+                    respond(sock, "400 Bad Request", page("Bad request."))
+                    return
                 }
 
                 val path = target.substringBefore('?')
                 when {
                     method == "GET" && path == "/" -> {
                         val given = parseForm(target.substringAfter('?', "")).get("pin")
-                        if (given == pin) {
-                            respond(sock, "200 OK", formPage(pin))
-                        } else {
-                            respond(sock, "403 Forbidden", page("Wrong code. Scan the code on the TV again."))
+                        when {
+                            given != null && sameCode(given) -> respond(sock, "200 OK", formPage(pin))
+                            given != null -> noteWrong(sock)
+                            else -> respond(sock, "403 Forbidden", page("Scan the code on the TV."))
                         }
                     }
                     method == "POST" && path == "/" -> {
-                        val chars = CharArray(contentLength)
+                        if (contentLength > MAX_BODY) {
+                            respond(sock, "413 Payload Too Large", page("That is too much data."))
+                            return
+                        }
+                        val body = ByteArray(contentLength.toInt())
                         var read = 0
-                        while (read < contentLength) {
-                            val n = reader.read(chars, read, contentLength - read)
+                        while (read < body.size) {
+                            val n = input.read(body, read, body.size - read)
                             if (n < 0) break
                             read += n
                         }
-                        val fields = parseForm(String(chars, 0, read))
-                        if (fields["pin"] == pin && running) {
+                        val fields = parseForm(String(body, 0, read, Charsets.UTF_8))
+                        if (sameCode(fields["pin"])) {
+                            if (!running) {
+                                respond(sock, "403 Forbidden", page("This code has expired. Scan the code on the TV again."))
+                                return
+                            }
                             val details = fields.filterKeys { it != "pin" }
                             respond(sock, "200 OK", page("Sent. You can close this page and check the TV."))
                             stop()
                             onReceive(details)
                         } else {
-                            respond(sock, "403 Forbidden", page("Wrong code. Scan the code on the TV again."))
+                            noteWrong(sock)
                         }
                     }
                     else -> respond(sock, "404 Not Found", page("Not found."))
@@ -97,6 +170,19 @@ class PhoneSignInServer(private val pin: String, private val onReceive: (Map<Str
                 // A broken request is dropped. The TV keeps listening for the next one.
             }
         }
+    }
+
+    /** Reads one line as ISO-8859-1. Returns null at the end of the stream, throws when the line is too long. */
+    private fun readLine(input: InputStream, max: Int): String? {
+        val buf = ByteArrayOutputStream()
+        while (true) {
+            val b = input.read()
+            if (b < 0) return if (buf.size() == 0) null else buf.toString("ISO-8859-1")
+            if (b == '\n'.code) break
+            if (b != '\r'.code) buf.write(b)
+            if (buf.size() > max) throw IOException("Line too long")
+        }
+        return buf.toString("ISO-8859-1")
     }
 
     private fun respond(sock: Socket, status: String, html: String) {
@@ -118,6 +204,12 @@ class PhoneSignInServer(private val pin: String, private val onReceive: (Map<Str
                 val value = URLDecoder.decode(part.substringAfter('=', ""), "UTF-8")
                 key to value
             }
+
+    private companion object {
+        const val MAX_BODY = 16 * 1024
+        const val MAX_LINE = 8 * 1024
+        const val MAX_HEADERS = 64
+    }
 
     private fun page(message: String): String = """
         <!doctype html><html><head><meta charset="utf-8">
@@ -170,11 +262,31 @@ class PhoneSignInServer(private val pin: String, private val onReceive: (Map<Str
     """.trimIndent()
 }
 
-/** The address of this TV on the local network, or null when there is none. */
-fun localIpv4(): String? = runCatching {
-    Collections.list(NetworkInterface.getNetworkInterfaces())
-        .filter { it.isUp && !it.isLoopback }
-        .flatMap { Collections.list(it.inetAddresses) }
-        .firstOrNull { it is Inet4Address && !it.isLoopbackAddress }
-        ?.hostAddress
-}.getOrNull()
+/**
+ * The address of this TV on the local network, or null when there is none. The active Wi-Fi or
+ * Ethernet link is preferred, so a VPN or mobile data address is not put in the QR code.
+ */
+fun localIpv4(context: Context): String? {
+    runCatching {
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val net = cm.activeNetwork
+        val caps = net?.let { cm.getNetworkCapabilities(it) }
+        if (net != null && caps != null &&
+            (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) || caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET))
+        ) {
+            val found = cm.getLinkProperties(net)?.linkAddresses
+                ?.map { it.address }
+                ?.firstOrNull { it is Inet4Address && !it.isLoopbackAddress && !it.isLinkLocalAddress }
+            if (found != null) return found.hostAddress
+        }
+    }
+    return runCatching {
+        Collections.list(NetworkInterface.getNetworkInterfaces())
+            .filter { it.isUp && !it.isLoopback && SKIPPED_INTERFACES.none { p -> it.name.startsWith(p, ignoreCase = true) } }
+            .flatMap { Collections.list(it.inetAddresses) }
+            .firstOrNull { it is Inet4Address && !it.isLoopbackAddress && !it.isLinkLocalAddress }
+            ?.hostAddress
+    }.getOrNull()
+}
+
+private val SKIPPED_INTERFACES = listOf("tun", "ppp", "p2p", "rmnet")

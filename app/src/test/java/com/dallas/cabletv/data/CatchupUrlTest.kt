@@ -42,6 +42,47 @@ class CatchupUrlTest {
     }
 
     @Test
+    fun relativeTemplateIsAppendedToTheStreamUrl() {
+        val url = m3uCatchupUrl("http://example/live.m3u8", "append", "?utc={utc}&lutc={lutc}", start, end, start + 5_000L)
+        assertEquals("http://example/live.m3u8?utc=1700000000&lutc=1700000005", url)
+    }
+
+    @Test
+    fun relativeQueryTemplateJoinsWithAmpersandWhenThereIsAQuery() {
+        val url = m3uCatchupUrl("http://example/live.m3u8?token=1", "append", "?utc={utc}", start, end, start)
+        assertEquals("http://example/live.m3u8?token=1&utc=1700000000", url)
+    }
+
+    @Test
+    fun urlPlaceholderIsNotAppended() {
+        val url = m3uCatchupUrl("http://example/live", "default", "{url}?from=\${start}", start, end, start)
+        assertEquals("http://example/live?from=1700000000", url)
+    }
+
+    @Test
+    fun kodiPlaceholdersAreFilled() {
+        val url = m3uCatchupUrl(
+            "http://example/live", "default",
+            "http://x/{Y}-{m}-{d}/{H}{M}{S}/\${end}/{utcend}/\${now}/{offset}/{duration}",
+            start, end, start + 120_000L
+        )
+        // 1700000000 is 2023-11-14 22:13:20 UTC.
+        assertEquals("http://x/2023-11-14/221320/1700003600/1700003600/1700000120/120/3600", url)
+    }
+
+    @Test
+    fun flussonicVariants() {
+        assertEquals(
+            "http://example/channel/archive-1700000000-3600.m3u8",
+            m3uCatchupUrl("http://example/channel/index.m3u8", "flussonic-hls", null, start, end, start)
+        )
+        assertEquals(
+            "http://example/channel/archive-1700000000-3600.ts",
+            m3uCatchupUrl("http://example/channel/mpegts", "flussonic-ts", null, start, end, start)
+        )
+    }
+
+    @Test
     fun emptyRangeIsNotAUrl() {
         assertNull(m3uCatchupUrl("http://example/live", "append", null, start, start, start))
     }

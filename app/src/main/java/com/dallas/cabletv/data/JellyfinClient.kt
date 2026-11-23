@@ -6,6 +6,14 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.TimeUnit
+
+/** Server address with a scheme and no trailing slash. A bare host or host:port gets http://. */
+internal fun normalizeJellyfinServer(server: String): String {
+    val t = server.trim().trimEnd('/')
+    if (t.isEmpty()) return t
+    return if (t.contains("://")) t else "http://$t"
+}
 
 /**
  * Jellyfin client: sign in, browse and search the library, build playback URLs, and
@@ -14,10 +22,17 @@ import org.json.JSONObject
  */
 class JellyfinClient(server: String, private val token: String, private val userId: String) {
 
-    private val base = server.trim().trimEnd('/')
-    private val http = OkHttpClient()
+    private val base = normalizeJellyfinServer(server)
+    private val http = newHttp()
 
     companion object {
+        private fun newHttp(): OkHttpClient = OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .build()
+
+        private const val EXPIRED = "Jellyfin sign-in has expired. Sign in again in Settings."
+
         private const val CLIENT_AUTH =
             "MediaBrowser Client=\"CableTV\", Device=\"Android\", DeviceId=\"cabletv-android\", Version=\"1.0\""
 
@@ -30,12 +45,13 @@ class JellyfinClient(server: String, private val token: String, private val user
                 .toRequestBody("application/json".toMediaType())
 
             val req = Request.Builder()
-                .url("${server.trim().trimEnd('/')}/Users/AuthenticateByName")
+                .url("${normalizeJellyfinServer(server)}/Users/AuthenticateByName")
                 .header("Authorization", CLIENT_AUTH)
                 .post(body)
                 .build()
 
-            OkHttpClient().newCall(req).execute().use { resp ->
+            newHttp().newCall(req).execute().use { resp ->
+                if (resp.code == 401) error("Wrong username or password.")
                 if (!resp.isSuccessful) error("Jellyfin login failed (HTTP ${resp.code})")
                 val json = JSONObject(resp.body!!.string())
                 return json.getString("AccessToken") to json.getJSONObject("User").getString("Id")
@@ -51,6 +67,7 @@ class JellyfinClient(server: String, private val token: String, private val user
             .header("Authorization", authHeader())
             .build()
         http.newCall(req).execute().use { resp ->
+            if (resp.code == 401) error(EXPIRED)
             if (!resp.isSuccessful) error("Jellyfin returned HTTP ${resp.code}")
             return JSONObject(resp.body!!.string())
         }
@@ -63,6 +80,7 @@ class JellyfinClient(server: String, private val token: String, private val user
             .post(body.toString().toRequestBody("application/json".toMediaType()))
             .build()
         http.newCall(req).execute().use { resp ->
+            if (resp.code == 401) error(EXPIRED)
             if (!resp.isSuccessful) error("Jellyfin returned HTTP ${resp.code}")
         }
     }
@@ -71,19 +89,19 @@ class JellyfinClient(server: String, private val token: String, private val user
         (0 until arr.length()).map { i ->
             val o = arr.getJSONObject(i)
             val id = o.getString("Id")
-            val type = o.optString("Type")
+            val type = o.str("Type") ?: ""
             val userData = o.optJSONObject("UserData")
             // Episodes use their show's backdrop. Movies and shows use their own.
             val backdropId = when {
                 (o.optJSONArray("BackdropImageTags")?.length() ?: 0) > 0 -> id
-                o.optString("ParentBackdropItemId").isNotBlank() -> o.optString("ParentBackdropItemId")
+                o.str("ParentBackdropItemId") != null -> o.str("ParentBackdropItemId")
                 else -> null
             }
             VodItem(
                 id = id,
-                name = o.optString("Name"),
+                name = o.str("Name") ?: "",
                 year = o.optInt("ProductionYear", 0).takeIf { it > 0 },
-                overview = o.optString("Overview").takeIf { it.isNotBlank() },
+                overview = o.str("Overview"),
                 posterUrl = "$base/Items/$id/Images/Primary?maxHeight=480&api_key=$token",
                 streamUrl = "$base/Videos/$id/stream?static=true&api_key=$token",
                 type = type,
@@ -91,10 +109,13 @@ class JellyfinClient(server: String, private val token: String, private val user
                 backdropUrl = backdropId?.let { "$base/Items/$it/Images/Backdrop?maxWidth=1280&api_key=$token" },
                 season = if (type == "Episode") o.optInt("ParentIndexNumber", 0).takeIf { it > 0 } else null,
                 episode = if (type == "Episode") o.optInt("IndexNumber", 0).takeIf { it > 0 } else null,
-                seriesName = o.optString("SeriesName").takeIf { it.isNotBlank() },
+                seriesName = o.str("SeriesName"),
                 runtimeMinutes = (o.optLong("RunTimeTicks", 0L) / 600_000_000L).toInt().takeIf { it > 0 },
                 progress = userData?.optDouble("PlayedPercentage", 0.0)?.takeIf { it > 0.0 }?.let { (it / 100.0).toFloat() },
-                category = o.optJSONArray("Genres")?.optString(0)?.takeIf { it.isNotBlank() }.orEmpty()
+                category = o.optJSONArray("Genres")?.let { g ->
+                    if (g.length() == 0 || g.isNull(0)) null else g.optString(0).takeIf { it.isNotBlank() && it != "null" }
+                }.orEmpty(),
+                seriesId = if (type == "Episode") o.str("SeriesId") else null
             )
         }
 
@@ -123,14 +144,24 @@ class JellyfinClient(server: String, private val token: String, private val user
         )
     }
 
-    /** A browsable slice of the library, grouped later by [VodItem.category]. */
-    fun browse(type: String, limit: Int = 400): List<VodItem> =
-        mapItems(
-            getJson(
+    /** A browsable slice of the library, grouped later by [VodItem.category]. Pages through up to [limit] items. */
+    fun browse(type: String, limit: Int = 5000): List<VodItem> {
+        val pageSize = 300
+        val out = mutableListOf<VodItem>()
+        while (out.size < limit) {
+            val want = minOf(pageSize, limit - out.size)
+            val json = getJson(
                 "/Users/$userId/Items?IncludeItemTypes=$type&Recursive=true" +
-                    "&SortBy=SortName&SortOrder=Ascending&Limit=$limit&Fields=Overview,Genres"
-            ).getJSONArray("Items")
-        )
+                    "&SortBy=SortName&SortOrder=Ascending&StartIndex=${out.size}&Limit=$want&Fields=Overview,Genres"
+            )
+            val items = json.optJSONArray("Items") ?: break
+            if (items.length() == 0) break
+            out += mapItems(items)
+            val total = json.optInt("TotalRecordCount", -1)
+            if (items.length() < want || (total >= 0 && out.size >= total)) break
+        }
+        return out
+    }
 
     fun episodes(seriesId: String): List<VodItem> =
         mapItems(

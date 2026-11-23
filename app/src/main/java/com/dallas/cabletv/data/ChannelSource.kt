@@ -4,22 +4,78 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.util.concurrent.TimeUnit
 
+/** Channels that loaded, plus one short message for each source that did not. */
+data class ChannelLoad(val channels: List<LiveChannel>, val problems: List<String>)
+
+/** One short plain sentence for a common failure. Falls back to the exception message. */
+fun friendlyError(t: Throwable): String {
+    var cur: Throwable? = t
+    var depth = 0
+    while (cur != null && depth < 6) {
+        val msg = cur.message.orEmpty()
+        val lower = msg.lowercase()
+        when {
+            cur is java.net.UnknownHostException -> return "The server name could not be found."
+            cur is java.net.SocketTimeoutException -> return "The server did not answer."
+            cur is java.net.ConnectException -> return "Could not connect to the server."
+            cur is javax.net.ssl.SSLException -> return "A secure connection could not be made."
+            cur is org.json.JSONException || lower.contains("<html") || lower.contains("<!doctype") ||
+                lower.contains("cannot be converted to json") ->
+                return "The server sent a web page instead of channel data. Check the address."
+            Regex("""\b401\b""").containsMatchIn(msg) && lower.contains("http") ||
+                Regex("""\b403\b""").containsMatchIn(msg) && lower.contains("http") ->
+                return "The server refused the login."
+            Regex("""\b404\b""").containsMatchIn(msg) && lower.contains("http") ->
+                return "The server address was not found."
+            Regex("""\bhttp 5\d\d\b""").containsMatchIn(lower) -> return "The server had a problem. Try again later."
+        }
+        cur = cur.cause?.takeIf { it !== cur }
+        depth++
+    }
+    return t.message?.takeIf { it.isNotBlank() } ?: "Something went wrong."
+}
+
 /**
  * Chooses where live channels come from. Xtream Codes is preferred because it
  * carries categories and guide data. A plain M3U URL is the fallback.
  */
 object ChannelSource {
-    /** Every channel the source provides. Hiding is applied in the app, so ticking a box never re-downloads. */
-    fun load(s: Settings): List<LiveChannel> = fetchAll(s)
-
-    private fun fetchAll(s: Settings): List<LiveChannel> {
-        val all = mutableListOf<LiveChannel>()
-        if (s.hasXtream) all += XtreamClient(s.xtreamServer, s.xtreamUser, s.xtreamPass).liveChannels()
-        if (s.m3uUrl.isNotBlank()) {
-            all += M3uParser.parse(fetchText(s.m3uUrl)).map { it.copy(origin = "playlist") }
+    /**
+     * Every channel the sources provide. Hiding is applied in the app, so ticking a box never re-downloads.
+     * Throws, with the problems joined, only when every configured source failed.
+     */
+    fun load(s: Settings): List<LiveChannel> {
+        val report = loadReport(s)
+        if (report.channels.isEmpty() && report.problems.isNotEmpty() && report.problems.size >= configuredSources(s)) {
+            throw IllegalStateException(report.problems.joinToString(" "))
         }
-        if (s.hasStalker) all += StalkerClient(s.stalkerUrl, s.stalkerMac).channels()
-        return all.distinctBy { it.origin + ":" + it.id }
+        return report.channels
+    }
+
+    private fun configuredSources(s: Settings): Int =
+        (if (s.hasXtream) 1 else 0) + (if (s.m3uUrl.isNotBlank()) 1 else 0) + (if (s.hasStalker) 1 else 0)
+
+    /** Loads each configured source on its own. A failed source adds a short message and the rest still load. */
+    fun loadReport(s: Settings): ChannelLoad {
+        val all = mutableListOf<LiveChannel>()
+        val problems = mutableListOf<String>()
+        fun attempt(label: String, block: () -> List<LiveChannel>) {
+            try {
+                all += block()
+            } catch (e: Exception) {
+                problems += "$label: ${friendlyError(e)}"
+            }
+        }
+        if (s.hasXtream) attempt("Xtream") {
+            XtreamClient(s.xtreamServer, s.xtreamUser, s.xtreamPass).liveChannels()
+        }
+        if (s.m3uUrl.isNotBlank()) attempt("Playlist") {
+            M3uParser.parse(fetchText(s.m3uUrl)).map { it.copy(origin = "playlist") }
+        }
+        if (s.hasStalker) attempt("Stalker") {
+            StalkerClient(s.stalkerUrl, s.stalkerMac).channels()
+        }
+        return ChannelLoad(all.distinctBy { it.origin + ":" + it.id }, problems)
     }
 
     /**
@@ -138,7 +194,7 @@ fun fetchText(url: String): String {
 }
 
 object M3uParser {
-    private val attr = Regex("(\\w[\\w-]*)=\"([^\"]*)\"")
+    private val attr = Regex("(\\w[\\w-]*)=(?:\"([^\"]*)\"|'([^']*)')")
     private val guideAttr = Regex("(?:url-tvg|x-tvg-url)=\"([^\"]+)\"")
 
     /** The first guide link in a playlist header line, such as #EXTM3U url-tvg="...". */
@@ -146,23 +202,54 @@ object M3uParser {
         guideAttr.find(headerLine)?.groupValues?.get(1)
             ?.split(',')?.firstOrNull()?.trim()?.takeIf { it.isNotEmpty() }
 
+    /** Index of the first comma that is not inside a quoted attribute value, or -1. */
+    private fun titleComma(line: String): Int {
+        var quote = 0.toChar()
+        for (i in line.indices) {
+            val c = line[i]
+            if (quote != 0.toChar()) {
+                if (c == quote) quote = 0.toChar()
+            } else if ((c == '"' || c == '\'') && i > 0 && line[i - 1] == '=') {
+                quote = c
+            } else if (c == ',') {
+                return i
+            }
+        }
+        return -1
+    }
+
+    /** A stable id from the stream address, so list changes do not move saved favorites. */
+    private fun idFor(url: String, seen: MutableMap<String, Int>): String {
+        val digest = java.security.MessageDigest.getInstance("SHA-1").digest(url.toByteArray(Charsets.UTF_8))
+        val hex = digest.joinToString("") { String.format(java.util.Locale.US, "%02x", it) }.take(16)
+        val base = "m3u:$hex"
+        val count = (seen[base] ?: 0) + 1
+        seen[base] = count
+        return if (count == 1) base else "$base#$count"
+    }
+
     fun parse(text: String): List<LiveChannel> {
         val out = mutableListOf<LiveChannel>()
+        val seen = mutableMapOf<String, Int>()
         var attrs: Map<String, String> = emptyMap()
         var title = ""
 
-        for (raw in text.lineSequence()) {
+        for (raw in text.removePrefix("\uFEFF").lineSequence()) {
             val line = raw.trim()
             when {
                 line.startsWith("#EXTINF") -> {
-                    attrs = attr.findAll(line).associate { it.groupValues[1] to it.groupValues[2] }
-                    title = line.substringAfter(',', "").trim()
+                    val comma = titleComma(line)
+                    val head = if (comma >= 0) line.substring(0, comma) else line
+                    attrs = attr.findAll(head).associate {
+                        it.groupValues[1] to it.groupValues[2].ifEmpty { it.groupValues[3] }
+                    }
+                    title = if (comma >= 0) line.substring(comma + 1).trim() else ""
                 }
                 line.isNotEmpty() && !line.startsWith("#") -> {
                     val n = out.size + 1
                     out += LiveChannel(
-                        // Playlists often repeat tvg-id (HD and SD copies), so the list position keeps IDs unique.
-                        id = "$n|$line",
+                        // Playlists often repeat tvg-id (HD and SD copies), so the id comes from the stream address.
+                        id = idFor(line, seen),
                         number = attrs["tvg-chno"]?.toIntOrNull() ?: n,
                         name = title.ifBlank { attrs.nz("tvg-name") ?: "Channel $n" },
                         logo = attrs.nz("tvg-logo"),

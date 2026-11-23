@@ -35,6 +35,12 @@ class XtreamPortalTest {
     }
 
     @Test
+    fun serverUrlAcceptsUnderscoreHosts() {
+        assertEquals("http://my_panel.example:8080", normalizeXtreamServerUrl("http://my_panel.example:8080/get.php"))
+        assertEquals("http://iptv_one", normalizeXtreamServerUrl("http://iptv_one/"))
+    }
+
+    @Test
     fun pastedPlaylistFillsBlankCredentials() {
         val (server, user, pass) = xtreamLoginFields(
             "http://example.com:8080/get.php?username=ada&password=p%40ss",

@@ -6,12 +6,14 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      release_built: ${{ steps.release_build.outputs.built }}
 
     steps:
       - name: Check out
@@ -46,7 +48,8 @@ jobs:
         run: ./gradlew --no-daemon assembleDebug
 
       - name: Decode release keystore
-        # Skipped when the keystore secret is not set, so the debug build still works.
+        # Only pushes to main get the signing secrets. Skipped when the keystore secret is not set.
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           KEYSTORE_BASE64: ${{ secrets.CABLETV_KEYSTORE_BASE64 }}
         run: |
@@ -59,13 +62,16 @@ jobs:
           echo "CABLETV_KEYSTORE_PATH=$RUNNER_TEMP/cabletv-release.jks" >> "$GITHUB_ENV"
 
       - name: Build signed release APK
-        if: env.SKIP_RELEASE != 'true'
+        id: release_build
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && env.SKIP_RELEASE != 'true'
         env:
           CABLETV_KEYSTORE_PASSWORD: ${{ secrets.CABLETV_KEYSTORE_PASSWORD }}
           CABLETV_KEY_ALIAS: ${{ secrets.CABLETV_KEY_ALIAS }}
           CABLETV_KEY_PASSWORD: ${{ secrets.CABLETV_KEY_PASSWORD }}
         # The run number is the version code, so every new build is newer than the last.
-        run: ./gradlew --no-daemon assembleRelease -PversionCode=${{ github.run_number }}
+        run: |
+          ./gradlew --no-daemon assembleRelease -PversionCode=${{ github.run_number }}
+          echo "built=true" >> "$GITHUB_OUTPUT"
 
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
@@ -75,21 +81,42 @@ jobs:
           if-no-files-found: error
 
       - name: Upload signed release APK
-        if: env.SKIP_RELEASE != 'true'
+        if: steps.release_build.outputs.built == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: cabletv-release-apk
           path: app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
 
+  release:
+    # Publishes the signed APK so the TV can update itself. Only builds from main with the signing key get here.
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.build.outputs.release_built == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    concurrency:
+      group: release-main
+      cancel-in-progress: false
+
+    steps:
+      - name: Download release APK
+        uses: actions/download-artifact@v4
+        with:
+          name: cabletv-release-apk
+          path: release
+
       - name: Publish release for in-app updates
-        # Only builds from main with the signing key are published, so the TV never gets an unsigned build.
-        if: github.ref == 'refs/heads/main' && env.SKIP_RELEASE != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          if gh release view "build-${GITHUB_RUN_NUMBER}" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "Release build-${GITHUB_RUN_NUMBER} already exists; nothing to do."
+            exit 0
+          fi
           gh release create "build-${GITHUB_RUN_NUMBER}" \
-            app/build/outputs/apk/release/app-release.apk \
+            release/app-release.apk \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "Build ${GITHUB_RUN_NUMBER}" \

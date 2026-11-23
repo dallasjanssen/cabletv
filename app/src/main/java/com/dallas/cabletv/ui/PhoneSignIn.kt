@@ -17,15 +17,18 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.dallas.cabletv.data.PhoneSignInServer
+import com.dallas.cabletv.data.SignInEnd
 import com.dallas.cabletv.data.localIpv4
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
 import kotlinx.coroutines.launch
+import java.security.SecureRandom
 import java.util.concurrent.atomic.AtomicReference
 
 /** What the TV shows while it waits for the phone: the address, the code, and the QR image. */
@@ -35,6 +38,7 @@ private class PhoneCode(val url: String, val address: String, val pin: String, v
 @Composable
 private fun rememberPhoneSignIn(autoStart: Boolean, onReceived: (Map<String, String>) -> Unit): Triple<PhoneCode?, String?, () -> Unit> {
     val scope = rememberCoroutineScope()
+    val appContext = LocalContext.current.applicationContext
     val running = remember { AtomicReference<PhoneSignInServer?>(null) }
     var code by remember { mutableStateOf<PhoneCode?>(null) }
     var problem by remember { mutableStateOf<String?>(null) }
@@ -46,17 +50,33 @@ private fun rememberPhoneSignIn(autoStart: Boolean, onReceived: (Map<String, Str
 
     fun open() {
         running.getAndSet(null)?.stop()
-        val pin = (100000..999999).random().toString()
-        val server = PhoneSignInServer(pin) { fields ->
-            // Runs on the server thread, so hand the result to the UI thread.
-            scope.launch {
-                running.getAndSet(null)?.stop()
-                code = null
-                latest(fields)
+        val pin = (100000 + SecureRandom().nextInt(900000)).toString()
+        val server = PhoneSignInServer(
+            pin,
+            onReceive = { fields ->
+                // Runs on the server thread, so hand the result to the UI thread.
+                scope.launch {
+                    running.getAndSet(null)?.stop()
+                    code = null
+                    latest(fields)
+                    // If the check fails and this screen stays, a fresh code is ready to scan again.
+                    // On success the screen goes away and its server is stopped.
+                    open()
+                }
+            },
+            onEnd = { why ->
+                scope.launch {
+                    running.getAndSet(null)?.stop()
+                    code = null
+                    problem = when (why) {
+                        SignInEnd.TooManyWrongCodes -> "Too many wrong codes. Press New code."
+                        SignInEnd.Expired -> "The code expired. Press New code."
+                    }
+                }
             }
-        }
+        )
         val port = runCatching { server.start() }.getOrNull()
-        val ip = localIpv4()
+        val ip = localIpv4(appContext)
         if (port == null || ip == null) {
             server.stop()
             problem = "The setup page did not start. Check that the TV is connected to your Wi-Fi or network."
@@ -77,7 +97,7 @@ private fun rememberPhoneSignIn(autoStart: Boolean, onReceived: (Map<String, Str
 fun PhoneSignInPanel(autoStart: Boolean, onReceived: (Map<String, String>) -> Unit) {
     val (code, problem, open) = rememberPhoneSignIn(autoStart, onReceived)
     if (code == null) {
-        PillButton("Show the code", open, icon = TvIcons.Phone)
+        PillButton(if (problem != null) "New code" else "Show the code", open, icon = TvIcons.Phone)
         problem?.let { Text(it, style = TvType.Small, color = Tv.Accent, modifier = Modifier.padding(top = 10.dp)) }
     } else {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(24.dp)) {
@@ -160,13 +180,13 @@ fun WelcomeScreen(
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 when {
+                    busy -> Text("Checking your details", style = TvType.Section, textAlign = TextAlign.Center)
                     code != null -> {
                         QrImage(code.qr, 190.dp)
                         Text("Code", style = TvType.Caption, color = Tv.Ink3)
                         Text(code.pin.chunked(3).joinToString(" "), style = TvType.Display.copy(fontSize = 30.sp, letterSpacing = 2.sp), color = Tv.Accent)
                         Text("Or open ${code.address} on a phone on the same Wi-Fi.", style = TvType.Caption, color = Tv.Ink3, textAlign = TextAlign.Center)
                     }
-                    busy -> Text("Checking your details", style = TvType.Section, textAlign = TextAlign.Center)
                     else -> Text(problem ?: "Details received.", style = TvType.Small, color = Tv.Ink2, textAlign = TextAlign.Center)
                 }
             }

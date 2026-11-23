@@ -14,15 +14,27 @@ import java.util.Locale
 object CrashLog {
     private const val FILE = "last_crash.txt"
     private const val SEEN = "last_crash_seen"
+    private val installed = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    private val PATH_CREDENTIALS = Regex("/(live|movie|series|timeshift)/[^/\\s?#]+/[^/\\s?#]+/")
+    private val QUERY_SECRET = Regex("(?i)\\b(username|password|api_key|token|mac)=[^&\\s\"')>\\]]*")
+    private val AUTH_HEADER = Regex("(?i)(Authorization:\\s*).*")
+
+    /** Hides logins in crash text: stream paths, query values and Authorization headers. */
+    fun redact(text: String): String =
+        text.replace(PATH_CREDENTIALS) { "/${it.groupValues[1]}/***/***/" }
+            .replace(QUERY_SECRET) { "${it.groupValues[1]}=***" }
+            .replace(AUTH_HEADER) { "${it.groupValues[1]}***" }
 
     /** Saves any uncaught error to a file, then lets Android handle the crash as usual. */
     fun install(context: Context) {
+        if (!installed.compareAndSet(false, true)) return
         val dir = context.applicationContext.filesDir
         val previous = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, error ->
             runCatching {
                 val stamp = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date())
-                File(dir, FILE).writeText("Build ${BuildConfig.VERSION_CODE}, $stamp\n${error.stackTraceToString().take(12_000)}")
+                File(dir, FILE).writeText("Build ${BuildConfig.VERSION_CODE}, $stamp\n${redact(error.stackTraceToString().take(12_000))}")
                 File(dir, SEEN).delete()
             }
             previous?.uncaughtException(thread, error)
