@@ -18,6 +18,20 @@ object ChannelSource {
         } else {
             M3uParser.parse(fetchText(s.m3uUrl))
         }
+
+    /**
+     * The XMLTV guide link named in an M3U playlist's first line (url-tvg), or null.
+     * Only the first line is read, so this stays cheap even for large playlists.
+     */
+    fun guideUrl(s: Settings): String? {
+        if (s.hasXtream || s.m3uUrl.isBlank()) return null
+        return runCatching {
+            val req = Request.Builder().url(s.m3uUrl).header("User-Agent", "CableTV/1.0").build()
+            playlistHttp.newCall(req).execute().use { resp ->
+                resp.body?.source()?.readUtf8Line()?.let { M3uParser.guideUrlFrom(it) }
+            }
+        }.getOrNull()
+    }
 }
 
 /**
@@ -42,6 +56,16 @@ data class ChannelFilter(val term: String, val label: String, val count: Int)
 
 private val countryPrefix = Regex("^([A-Za-z]{2})\\s*[|:\\-]")
 
+/** The two-letter country code at the start of a name, such as "UK" in "UK| BBC One", or null. */
+fun countryPrefixOf(name: String): String? =
+    countryPrefix.find(name.trim())?.groupValues?.get(1)?.uppercase()
+
+/** A channel name without its country prefix, for display. Names without one are returned unchanged. */
+fun displayName(name: String): String {
+    val match = countryPrefix.find(name.trim()) ?: return name
+    return name.trim().substring(match.value.length).trim().ifEmpty { name }
+}
+
 /**
  * Builds the checkbox lists from the channels the provider sent.
  * Country prefixes come from names such as "UK| BBC". Only prefixes used by two or more
@@ -49,7 +73,7 @@ private val countryPrefix = Regex("^([A-Za-z]{2})\\s*[|:\\-]")
  */
 fun channelFilters(channels: List<LiveChannel>): Pair<List<ChannelFilter>, List<ChannelFilter>> {
     val prefixes = channels
-        .mapNotNull { ch -> countryPrefix.find(ch.name.trim())?.groupValues?.get(1)?.uppercase() }
+        .mapNotNull { countryPrefixOf(it.name) }
         .groupingBy { it }
         .eachCount()
         .filter { it.value >= 2 }
@@ -79,6 +103,12 @@ fun fetchText(url: String): String {
 
 object M3uParser {
     private val attr = Regex("(\\w[\\w-]*)=\"([^\"]*)\"")
+    private val guideAttr = Regex("(?:url-tvg|x-tvg-url)=\"([^\"]+)\"")
+
+    /** The first guide link in a playlist header line, such as #EXTM3U url-tvg="...". */
+    fun guideUrlFrom(headerLine: String): String? =
+        guideAttr.find(headerLine)?.groupValues?.get(1)
+            ?.split(',')?.firstOrNull()?.trim()?.takeIf { it.isNotEmpty() }
 
     fun parse(text: String): List<LiveChannel> {
         val out = mutableListOf<LiveChannel>()

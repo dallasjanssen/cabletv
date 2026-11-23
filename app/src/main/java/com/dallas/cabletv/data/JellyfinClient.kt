@@ -8,7 +8,8 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * Minimal Jellyfin client: sign in, list libraries, and build playback URLs.
+ * Jellyfin client: sign in, browse and search the library, build playback URLs, and
+ * report playback progress so the server keeps watched status and resume points in step.
  * Playback uses direct streams, so the TV needs to support the file's codecs.
  */
 class JellyfinClient(server: String, private val token: String, private val userId: String) {
@@ -42,14 +43,27 @@ class JellyfinClient(server: String, private val token: String, private val user
         }
     }
 
+    private fun authHeader(): String = "$CLIENT_AUTH, Token=\"$token\""
+
     private fun getJson(path: String): JSONObject {
         val req = Request.Builder()
             .url("$base$path")
-            .header("Authorization", "$CLIENT_AUTH, Token=\"$token\"")
+            .header("Authorization", authHeader())
             .build()
         http.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) error("Jellyfin returned HTTP ${resp.code}")
             return JSONObject(resp.body!!.string())
+        }
+    }
+
+    private fun postJson(path: String, body: JSONObject) {
+        val req = Request.Builder()
+            .url("$base$path")
+            .header("Authorization", authHeader())
+            .post(body.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+        http.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) error("Jellyfin returned HTTP ${resp.code}")
         }
     }
 
@@ -64,7 +78,8 @@ class JellyfinClient(server: String, private val token: String, private val user
                 overview = o.optString("Overview").takeIf { it.isNotBlank() },
                 posterUrl = "$base/Items/$id/Images/Primary?maxHeight=480&api_key=$token",
                 streamUrl = "$base/Videos/$id/stream?static=true&api_key=$token",
-                type = o.optString("Type")
+                type = o.optString("Type"),
+                played = o.optJSONObject("UserData")?.optBoolean("Played") ?: false
             )
         }
 
@@ -82,8 +97,41 @@ class JellyfinClient(server: String, private val token: String, private val user
                 .getJSONArray("Items")
         )
 
+    /** Movies and series whose names match the search text. */
+    fun search(term: String, limit: Int = 40): List<VodItem> {
+        val encoded = java.net.URLEncoder.encode(term, "UTF-8")
+        return mapItems(
+            getJson(
+                "/Users/$userId/Items?searchTerm=$encoded&IncludeItemTypes=Movie,Series" +
+                    "&Recursive=true&Limit=$limit&Fields=Overview"
+            ).getJSONArray("Items")
+        )
+    }
+
     fun episodes(seriesId: String): List<VodItem> =
         mapItems(
             getJson("/Shows/$seriesId/Episodes?UserId=$userId&Fields=Overview").getJSONArray("Items")
         )
+
+    /** Tells the server playback started. Positions are in milliseconds, converted to Jellyfin ticks. */
+    fun reportStart(itemId: String, positionMs: Long) = report("/Sessions/Playing", itemId, positionMs, false)
+
+    /** Tells the server where playback is. Called every few seconds while watching. */
+    fun reportProgress(itemId: String, positionMs: Long, paused: Boolean) =
+        report("/Sessions/Playing/Progress", itemId, positionMs, paused)
+
+    /** Tells the server playback stopped. The server uses the last position to set watched status. */
+    fun reportStopped(itemId: String, positionMs: Long) =
+        report("/Sessions/Playing/Stopped", itemId, positionMs, false)
+
+    private fun report(path: String, itemId: String, positionMs: Long, paused: Boolean) {
+        val body = JSONObject()
+            .put("ItemId", itemId)
+            .put("MediaSourceId", itemId)
+            .put("PositionTicks", positionMs * 10_000L)
+            .put("IsPaused", paused)
+            .put("CanSeek", true)
+            .put("PlayMethod", "DirectStream")
+        postJson(path, body)
+    }
 }

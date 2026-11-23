@@ -7,7 +7,9 @@ data class LiveChannel(
     val logo: String?,
     val group: String,
     val streamUrl: String,
-    val epgId: String?
+    val epgId: String?,
+    /** True when the provider keeps a replay archive for this channel. */
+    val catchup: Boolean = false
 )
 
 data class Program(
@@ -32,7 +34,9 @@ data class VodItem(
     /** Where the item comes from: "jellyfin" or "xtream". Decides how episodes load. */
     val source: String = "jellyfin",
     /** Date added, used to sort provider titles newest first. */
-    val addedAt: Long = 0L
+    val addedAt: Long = 0L,
+    /** True when the viewer has finished the title (Jellyfin only). */
+    val played: Boolean = false
 )
 
 data class Settings(
@@ -44,7 +48,9 @@ data class Settings(
     val jellyfinToken: String = "",
     val jellyfinUserId: String = "",
     /** Comma-separated prefixes and category names to hide from the guide and live TV. */
-    val hiddenFilters: String = ""
+    val hiddenFilters: String = "",
+    /** Shows channel names without their country prefix, such as "UK| BBC One" as "BBC One". */
+    val stripPrefixes: Boolean = false
 ) {
     /** The hidden filters, trimmed and upper-cased. */
     val hiddenTerms: List<String>

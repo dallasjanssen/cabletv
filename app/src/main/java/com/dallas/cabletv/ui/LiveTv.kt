@@ -51,6 +51,8 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 
+private const val MAX_RETRIES = 4
+
 private fun progressOf(p: Program): Float {
     val total = (p.end - p.start).coerceAtLeast(1L)
     return ((System.currentTimeMillis() - p.start).toFloat() / total).coerceIn(0f, 1f)
@@ -78,6 +80,9 @@ fun LiveTvScreen(
 
     var index by remember(startIndex) { mutableIntStateOf(startIndex) }
     var playerError by remember { mutableStateOf<String?>(null) }
+    var buffering by remember { mutableStateOf(false) }
+    var retries by remember { mutableIntStateOf(0) }
+    var retryTick by remember { mutableIntStateOf(0) }
     var showBanner by remember { mutableStateOf(false) }
     var bannerTick by remember { mutableIntStateOf(0) }
     var digits by remember { mutableStateOf("") }
@@ -85,14 +90,35 @@ fun LiveTvScreen(
     // Left opens the channel list. Up and down browse it, OK tunes, right or Back closes it.
     var showMiniGuide by remember { mutableStateOf(false) }
     var guideHighlight by remember { mutableIntStateOf(0) }
+    // INFO opens the replay list for channels with a catch-up archive. While a replay plays, BACK returns to live.
+    var showReplay by remember { mutableStateOf(false) }
+    var replayUrl by remember { mutableStateOf<String?>(null) }
+    val replayFocus = remember { FocusRequester() }
     BackHandler(enabled = showMiniGuide) { showMiniGuide = false }
+    BackHandler(enabled = showReplay) { showReplay = false }
+    BackHandler(enabled = replayUrl != null && !showReplay && !showMiniGuide) { replayUrl = null }
     val focus = remember { FocusRequester() }
     val current = channels.getOrNull(index)
+    val playUrl = replayUrl ?: current?.streamUrl
 
     DisposableEffect(player) {
         val listener = object : Player.Listener {
             override fun onPlayerError(e: PlaybackException) {
-                playerError = e.message ?: "Signal lost"
+                // Retry a few times before saying there is no signal, since most failures are brief.
+                if (retries < MAX_RETRIES) {
+                    retries++
+                    retryTick++
+                } else {
+                    playerError = e.message ?: "Signal lost"
+                }
+            }
+
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                buffering = playbackState == Player.STATE_BUFFERING
+                if (playbackState == Player.STATE_READY) {
+                    retries = 0
+                    playerError = null
+                }
             }
         }
         player.addListener(listener)
@@ -102,13 +128,23 @@ fun LiveTvScreen(
         }
     }
 
-    // Tune the player whenever the channel changes. A short wait means holding a
-    // key only loads the channel you stop on, not every one on the way.
-    LaunchedEffect(current?.streamUrl) {
-        if (current == null) return@LaunchedEffect
+    // Retries a failed stream after a short wait.
+    LaunchedEffect(retryTick) {
+        if (retryTick > 0 && retries <= MAX_RETRIES) {
+            delay(2000)
+            player.prepare()
+            player.playWhenReady = true
+        }
+    }
+
+    // Load whatever should be on screen: the live channel or a replay. A short wait means
+    // holding a key only loads the channel you stop on, not every one on the way.
+    LaunchedEffect(playUrl) {
+        if (playUrl == null) return@LaunchedEffect
         delay(300)
         playerError = null
-        player.setMediaItem(MediaItem.fromUri(current.streamUrl))
+        retries = 0
+        player.setMediaItem(MediaItem.fromUri(playUrl))
         player.prepare()
         player.playWhenReady = true
     }
@@ -144,7 +180,16 @@ fun LiveTvScreen(
             val target = channels.indexOfFirst { it.number == digits.toIntOrNull() }
             if (target >= 0) index = target
             digits = ""
+            replayUrl = null
             bannerTick++
+        }
+    }
+
+    // Opens the replay list with focus on its first row.
+    LaunchedEffect(showReplay) {
+        if (showReplay) {
+            withFrameNanos { }
+            runCatching { replayFocus.requestFocus() }
         }
     }
 
@@ -156,12 +201,14 @@ fun LiveTvScreen(
         if (channels.isEmpty()) return
         index = (index + delta + channels.size) % channels.size
         digits = ""
+        replayUrl = null
         flashBanner()
     }
 
     fun pickGuideChannel(idx: Int) {
         index = idx
         digits = ""
+        replayUrl = null
         showMiniGuide = false
         flashBanner()
     }
@@ -195,6 +242,10 @@ fun LiveTvScreen(
         }
     }
 
+    val replayPrograms = remember(current?.id, showReplay) {
+        if (current != null && current.catchup && epg != null) EpgCache.pastPrograms(current.epgId) else emptyList()
+    }
+
     LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
 
     Box(
@@ -206,6 +257,8 @@ fun LiveTvScreen(
             .onPreviewKeyEvent { ev ->
                 if (ev.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                 val code = ev.nativeKeyEvent.keyCode
+                // While the replay list is open, its rows handle the remote.
+                if (showReplay) return@onPreviewKeyEvent false
                 if (showMiniGuide) return@onPreviewKeyEvent handleMiniGuideKey(code)
                 when (code) {
                     KeyEvent.KEYCODE_DPAD_LEFT -> {
@@ -216,6 +269,10 @@ fun LiveTvScreen(
                             showMiniGuide = true
                             true
                         }
+                    }
+                    KeyEvent.KEYCODE_INFO -> {
+                        if (replayPrograms.isNotEmpty()) showReplay = true
+                        true
                     }
                     KeyEvent.KEYCODE_CHANNEL_UP, KeyEvent.KEYCODE_DPAD_UP -> {
                         tune(1)
@@ -271,6 +328,21 @@ fun LiveTvScreen(
             )
         }
 
+        // Shown while the stream is waiting for more data, so a stall never looks like a freeze.
+        if (buffering && playerError == null && channels.isNotEmpty() && !showBanner) {
+            Text(
+                text = "BUFFERING...",
+                style = MaterialTheme.typography.labelMedium,
+                color = Cable.Accent,
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .padding(40.dp)
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(Cable.Canvas.copy(alpha = 0.8f))
+                    .padding(horizontal = 14.dp, vertical = 6.dp)
+            )
+        }
+
         // Digits typed on the remote appear in the top corner.
         if (digits.isNotEmpty()) {
             Text(
@@ -286,6 +358,20 @@ fun LiveTvScreen(
             )
         }
 
+        if (replayUrl != null) {
+            Text(
+                text = "REPLAY    BACK  Return to live",
+                style = MaterialTheme.typography.labelMedium,
+                color = Cable.Led,
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(40.dp)
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(Cable.Canvas.copy(alpha = 0.8f))
+                    .padding(horizontal = 14.dp, vertical = 6.dp)
+            )
+        }
+
         if (showMiniGuide && channels.isNotEmpty()) {
             MiniGuide(
                 channels = channels,
@@ -297,8 +383,25 @@ fun LiveTvScreen(
             )
         }
 
+        if (showReplay && current != null) {
+            ReplayPanel(
+                channelName = current.name,
+                programs = replayPrograms,
+                focusRequester = replayFocus,
+                onPick = { p ->
+                    val url = epg?.timeshiftUrl(current.id, p.start, p.end)
+                    if (url != null) {
+                        replayUrl = url
+                        showReplay = false
+                        flashBanner()
+                    }
+                },
+                modifier = Modifier.align(Alignment.CenterEnd)
+            )
+        }
+
         AnimatedVisibility(
-            visible = showBanner && current != null && !showMiniGuide,
+            visible = showBanner && current != null && !showMiniGuide && !showReplay,
             modifier = Modifier.align(Alignment.BottomCenter),
             enter = fadeIn(),
             exit = fadeOut()
@@ -307,7 +410,8 @@ fun LiveTvScreen(
                 ChannelBanner(
                     channel = current,
                     nn = nowNext,
-                    isFavorite = current.id in favorites
+                    isFavorite = current.id in favorites,
+                    canReplay = replayPrograms.isNotEmpty()
                 )
             }
         }
@@ -315,7 +419,7 @@ fun LiveTvScreen(
 }
 
 @Composable
-private fun ChannelBanner(channel: LiveChannel, nn: NowNext?, isFavorite: Boolean) {
+private fun ChannelBanner(channel: LiveChannel, nn: NowNext?, isFavorite: Boolean, canReplay: Boolean) {
     val now = nn?.now
     val next = nn?.next
 
@@ -382,7 +486,11 @@ private fun ChannelBanner(channel: LiveChannel, nn: NowNext?, isFavorite: Boolea
 
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    text = "UP / DOWN  Change channel    LEFT  Channel list    MENU  Favorite    0-9  Jump",
+                    text = if (canReplay) {
+                        "UP / DOWN  Channel    LEFT  Channel list    INFO  Replay    MENU  Favorite"
+                    } else {
+                        "UP / DOWN  Channel    LEFT  Channel list    MENU  Favorite    0-9  Jump"
+                    },
                     style = MaterialTheme.typography.bodyMedium,
                     color = Cable.Ink2
                 )
@@ -390,6 +498,70 @@ private fun ChannelBanner(channel: LiveChannel, nn: NowNext?, isFavorite: Boolea
 
             next?.let { UpNextCard(it) }
         }
+    }
+}
+
+/** Past programmes on a channel with catch-up, newest first. OK plays one from the provider's archive. */
+@Composable
+private fun ReplayPanel(
+    channelName: String,
+    programs: List<Program>,
+    focusRequester: FocusRequester,
+    onPick: (Program) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier
+            .fillMaxHeight()
+            .width(620.dp)
+            .background(Cable.Canvas.copy(alpha = 0.92f))
+            .padding(vertical = 32.dp, horizontal = 24.dp)
+    ) {
+        Text(
+            text = "REPLAY  $channelName",
+            style = MaterialTheme.typography.labelMedium,
+            color = Cable.Accent,
+            modifier = Modifier.padding(bottom = 12.dp)
+        )
+        LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            itemsIndexed(programs, key = { _, p -> p.start }) { idx, p ->
+                FocusSurface(
+                    onClick = { onPick(p) },
+                    modifier = (if (idx == 0) Modifier.focusRequester(focusRequester) else Modifier).fillMaxWidth(),
+                    shape = RoundedCornerShape(8.dp),
+                    focusScale = 1f
+                ) {
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .background(Cable.Surface)
+                            .padding(horizontal = 20.dp, vertical = 14.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = formatTime(p.start),
+                            style = MaterialTheme.typography.labelLarge,
+                            color = Cable.Accent,
+                            modifier = Modifier.width(120.dp)
+                        )
+                        Text(
+                            text = p.title,
+                            style = MaterialTheme.typography.titleMedium,
+                            color = Cable.Ink,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+            }
+        }
+        Text(
+            text = "BACK  Close",
+            style = MaterialTheme.typography.labelMedium,
+            color = Cable.Ink2,
+            modifier = Modifier.padding(top = 12.dp)
+        )
     }
 }
 

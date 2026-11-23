@@ -8,9 +8,13 @@ import org.json.JSONObject
  * Favorites, recently watched channels and on-demand resume points.
  * None of this is secret, so it lives in ordinary preferences.
  */
-class UserStateStore(context: Context) {
+class UserStateStore(context: Context, profileId: String = ProfileStore.DEFAULT_ID) {
 
-    private val prefs = context.getSharedPreferences("cabletv_user_state", Context.MODE_PRIVATE)
+    // The default profile keeps the original file name, so nothing is lost when profiles arrived.
+    private val prefs = context.getSharedPreferences(
+        if (profileId == ProfileStore.DEFAULT_ID) "cabletv_user_state" else "cabletv_user_state_$profileId",
+        Context.MODE_PRIVATE
+    )
 
     fun favorites(): Set<String> = prefs.getStringSet(K_FAV, emptySet())?.toSet() ?: emptySet()
 

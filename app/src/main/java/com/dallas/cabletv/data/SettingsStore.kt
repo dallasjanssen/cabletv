@@ -3,9 +3,11 @@ package com.dallas.cabletv.data
 import android.content.Context
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
+import java.security.MessageDigest
+import java.security.SecureRandom
 
 /**
- * Stores provider credentials and tokens encrypted on the device.
+ * Stores provider credentials, tokens, and the parental-lock PIN encrypted on the device.
  * Nothing secret lives in source code or in plain preferences.
  */
 class SettingsStore(context: Context) {
@@ -26,7 +28,8 @@ class SettingsStore(context: Context) {
         jellyfinServer = prefs.getString(K_JS, "").orEmpty(),
         jellyfinToken = prefs.getString(K_JT, "").orEmpty(),
         jellyfinUserId = prefs.getString(K_JU, "").orEmpty(),
-        hiddenFilters = prefs.getString(K_HIDDEN, "").orEmpty()
+        hiddenFilters = prefs.getString(K_HIDDEN, "").orEmpty(),
+        stripPrefixes = prefs.getBoolean(K_STRIP, false)
     )
 
     fun save(s: Settings) {
@@ -39,6 +42,7 @@ class SettingsStore(context: Context) {
             .putString(K_JT, s.jellyfinToken)
             .putString(K_JU, s.jellyfinUserId)
             .putString(K_HIDDEN, s.hiddenFilters)
+            .putBoolean(K_STRIP, s.stripPrefixes)
             .apply()
     }
 
@@ -49,9 +53,33 @@ class SettingsStore(context: Context) {
         prefs.edit().putString(K_LAST_CHANNEL, id).apply()
     }
 
+    fun hasPin(): Boolean = prefs.contains(K_PIN)
+
+    /** Stores a new PIN as a salted hash. Passing an empty string removes the lock. */
+    fun setPin(pin: String) {
+        if (pin.isEmpty()) {
+            prefs.edit().remove(K_PIN).apply()
+            return
+        }
+        val salt = ByteArray(16).also { SecureRandom().nextBytes(it) }
+        val saltHex = salt.joinToString("") { "%02x".format(it) }
+        prefs.edit().putString(K_PIN, "$saltHex:${hash(saltHex, pin)}").apply()
+    }
+
+    /** True when the PIN matches the stored one. Always false when no PIN is set. */
+    fun checkPin(pin: String): Boolean {
+        val stored = prefs.getString(K_PIN, null) ?: return false
+        val saltHex = stored.substringBefore(':')
+        return stored.substringAfter(':') == hash(saltHex, pin)
+    }
+
+    private fun hash(saltHex: String, pin: String): String {
+        val digest = MessageDigest.getInstance("SHA-256").digest((saltHex + pin).toByteArray(Charsets.UTF_8))
+        return digest.joinToString("") { "%02x".format(it) }
+    }
+
     private companion object {
         const val K_LAST_CHANNEL = "last_channel_id"
-        const val K_HIDDEN = "hidden_filters"
         const val K_XS = "xtream_server"
         const val K_XU = "xtream_user"
         const val K_XP = "xtream_pass"
@@ -59,5 +87,8 @@ class SettingsStore(context: Context) {
         const val K_JS = "jellyfin_server"
         const val K_JT = "jellyfin_token"
         const val K_JU = "jellyfin_user_id"
+        const val K_HIDDEN = "hidden_filters"
+        const val K_STRIP = "strip_prefixes"
+        const val K_PIN = "parental_pin"
     }
 }

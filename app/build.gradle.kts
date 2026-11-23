@@ -76,4 +76,6 @@ dependencies {
     implementation("io.coil-kt:coil-compose:2.7.0")
     // Draws the sign-in QR code on the TV.
     implementation("com.google.zxing:core:3.5.3")
+
+    testImplementation("junit:junit:4.13.2")
 }

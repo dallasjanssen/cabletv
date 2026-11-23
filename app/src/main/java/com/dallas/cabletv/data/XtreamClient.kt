@@ -61,7 +61,8 @@ class XtreamClient(server: String, private val user: String, private val pass: S
                 logo = o.optString("stream_icon").takeIf { it.isNotBlank() },
                 group = categories[o.optString("category_id")] ?: "Other",
                 streamUrl = "$base/live/${enc(user)}/${enc(pass)}/$id.ts",
-                epgId = o.optString("epg_channel_id").takeIf { it.isNotBlank() }
+                epgId = o.optString("epg_channel_id").takeIf { it.isNotBlank() },
+                catchup = o.optString("tv_archive") == "1"
             )
         }.sortedBy { it.number }
     }
@@ -138,6 +139,15 @@ class XtreamClient(server: String, private val user: String, private val pass: S
         return keyed
             .sortedWith(compareBy<Triple<Int, Int, VodItem>>({ it.first }, { it.second }))
             .map { it.third }
+    }
+
+    /** Replay URL for a programme that already aired on a channel with catch-up. Times are UTC. */
+    fun timeshiftUrl(streamId: String, startMs: Long, stopMs: Long): String {
+        val fmt = java.text.SimpleDateFormat("yyyy-MM-dd:HH-mm", java.util.Locale.US)
+        fmt.timeZone = java.util.TimeZone.getTimeZone("UTC")
+        val minutes = ((stopMs - startMs) / 60_000L).coerceAtLeast(1L)
+        val stamp = fmt.format(java.util.Date(startMs))
+        return "$base/timeshift/${enc(user)}/${enc(pass)}/$minutes/$stamp/$streamId.ts"
     }
 
     fun nowNext(streamId: String): NowNext {

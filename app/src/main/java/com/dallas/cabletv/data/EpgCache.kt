@@ -11,11 +11,15 @@ import java.util.Locale
 import java.util.concurrent.TimeUnit
 
 /**
- * The full programme schedule from the provider's XMLTV feed. Only programmes
- * from two hours ago to twelve hours ahead are kept, so memory stays small.
- * Channels are matched by their epg_channel_id.
+ * The full programme schedule from an XMLTV feed. The feed comes from the Xtream
+ * login, or from the guide link inside an M3U playlist. Programmes from the last day
+ * to twelve hours ahead are kept, so catch-up has something to show. Channels are
+ * matched by their epg_channel_id, or the playlist's tvg-id.
  */
 object EpgCache {
+
+    private const val DAY_MS = 24 * 3_600_000L
+    private const val AHEAD_MS = 12 * 3_600_000L
 
     private val lock = Any()
     private var programs: Map<String, List<Program>> = emptyMap()
@@ -25,10 +29,14 @@ object EpgCache {
         .readTimeout(180, TimeUnit.SECONDS)
         .build()
 
-    /** Downloads the feed and replaces the cache. Runs on a background thread. */
+    /** Downloads the feed from an Xtream login and replaces the cache. Runs on a background thread. */
     fun refresh(server: String, user: String, pass: String) {
         val base = server.trim().trimEnd('/')
-        val url = "$base/xmltv.php?username=${enc(user)}&password=${enc(pass)}"
+        refreshUrl("$base/xmltv.php?username=${enc(user)}&password=${enc(pass)}")
+    }
+
+    /** Downloads any XMLTV feed by URL and replaces the cache. Runs on a background thread. */
+    fun refreshUrl(url: String) {
         val req = Request.Builder().url(url).header("User-Agent", "CableTV/1.0").build()
         http.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) error("XMLTV returned HTTP ${resp.code}")
@@ -49,13 +57,23 @@ object EpgCache {
         return NowNext(current, next)
     }
 
+    /** Programmes that already aired on a channel in the last day, newest first. */
+    fun pastPrograms(epgId: String?): List<Program> {
+        if (epgId.isNullOrBlank()) return emptyList()
+        val list = synchronized(lock) { programs[epgId] } ?: return emptyList()
+        val now = System.currentTimeMillis()
+        return list
+            .filter { it.end <= now && it.end - it.start >= 60_000L }
+            .sortedByDescending { it.start }
+    }
+
     private fun enc(value: String): String = URLEncoder.encode(value, "UTF-8")
 
     /** Reads XMLTV with a streaming parser, keeping only the window around now. */
     internal fun parse(input: InputStream): Map<String, List<Program>> {
         val now = System.currentTimeMillis()
-        val from = now - 2 * 3_600_000L
-        val to = now + 12 * 3_600_000L
+        val from = now - DAY_MS
+        val to = now + AHEAD_MS
         val stamp = SimpleDateFormat("yyyyMMddHHmmss Z", Locale.US)
         val out = HashMap<String, MutableList<Program>>()
 

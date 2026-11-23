@@ -13,12 +13,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -27,10 +23,12 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
@@ -39,28 +37,37 @@ import androidx.compose.ui.unit.dp
 import com.dallas.cabletv.BuildConfig
 import com.dallas.cabletv.data.AppUpdater
 import com.dallas.cabletv.data.ChannelSource
+import com.dallas.cabletv.data.EpgCache
 import com.dallas.cabletv.data.JellyfinClient
 import com.dallas.cabletv.data.LiveChannel
+import com.dallas.cabletv.data.Profile
+import com.dallas.cabletv.data.ProfileStore
 import com.dallas.cabletv.data.Settings
 import com.dallas.cabletv.data.SettingsStore
-import com.dallas.cabletv.data.XtreamClient
-import com.dallas.cabletv.data.EpgCache
 import com.dallas.cabletv.data.UserStateStore
+import com.dallas.cabletv.data.VodItem
+import com.dallas.cabletv.data.XtreamClient
 import com.dallas.cabletv.data.channelFilters
+import com.dallas.cabletv.data.displayName
 import com.dallas.cabletv.data.isHidden
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.Calendar
 
-enum class Screen { Home, LiveTv, Guide, OnDemand, Settings }
+enum class Screen { Home, LiveTv, Guide, OnDemand, Search, Settings }
+
+/** Which PIN pad, if any, is on screen. */
+private enum class PinPurpose { NONE, UNLOCK, SET_NEW, SET_CONFIRM, REMOVE }
 
 private fun titleOf(screen: Screen): String = when (screen) {
     Screen.Home -> "CABLE"
     Screen.LiveTv -> "LIVE TV"
     Screen.Guide -> "PROGRAM GUIDE"
     Screen.OnDemand -> "ON DEMAND"
+    Screen.Search -> "SEARCH"
     Screen.Settings -> "SETTINGS"
 }
 
@@ -79,7 +86,9 @@ fun CableApp(store: SettingsStore) {
     // Every channel the source sent, and the list the screens show after hidden channels are removed.
     var loadedChannels by remember { mutableStateOf<List<LiveChannel>>(emptyList()) }
     val channels = remember(loadedChannels, settings) {
-        loadedChannels.filterNot { isHidden(it, settings.hiddenTerms) }
+        loadedChannels
+            .filterNot { isHidden(it, settings.hiddenTerms) }
+            .map { if (settings.stripPrefixes) it.copy(name = displayName(it.name)) else it }
     }
     var channelsLoading by remember { mutableStateOf(false) }
     var channelError by remember { mutableStateOf<String?>(null) }
@@ -92,31 +101,35 @@ fun CableApp(store: SettingsStore) {
     var updateMessage by remember { mutableStateOf<String?>(null) }
     var updateBusy by remember { mutableStateOf(false) }
 
+    // Profiles: each has its own favorites, recent channels, and resume points.
+    val profileStore = remember { ProfileStore(context) }
+    var profiles by remember { mutableStateOf(profileStore.profiles()) }
+    var profileId by remember { mutableStateOf(profileStore.active()) }
+    val userState = remember(profileId) { UserStateStore(context, profileId) }
+    var favorites by remember(userState) { mutableStateOf(userState.favorites()) }
+    var recents by remember(userState) { mutableStateOf(userState.recents()) }
+    val toggleFavorite: (LiveChannel) -> Unit = { ch ->
+        userState.toggleFavorite(ch.id)
+        favorites = userState.favorites()
+    }
+    val profileName = profiles.firstOrNull { it.id == profileId }?.name ?: "Main"
+
+    // The parental lock: Settings needs the PIN, and it stays open only until Settings is left.
+    var pinSet by remember { mutableStateOf(store.hasPin()) }
+    var settingsUnlocked by remember { mutableStateOf(false) }
+    var pinPurpose by remember { mutableStateOf(PinPurpose.NONE) }
+    var pinFirst by remember { mutableStateOf("") }
+    var pinError by remember { mutableStateOf<String?>(null) }
+    var pinNote by remember { mutableStateOf<String?>(null) }
+
+    // A title chosen in search opens in On Demand.
+    var pendingVod by remember { mutableStateOf<VodItem?>(null) }
+
     val xtream = remember(settings) {
         if (settings.hasXtream) {
             XtreamClient(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass)
         } else {
             null
-        }
-    }
-
-    // Favorites and recent channels live on this TV only.
-    val userState = remember { UserStateStore(context) }
-    var favorites by remember { mutableStateOf(userState.favorites()) }
-    var recents by remember { mutableStateOf(userState.recents()) }
-    val toggleFavorite: (LiveChannel) -> Unit = { ch ->
-        userState.toggleFavorite(ch.id)
-        favorites = userState.favorites()
-    }
-
-    // The full schedule is downloaded now and then hourly while an Xtream login is set.
-    LaunchedEffect(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass) {
-        if (!settings.hasXtream) return@LaunchedEffect
-        while (true) {
-            withContext(Dispatchers.IO) {
-                runCatching { EpgCache.refresh(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass) }
-            }
-            delay(60 * 60 * 1000L)
         }
     }
 
@@ -132,12 +145,20 @@ fun CableApp(store: SettingsStore) {
         channelsLoading = false
     }
 
-    // Ticking a checkbox saves straight away, so there is no SAVE step to forget on a remote.
-    val toggleFilter: (String) -> Unit = { term ->
-        val set = settings.hiddenTerms.toMutableSet()
-        if (!set.remove(term)) set.add(term)
-        settings = settings.copy(hiddenFilters = set.joinToString(","))
-        store.save(settings)
+    // The full schedule is downloaded now and then hourly: from the Xtream login, or the guide link in an M3U playlist.
+    LaunchedEffect(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass, settings.m3uUrl) {
+        while (settings.hasLiveSource) {
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    if (settings.hasXtream) {
+                        EpgCache.refresh(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass)
+                    } else {
+                        ChannelSource.guideUrl(settings)?.let { EpgCache.refreshUrl(it) }
+                    }
+                }
+            }
+            delay(60 * 60 * 1000L)
+        }
     }
 
     // Until the saved channel is found, live TV starts on it directly, so channel 1 never plays first.
@@ -153,6 +174,19 @@ fun CableApp(store: SettingsStore) {
             restoredChannel = true
             tuneIndex = startIndex
         }
+    }
+
+    // Ticking a checkbox saves straight away, so there is no SAVE step to forget on a remote.
+    val toggleFilter: (String) -> Unit = { term ->
+        val set = settings.hiddenTerms.toMutableSet()
+        if (!set.remove(term)) set.add(term)
+        settings = settings.copy(hiddenFilters = set.joinToString(","))
+        store.save(settings)
+    }
+
+    val toggleStrip: () -> Unit = {
+        settings = settings.copy(stripPrefixes = !settings.stripPrefixes)
+        store.save(settings)
     }
 
     // Asks GitHub for a newer build. A manual check always reports back, an automatic one stays quiet.
@@ -207,15 +241,31 @@ fun CableApp(store: SettingsStore) {
     LaunchedEffect(Unit) { checkForUpdate(manual = false) }
 
     val navigate: (Screen) -> Unit = { target ->
-        previous = screen
-        screen = target
+        if (target == Screen.Settings && pinSet && !settingsUnlocked) {
+            pinError = null
+            pinPurpose = PinPurpose.UNLOCK
+        } else {
+            previous = screen
+            screen = target
+        }
     }
     val goBack: () -> Unit = {
+        if (screen == Screen.Settings) settingsUnlocked = false
         screen = previous
         previous = Screen.Home
     }
 
     BackHandler(enabled = screen != Screen.Home) { goBack() }
+
+    // Cycles to the next profile and loads its favorites and recent channels.
+    val cycleProfile: () -> Unit = {
+        if (profiles.size > 1) {
+            val at = profiles.indexOfFirst { it.id == profileId }
+            val next = profiles[(at + 1) % profiles.size]
+            profileStore.setActive(next.id)
+            profileId = next.id
+        }
+    }
 
     // Scan lines are part of the menu look. Live video and playback are shown clean.
     val scanlineModifier = if (screen == Screen.LiveTv || screen == Screen.OnDemand) {
@@ -231,10 +281,20 @@ fun CableApp(store: SettingsStore) {
                 liveReady = settings.hasLiveSource,
                 onDemandReady = settings.hasJellyfin || settings.hasXtream,
                 updateAvailable = update != null,
+                profileName = profileName,
+                canCycleProfile = profiles.size > 1,
+                onCycleProfile = cycleProfile,
+                onSearch = { navigate(Screen.Search) },
                 onOpen = navigate
             )
             // Full-bleed screens draw their own scan lines, so playback can stay clean.
-            Screen.OnDemand -> OnDemandScreen(settings = settings, onExit = goBack)
+            Screen.OnDemand -> OnDemandScreen(
+                settings = settings,
+                profileId = profileId,
+                pendingVod = pendingVod,
+                onPendingConsumed = { pendingVod = null },
+                onExit = goBack
+            )
             Screen.LiveTv -> LiveTvScreen(
                 channels = channels,
                 loading = channelsLoading,
@@ -267,11 +327,29 @@ fun CableApp(store: SettingsStore) {
                                 screen = Screen.LiveTv
                             }
                         )
+                        Screen.Search -> SearchScreen(
+                            channels = channels,
+                            settings = settings,
+                            // Names are already shown without prefixes when that setting is on.
+                            stripPrefixes = false,
+                            onPlayChannel = { ch ->
+                                tuneIndex = channels.indexOfFirst { it.id == ch.id }.coerceAtLeast(0)
+                                previous = Screen.Search
+                                screen = Screen.LiveTv
+                            },
+                            onOpenVod = { vod ->
+                                pendingVod = vod
+                                previous = Screen.Search
+                                screen = Screen.OnDemand
+                            }
+                        )
                         Screen.Settings -> SettingsScreen(
                             current = settings,
                             onSave = { updated ->
                                 store.save(updated)
                                 settings = updated
+                                // Leaving Settings locks it again.
+                                settingsUnlocked = false
                                 previous = Screen.Home
                                 screen = Screen.Home
                             },
@@ -282,12 +360,94 @@ fun CableApp(store: SettingsStore) {
                             onCheckUpdate = { checkForUpdate(manual = true) },
                             onInstallUpdate = { installUpdate(it) },
                             allChannels = loadedChannels,
-                            onToggleFilter = toggleFilter
+                            onToggleFilter = toggleFilter,
+                            onToggleStrip = toggleStrip,
+                            profiles = profiles,
+                            activeProfileId = profileId,
+                            onAddProfile = { name ->
+                                profileStore.add(name)
+                                profiles = profileStore.profiles()
+                            },
+                            onRemoveProfile = { id ->
+                                profileStore.remove(id)
+                                profiles = profileStore.profiles()
+                                profileId = profileStore.active()
+                            },
+                            pinSet = pinSet,
+                            pinNote = pinNote,
+                            onSetPin = {
+                                pinError = null
+                                pinPurpose = PinPurpose.SET_NEW
+                            },
+                            onRemovePin = {
+                                pinError = null
+                                pinPurpose = PinPurpose.REMOVE
+                            }
                         )
                         else -> Unit
                     }
                 }
             }
+        }
+
+        // The PIN pad sits over whatever is showing.
+        when (pinPurpose) {
+            PinPurpose.NONE -> Unit
+            PinPurpose.UNLOCK -> PinPad(
+                title = "PARENTAL LOCK",
+                subtitle = pinError ?: "Enter the PIN to open Settings.",
+                onComplete = { entered ->
+                    if (store.checkPin(entered)) {
+                        settingsUnlocked = true
+                        pinPurpose = PinPurpose.NONE
+                        navigate(Screen.Settings)
+                    } else {
+                        pinError = "Wrong PIN. Try again."
+                    }
+                },
+                onCancel = { pinPurpose = PinPurpose.NONE }
+            )
+            PinPurpose.SET_NEW -> PinPad(
+                title = "NEW PIN",
+                subtitle = pinError ?: "Enter four digits.",
+                onComplete = { entered ->
+                    pinFirst = entered
+                    pinError = null
+                    pinPurpose = PinPurpose.SET_CONFIRM
+                },
+                onCancel = { pinPurpose = PinPurpose.NONE }
+            )
+            PinPurpose.SET_CONFIRM -> PinPad(
+                title = "CONFIRM PIN",
+                subtitle = pinError ?: "Enter the same four digits again.",
+                onComplete = { entered ->
+                    if (entered == pinFirst) {
+                        store.setPin(entered)
+                        pinSet = true
+                        pinNote = "PIN set. Settings now need it to open."
+                        pinPurpose = PinPurpose.NONE
+                    } else {
+                        pinError = "The PINs did not match. Start again."
+                        pinPurpose = PinPurpose.SET_NEW
+                    }
+                },
+                onCancel = { pinPurpose = PinPurpose.NONE }
+            )
+            PinPurpose.REMOVE -> PinPad(
+                title = "REMOVE PIN",
+                subtitle = pinError ?: "Enter the current PIN to remove the lock.",
+                onComplete = { entered ->
+                    if (store.checkPin(entered)) {
+                        store.setPin("")
+                        pinSet = false
+                        pinNote = "PIN removed."
+                        pinPurpose = PinPurpose.NONE
+                    } else {
+                        pinError = "Wrong PIN. Try again."
+                    }
+                },
+                onCancel = { pinPurpose = PinPurpose.NONE }
+            )
         }
     }
 }
@@ -302,6 +462,10 @@ private fun HomeMenu(
     liveReady: Boolean,
     onDemandReady: Boolean,
     updateAvailable: Boolean,
+    profileName: String,
+    canCycleProfile: Boolean,
+    onCycleProfile: () -> Unit,
+    onSearch: () -> Unit,
     onOpen: (Screen) -> Unit
 ) {
     val firstButton = remember { FocusRequester() }
@@ -331,17 +495,25 @@ private fun HomeMenu(
             .padding(horizontal = 48.dp, vertical = 32.dp),
         verticalArrangement = Arrangement.spacedBy(20.dp)
     ) {
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Text(
                 text = "CABLE TV",
                 style = MaterialTheme.typography.headlineLarge,
-                color = Cable.Led
+                color = Cable.Led,
+                modifier = Modifier.weight(1f)
             )
+            CableButton(label = "SEARCH", onClick = onSearch)
+            Spacer(Modifier.width(12.dp))
+            CableButton(
+                label = if (canCycleProfile) "PROFILE: ${profileName.uppercase()}" else profileName.uppercase(),
+                enabled = canCycleProfile,
+                onClick = onCycleProfile
+            )
+            Spacer(Modifier.width(20.dp))
             Text(
                 text = if (updateAvailable) "UPDATE READY IN SETTINGS" else "PRESS 1-4",
                 style = MaterialTheme.typography.bodyMedium,
-                color = if (updateAvailable) Cable.Accent else Cable.Ink3,
-                modifier = Modifier.padding(top = 14.dp)
+                color = if (updateAvailable) Cable.Accent else Cable.Ink3
             )
         }
 
@@ -443,7 +615,16 @@ private fun SettingsScreen(
     onCheckUpdate: () -> Unit,
     onInstallUpdate: (AppUpdater.Release) -> Unit,
     allChannels: List<LiveChannel>,
-    onToggleFilter: (String) -> Unit
+    onToggleFilter: (String) -> Unit,
+    onToggleStrip: () -> Unit,
+    profiles: List<Profile>,
+    activeProfileId: String,
+    onAddProfile: (String) -> Unit,
+    onRemoveProfile: (String) -> Unit,
+    pinSet: Boolean,
+    pinNote: String?,
+    onSetPin: () -> Unit,
+    onRemovePin: () -> Unit
 ) {
     var xs by remember { mutableStateOf(current.xtreamServer) }
     var xu by remember { mutableStateOf(current.xtreamUser) }
@@ -452,6 +633,7 @@ private fun SettingsScreen(
     var js by remember { mutableStateOf(current.jellyfinServer) }
     var ju by remember { mutableStateOf("") }
     var jp by remember { mutableStateOf("") }
+    var newProfile by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
     var message by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
@@ -507,7 +689,9 @@ private fun SettingsScreen(
                         jellyfinServer = jServer,
                         jellyfinToken = token,
                         jellyfinUserId = userId,
-                        hiddenFilters = current.hiddenFilters
+                        // These are changed on their own rows, so the save keeps what is current.
+                        hiddenFilters = current.hiddenFilters,
+                        stripPrefixes = current.stripPrefixes
                     )
                 }
             }
@@ -563,9 +747,83 @@ private fun SettingsScreen(
 
         SettingsCard(
             title = "LIVE TV PLAYLIST",
-            subtitle = "M3U URL. Used only when no Xtream login is set."
+            subtitle = "M3U URL. Used only when no Xtream login is set. A guide link inside the playlist is used automatically."
         ) {
             CableField("Playlist URL", m3u) { m3u = it }
+        }
+
+        SettingsCard(
+            title = "ON DEMAND",
+            subtitle = "Jellyfin server, optional. Provider movies and series use the Live TV login."
+        ) {
+            CableField("Server URL", js) { js = it }
+            CableField("Username (only to sign in again)", ju) { ju = it }
+            CableField("Password", jp, secret = true) { jp = it }
+        }
+
+        SettingsCard(
+            title = "PARENTAL LOCK",
+            subtitle = if (pinSet) {
+                "Settings need the PIN to open. Hidden channels can only be changed from Settings."
+            } else {
+                "Set a PIN so children cannot open Settings or change hidden channels."
+            }
+        ) {
+            pinNote?.let { StatusLine(it) }
+            Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                if (pinSet) {
+                    CableButton(label = "CHANGE PIN", onClick = onSetPin)
+                    CableButton(label = "REMOVE PIN", onClick = onRemovePin)
+                } else {
+                    CableButton(label = "SET PIN", primary = true, onClick = onSetPin)
+                }
+            }
+        }
+
+        SettingsCard(
+            title = "PROFILES",
+            subtitle = "Each profile keeps its own favorites, recent channels and resume points. Press PROFILE on the home screen to switch."
+        ) {
+            profiles.forEach { p ->
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    Text(
+                        text = if (p.id == activeProfileId) "${p.name}   (in use)" else p.name,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = Cable.Ink,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                    if (p.id != com.dallas.cabletv.data.ProfileStore.DEFAULT_ID) {
+                        CableButton(label = "REMOVE", onClick = { onRemoveProfile(p.id) })
+                    }
+                }
+            }
+            CableField("New profile name", newProfile) { newProfile = it }
+            CableButton(
+                label = "ADD PROFILE",
+                primary = true,
+                enabled = newProfile.isNotBlank(),
+                onClick = {
+                    onAddProfile(newProfile)
+                    newProfile = ""
+                }
+            )
+        }
+
+        SettingsCard(
+            title = "CHANNEL NAMES",
+            subtitle = "Hide the country code at the start of names, so UK| BBC One shows as BBC One."
+        ) {
+            FilterCheckbox(
+                label = "Hide country codes",
+                count = null,
+                checked = current.stripPrefixes,
+                onToggle = onToggleStrip
+            )
         }
 
         SettingsCard(
@@ -577,15 +835,6 @@ private fun SettingsScreen(
                 hiddenTerms = current.hiddenTerms,
                 onToggle = onToggleFilter
             )
-        }
-
-        SettingsCard(
-            title = "ON DEMAND",
-            subtitle = "Jellyfin server, optional. Provider movies and series use the Live TV login."
-        ) {
-            CableField("Server URL", js) { js = it }
-            CableField("Username (only to sign in again)", ju) { ju = it }
-            CableField("Password", jp, secret = true) { jp = it }
         }
 
         SettingsCard(
@@ -661,11 +910,11 @@ private fun HiddenChannelFilters(
 }
 
 /**
- * A large checkbox row for the remote. A ticked box means the channels are hidden.
- * The whole row is one focus target, so OK toggles it and the ring shows where you are.
+ * A large checkbox row for the remote. A ticked box is on. The whole row is one focus
+ * target, so OK toggles it and the ring shows where you are.
  */
 @Composable
-private fun FilterCheckbox(label: String, count: Int, checked: Boolean, onToggle: () -> Unit) {
+private fun FilterCheckbox(label: String, count: Int?, checked: Boolean, onToggle: () -> Unit) {
     FocusSurface(
         onClick = onToggle,
         modifier = Modifier.fillMaxWidth(),
@@ -703,11 +952,13 @@ private fun FilterCheckbox(label: String, count: Int, checked: Boolean, onToggle
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f)
             )
-            Text(
-                text = "$count",
-                style = MaterialTheme.typography.bodyMedium,
-                color = Cable.Ink2
-            )
+            if (count != null) {
+                Text(
+                    text = "$count",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Cable.Ink2
+                )
+            }
         }
     }
 }
@@ -761,7 +1012,7 @@ private fun StatusLine(text: String) {
  * and returns the highlight to the field.
  */
 @Composable
-private fun CableField(label: String, value: String, secret: Boolean = false, onChange: (String) -> Unit) {
+internal fun CableField(label: String, value: String, secret: Boolean = false, onChange: (String) -> Unit) {
     var editing by remember { mutableStateOf(false) }
     val row = remember { FocusRequester() }
     val input = remember { FocusRequester() }
