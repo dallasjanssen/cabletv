@@ -37,7 +37,6 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
-import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import coil.compose.AsyncImage
 import com.dallas.cabletv.data.EpgCache
@@ -45,11 +44,16 @@ import com.dallas.cabletv.data.LiveChannel
 import com.dallas.cabletv.data.NowNext
 import com.dallas.cabletv.data.Program
 import com.dallas.cabletv.data.XtreamClient
+import com.dallas.cabletv.data.newPlayer
+import com.dallas.cabletv.data.playbackHttpStatus
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 private const val MAX_RETRIES = 4
 
@@ -76,7 +80,14 @@ fun LiveTvScreen(
     onChannelChanged: (LiveChannel) -> Unit = {}
 ) {
     val context = LocalContext.current
-    val player = remember { ExoPlayer.Builder(context).build() }
+    val player = remember { newPlayer(context) }
+    val scope = rememberCoroutineScope()
+    // Which load is current, and which of those loads has actually started playing.
+    val session = remember { AtomicInteger(0) }
+    val readySession = remember { AtomicInteger(-1) }
+    val triedLiveFallback = remember { AtomicBoolean(false) }
+    val liveOverride = remember { mutableStateOf<String?>(null) }
+    val fallbackFor = remember { mutableStateOf<String?>(null) }
 
     var index by remember(startIndex) { mutableIntStateOf(startIndex) }
     var playerError by remember { mutableStateOf<String?>(null) }
@@ -99,11 +110,33 @@ fun LiveTvScreen(
     BackHandler(enabled = replayUrl != null && !showReplay && !showMiniGuide) { replayUrl = null }
     val focus = remember { FocusRequester() }
     val current = channels.getOrNull(index)
-    val playUrl = replayUrl ?: current?.streamUrl
+    val latestChannel = rememberUpdatedState(current)
+    val latestReplay = rememberUpdatedState(replayUrl)
+    val channelFallback = if (fallbackFor.value == current?.id) liveOverride.value else null
+    val playUrl = replayUrl ?: channelFallback ?: current?.streamUrl
+    val latestPlayUrl = rememberUpdatedState(playUrl)
 
     DisposableEffect(player) {
         val listener = object : Player.Listener {
             override fun onPlayerError(e: PlaybackException) {
+                val fallback = latestChannel.value?.fallbackStreamUrl
+                val status = playbackHttpStatus(e)
+                val played = readySession.get() == session.get()
+                // One switch from HLS to MPEG-TS when the panel refuses the manifest before it plays.
+                if (
+                    latestReplay.value == null &&
+                    !triedLiveFallback.get() &&
+                    !played &&
+                    !fallback.isNullOrBlank() &&
+                    fallback != latestPlayUrl.value &&
+                    status != null &&
+                    status >= 400
+                ) {
+                    triedLiveFallback.set(true)
+                    fallbackFor.value = latestChannel.value?.id
+                    liveOverride.value = fallback
+                    return
+                }
                 // Retry a few times before saying there is no signal, since most failures are brief.
                 if (retries < MAX_RETRIES) {
                     retries++
@@ -116,6 +149,8 @@ fun LiveTvScreen(
             override fun onPlaybackStateChanged(playbackState: Int) {
                 buffering = playbackState == Player.STATE_BUFFERING
                 if (playbackState == Player.STATE_READY) {
+                    val tag = player.currentMediaItem?.localConfiguration?.tag
+                    if (tag == session.get()) readySession.set(session.get())
                     retries = 0
                     playerError = null
                 }
@@ -137,14 +172,22 @@ fun LiveTvScreen(
         }
     }
 
-    // Load whatever should be on screen: the live channel or a replay. A short wait means
+    // A new channel gets its own HLS attempt. A channel that already fell back to TS keeps that address.
+    LaunchedEffect(current?.id) {
+        triedLiveFallback.set(false)
+    }
+
+    // Load whatever should be on screen: the live channel, its TS fallback, or a replay. A short wait means
     // holding a key only loads the channel you stop on, not every one on the way.
     LaunchedEffect(playUrl) {
+        val id = session.incrementAndGet()
+        readySession.set(-1)
         if (playUrl == null) return@LaunchedEffect
         delay(300)
+        if (session.get() != id) return@LaunchedEffect
         playerError = null
         retries = 0
-        player.setMediaItem(MediaItem.fromUri(playUrl))
+        player.setMediaItem(MediaItem.Builder().setUri(playUrl).setTag(id).build())
         player.prepare()
         player.playWhenReady = true
     }
@@ -242,8 +285,15 @@ fun LiveTvScreen(
         }
     }
 
-    val replayPrograms = remember(current?.id, showReplay) {
-        if (current != null && current.catchup && epg != null) EpgCache.pastPrograms(current.epgId) else emptyList()
+    val replayPrograms = remember(current?.id, current?.archiveDays, showReplay) {
+        val channel = current
+        if (channel != null && channel.catchup && epg != null) {
+            val day = 24L * 3_600_000L
+            val window = if (channel.archiveDays > 0) channel.archiveDays * day else day
+            EpgCache.pastPrograms(channel.epgId, window)
+        } else {
+            emptyList()
+        }
     }
 
     LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
@@ -389,11 +439,20 @@ fun LiveTvScreen(
                 programs = replayPrograms,
                 focusRequester = replayFocus,
                 onPick = { p ->
-                    val url = epg?.timeshiftUrl(current.id, p.start, p.end)
-                    if (url != null) {
-                        replayUrl = url
-                        showReplay = false
-                        flashBanner()
+                    val client = epg
+                    if (client != null) {
+                        val channelId = current.id
+                        val requested = index
+                        scope.launch {
+                            val url = withContext(Dispatchers.IO) {
+                                runCatching { client.resolveTimeshiftUrl(channelId, p.start, p.end) }.getOrNull()
+                            }
+                            if (url != null && index == requested) {
+                                replayUrl = url
+                                showReplay = false
+                                flashBanner()
+                            }
+                        }
                     }
                 },
                 modifier = Modifier.align(Alignment.CenterEnd)

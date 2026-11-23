@@ -49,6 +49,7 @@ import com.dallas.cabletv.data.SettingsStore
 import com.dallas.cabletv.data.UserStateStore
 import com.dallas.cabletv.data.VodItem
 import com.dallas.cabletv.data.XtreamClient
+import com.dallas.cabletv.data.xtreamLoginFields
 import com.dallas.cabletv.data.channelFilters
 import com.dallas.cabletv.data.displayName
 import com.dallas.cabletv.data.isHidden
@@ -686,10 +687,18 @@ private fun SettingsScreen(
         scope.launch {
             val result = runCatching {
                 withContext(Dispatchers.IO) {
-                    val xServer = xs.trim()
-                    if (xServer.isNotBlank() && xu.isNotBlank() && xp.isNotBlank()) {
-                        val ok = XtreamClient(xServer, xu.trim(), xp).login()
-                        check(ok) { "Live TV login failed. Check server, user and password." }
+                    val (xServer, xUser, xPass) = if (
+                        xs.trim().isNotBlank() || xu.isNotBlank() || xp.isNotBlank()
+                    ) {
+                        xtreamLoginFields(xs, xu, xp)
+                    } else {
+                        Triple("", "", "")
+                    }
+                    if (xServer.isNotBlank() || xUser.isNotBlank() || xPass.isNotBlank()) {
+                        check(xServer.isNotBlank() && xUser.isNotBlank() && xPass.isNotBlank()) {
+                            "Live TV login failed. Check server, user and password."
+                        }
+                        XtreamClient(xServer, xUser, xPass).requireActive()
                     }
 
                     var token = current.jellyfinToken
@@ -707,8 +716,8 @@ private fun SettingsScreen(
 
                     Settings(
                         xtreamServer = xServer,
-                        xtreamUser = xu.trim(),
-                        xtreamPass = xp,
+                        xtreamUser = xUser,
+                        xtreamPass = xPass,
                         m3uUrl = m3u.trim(),
                         jellyfinServer = jServer,
                         jellyfinToken = token,
@@ -721,7 +730,12 @@ private fun SettingsScreen(
             }
             busy = false
             result
-                .onSuccess { onSave(it) }
+                .onSuccess {
+                    xs = it.xtreamServer
+                    xu = it.xtreamUser
+                    xp = it.xtreamPass
+                    onSave(it)
+                }
                 .onFailure { message = "Save failed: ${it.message}" }
         }
     }
@@ -762,7 +776,7 @@ private fun SettingsScreen(
 
         SettingsCard(
             title = "LIVE TV",
-            subtitle = "Xtream Codes login. Used first when it is filled in."
+            subtitle = "Xtream Codes login, used first when it is filled in. A pasted get.php link is split into these fields."
         ) {
             CableField("Server URL", xs) { xs = it }
             CableField("Username", xu) { xu = it }

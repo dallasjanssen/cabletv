@@ -32,7 +32,6 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.TrackSelectionOverride
-import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import coil.compose.AsyncImage
@@ -41,6 +40,7 @@ import com.dallas.cabletv.data.Settings
 import com.dallas.cabletv.data.UserStateStore
 import com.dallas.cabletv.data.VodItem
 import com.dallas.cabletv.data.XtreamClient
+import com.dallas.cabletv.data.newPlayer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -594,7 +594,7 @@ private fun VodPlayer(
     onPlayNext: (VodItem) -> Unit
 ) {
     val context = LocalContext.current
-    val player = remember { ExoPlayer.Builder(context).build() }
+    val player = remember { newPlayer(context) }
     var failed by remember { mutableStateOf(false) }
     var showMenu by remember { mutableStateOf(false) }
     var resizeMode by remember { mutableIntStateOf(AspectRatioFrameLayout.RESIZE_MODE_FIT) }

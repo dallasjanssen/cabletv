@@ -26,7 +26,7 @@ object ChannelSource {
     fun guideUrl(s: Settings): String? {
         if (s.hasXtream || s.m3uUrl.isBlank()) return null
         return runCatching {
-            val req = Request.Builder().url(s.m3uUrl).header("User-Agent", "CableTV/1.0").build()
+            val req = Request.Builder().url(s.m3uUrl).header("User-Agent", PLAYER_USER_AGENT).build()
             playlistHttp.newCall(req).execute().use { resp ->
                 resp.body?.source()?.readUtf8Line()?.let { M3uParser.guideUrlFrom(it) }
             }
@@ -94,7 +94,7 @@ private val playlistHttp = OkHttpClient.Builder()
     .build()
 
 fun fetchText(url: String): String {
-    val req = Request.Builder().url(url).header("User-Agent", "CableTV/1.0").build()
+    val req = Request.Builder().url(url).header("User-Agent", PLAYER_USER_AGENT).build()
     playlistHttp.newCall(req).execute().use { resp ->
         if (!resp.isSuccessful) error("Playlist returned HTTP ${resp.code}")
         return resp.body?.string() ?: error("Playlist was empty")
