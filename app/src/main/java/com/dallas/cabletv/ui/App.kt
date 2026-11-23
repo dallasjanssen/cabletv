@@ -32,6 +32,8 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.dallas.cabletv.BuildConfig
@@ -495,26 +497,31 @@ private fun HomeMenu(
             .padding(horizontal = 48.dp, vertical = 32.dp),
         verticalArrangement = Arrangement.spacedBy(20.dp)
     ) {
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        // The title sits on its own line, so it never squeezes out on a narrow screen.
+        Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text(
                 text = "CABLE TV",
                 style = MaterialTheme.typography.headlineLarge,
-                color = Cable.Led,
-                modifier = Modifier.weight(1f)
+                color = Cable.Led
             )
-            CableButton(label = "SEARCH", onClick = onSearch)
-            Spacer(Modifier.width(12.dp))
-            CableButton(
-                label = if (canCycleProfile) "PROFILE: ${profileName.uppercase()}" else profileName.uppercase(),
-                enabled = canCycleProfile,
-                onClick = onCycleProfile
-            )
-            Spacer(Modifier.width(20.dp))
-            Text(
-                text = if (updateAvailable) "UPDATE READY IN SETTINGS" else "PRESS 1-4",
-                style = MaterialTheme.typography.bodyMedium,
-                color = if (updateAvailable) Cable.Accent else Cable.Ink3
-            )
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                CableButton(label = "SEARCH", onClick = onSearch)
+                CableButton(
+                    label = if (canCycleProfile) "PROFILE: ${profileName.uppercase()}" else profileName.uppercase(),
+                    enabled = canCycleProfile,
+                    onClick = onCycleProfile
+                )
+                Text(
+                    text = if (updateAvailable) "UPDATE READY IN SETTINGS" else "PRESS 1-4",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = if (updateAvailable) Cable.Accent else Cable.Ink3,
+                    modifier = Modifier.weight(1f)
+                )
+            }
         }
 
         Column(
@@ -569,39 +576,56 @@ private fun MenuButton(
         shape = shape,
         focusScale = 1.03f
     ) {
-        Row(
+        BoxWithConstraints(
             Modifier
                 .fillMaxSize()
                 .background(Cable.Surface)
                 .border(2.dp, Cable.Accent.copy(alpha = 0.45f), shape)
-                .padding(horizontal = 28.dp, vertical = 16.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(24.dp)
+                .padding(20.dp),
+            contentAlignment = Alignment.Center
         ) {
-            Text(
-                text = number.toString(),
-                style = CableNumber,
-                color = Cable.Accent
-            )
-            Column(Modifier.weight(1f)) {
-                Text(
-                    text = label,
-                    style = MaterialTheme.typography.titleLarge,
-                    color = Cable.Led,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    text = status,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = Cable.Ink2,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
+            // Narrow cards (phones) stack the number above the words. Wide cards (TVs) keep them side by side.
+            if (maxWidth < 360.dp) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(text = number.toString(), style = CableNumber, color = Cable.Accent)
+                    Spacer(Modifier.height(8.dp))
+                    CardWords(label, status, MaterialTheme.typography.titleMedium, TextAlign.Center)
+                }
+            } else {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(24.dp)
+                ) {
+                    Text(text = number.toString(), style = CableNumber, color = Cable.Accent)
+                    Column(Modifier.weight(1f)) {
+                        CardWords(label, status, MaterialTheme.typography.titleLarge, TextAlign.Start)
+                    }
+                }
             }
         }
     }
+}
+
+/** The name and status of a home card. Long names wrap onto a second line instead of being cut off. */
+@Composable
+private fun CardWords(label: String, status: String, labelStyle: TextStyle, align: TextAlign) {
+    Text(
+        text = label,
+        style = labelStyle,
+        color = Cable.Led,
+        textAlign = align,
+        maxLines = 2,
+        overflow = TextOverflow.Ellipsis
+    )
+    Spacer(Modifier.height(4.dp))
+    Text(
+        text = status,
+        style = MaterialTheme.typography.bodyMedium,
+        color = Cable.Ink2,
+        textAlign = align,
+        maxLines = 2,
+        overflow = TextOverflow.Ellipsis
+    )
 }
 
 @Composable
