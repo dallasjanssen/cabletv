@@ -20,8 +20,12 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.foundation.focusGroup
+import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.focusRestorer
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
@@ -86,6 +90,7 @@ private fun Tab.toScreen(): Screen = when (this) {
     Tab.Settings -> Screen.Settings
 }
 
+@OptIn(ExperimentalComposeUiApi::class)
 @Composable
 fun CableApp(store: SettingsStore) {
     val context = LocalContext.current
@@ -808,6 +813,26 @@ fun CableApp(store: SettingsStore) {
     // Live TV takes focus back when these close, so the next key press works.
     val overlayOpen = pinPurpose != PinPurpose.NONE || reminderShown != null
 
+    // The other screens get focus back too. When an overlay closes and nothing on the screen has
+    // focus, the item that had it before is focused again, or the screen's first item.
+    val screenFocus = remember { FocusRequester() }
+    var screenHasFocus by remember { mutableStateOf(false) }
+    var overlayWasOpen by remember { mutableStateOf(false) }
+    val anyOverlay = overlayOpen || showProfiles
+    LaunchedEffect(anyOverlay) {
+        if (anyOverlay) {
+            overlayWasOpen = true
+            return@LaunchedEffect
+        }
+        if (!overlayWasOpen) return@LaunchedEffect
+        overlayWasOpen = false
+        if (screen == Screen.Live) return@LaunchedEffect
+        // Give the screen a moment to place its own focus first.
+        withFrameNanos { }
+        withFrameNanos { }
+        if (!screenHasFocus) runCatching { screenFocus.requestFocus() }
+    }
+
     // ------------------------------------------------------------ Layout
     val density = LocalDensity.current
     Box(Modifier.fillMaxSize().background(Tv.Bg)) {
@@ -829,7 +854,15 @@ fun CableApp(store: SettingsStore) {
             LiveVideo(live, placement.zIndex(if (pip) 2f else 0f))
         }
 
-        Box(Modifier.fillMaxSize().zIndex(1f)) {
+        Box(
+            Modifier
+                .fillMaxSize()
+                .zIndex(1f)
+                .onFocusChanged { screenHasFocus = it.hasFocus }
+                .focusRequester(screenFocus)
+                .focusRestorer()
+                .focusGroup()
+        ) {
             when (screen) {
                 Screen.Welcome -> WelcomeScreen(
                     busy = welcomeBusy,

@@ -51,6 +51,8 @@ fun Shelf(title: String, side: Dp, state: LazyListState, modifier: Modifier = Mo
 @Composable
 fun ChannelCard(ch: LiveChannel, now: Program?, favorite: Boolean, onClick: () -> Unit, modifier: Modifier = Modifier) {
     var focused by remember { mutableStateOf(false) }
+    // Ticks so the progress line moves while the card stays on screen.
+    val clock = rememberNow()
     Column(modifier.width(168.dp)) {
         Focusable(
             onClick = onClick,
@@ -68,9 +70,9 @@ fun ChannelCard(ch: LiveChannel, now: Program?, favorite: Boolean, onClick: () -
             if (favorite) {
                 Icon(TvIcons.StarFilled, contentDescription = "Favorite", tint = Tv.Accent, modifier = Modifier.align(Alignment.TopEnd).padding(6.dp).size(14.dp))
             }
-            if (now != null && isOnNow(now)) {
+            if (now != null && isOnNow(now, clock)) {
                 ProgressBar(
-                    progressOf(now),
+                    progressOf(now, clock),
                     Modifier.align(Alignment.BottomStart).fillMaxWidth(),
                     track = Color(0x59000000),
                     height = 3.dp

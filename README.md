@@ -6,18 +6,19 @@ A personal, sideloaded Android and Android TV app that pulls together:
 - **Program guide** from the login, from a playlist, or from a guide link you paste in Settings, about two days ahead and two days behind
 - **On Demand** from your Jellyfin server and from the provider's movie and show categories
 
-It opens straight into live TV on the last channel you watched. Menus sit on top of the picture, so the channel keeps playing behind Home and in a corner of the guide. Back from live TV opens Home, and Back again leaves the app. Keep watching on Home returns to the picture.
+It opens straight into live TV on the last channel you watched. Menus sit on top of the picture, so the channel keeps playing behind Home and in a corner of the guide. Back from live TV opens Home, and Back again leaves the app. Keep watching on Home returns to the picture. Pressing the remote's Home button stops the picture and lets go of the provider connection; it starts again when you come back.
 
 The screens are laid out for Android TV's 960 by 540 grid, with one typeface (Figtree), a dark low-glare background, and one focus style: whatever is selected turns white. Everything works with only the arrows, OK and Back. Channel and number keys are shortcuts for remotes that have them.
 
 ## Screens
 
-- **Live TV**: up and down change channel. OK opens a bar with Guide, Home, Search, Channel list, Favorite, Pause, Watch from the start, Record, Two channels, and Audio and captions. Left opens the channel list while you are at the live edge. After a pause, Left and Right move inside the few minutes already buffered. A replay can be paused and skipped; Back returns from the replay to the live channel. Playlist catch-up uses the tags in the M3U.
+- **Live TV**: up and down change channel. OK opens a bar with Guide, Home, Search, Channel list, Favorite, Pause, Watch from the start, Record, Two channels, and Audio and captions. Left opens the channel list while you are at the live edge. After a pause, Left and Right move inside the few minutes already buffered, and a badge shows while you are paused or behind live. A replay can be paused and skipped; Back returns from the replay to the live channel, and a replay that reaches its end returns there by itself. Playlist catch-up uses the tags in the M3U. Up and down skip locked channels. A locked channel says so on screen, and OK asks for the PIN. When the channels do not load, Try again and Settings are on screen.
 - **Home**: what is on now, with Keep watching and Guide buttons, then rows for favorite and recent channels, half-watched titles, and new movies and shows.
-- **Guide**: a time grid covering tomorrow and the recent past, with a line for now, details of the highlighted show, and a preview of the channel playing. Refresh guide downloads the listings again. Left from a channel name picks a category. Up from the category reaches Refresh guide. OK on a channel name offers Watch now and Favorite. OK on a show that has not started yet offers a reminder or a recording.
+- **Guide**: a time grid covering tomorrow and the recent past, with a line for now, details of the highlighted show, and a preview of the channel playing. Refresh guide downloads the listings again. Left from a channel name picks a category. Up from the category reaches Refresh guide. OK on a channel name offers Watch now and Favorite. OK on a show that has not started yet offers a reminder or a recording. OK on the show on now offers Watch now and, when the channel keeps an archive, Watch from the start. OK on a show that has ended plays it from the start. A channel with no listings goes straight back to its name with Left.
 - **Movies & Shows**: provider categories and Jellyfin genres, plus continue and recently added. A title opens a details page with the plot and year when the provider sends them. The next episode waits ten seconds and can be cancelled. Each profile can have its own Jellyfin login, so continue watching is not shared.
-- **Search**: an on-screen keyboard with results beside it, for channels, shows on now or later, movies and series.
-- **Settings**: phone setup, live TV (including a Guide URL and subscription expiry), Jellyfin, channel list, profiles, parental lock, recordings and updates. Hidden channels belong to the profile. Locked groups need the PIN before they play. Each section saves by itself.
+- **Search**: an on-screen keyboard with results beside it, for channels, shows on now or later, movies and series. Accents and punctuation are ignored, so "tele" finds "Télé". A row of symbol keys sits under the letters.
+- **Two channels**: two pictures side by side. Left and right pick a picture, and only that one plays sound. Up and down change its channel. Locked channels are skipped.
+- **Settings**: phone setup, live TV (including a Guide URL and subscription expiry), Jellyfin, channel list, profiles, parental lock, recordings and updates. Hidden channels belong to the profile. Locked groups need the PIN before they play; movie and show categories can be locked too. After five wrong PINs, the PIN pad waits 30 seconds. Each section saves by itself, and leaving with unsaved typing says so. A running recording can be stopped in Recordings.
 - **First launch**: with nothing set up, the app opens on a QR code. Focus starts on New code.
 
 ## Remote and keyboard controls
@@ -29,7 +30,7 @@ The screens are laid out for Android TV's 960 by 540 grid, with one typeface (Fi
 | Everything you can do while watching | OK |
 | Channel list | Left, while the channel is live |
 | Rewind a few minutes | Pause, then Left. Right moves forward. Back to live is in the OK bar |
-| Jump to a channel | Type the number (up to 4 digits), in live TV or the guide |
+| Jump to a channel | Type the number (up to 4 digits), in live TV or anywhere on the guide. OK tunes straight away |
 | Home, while watching | Back |
 | Leave the app | Back again, from Home |
 | Skip in a replay | Left 10 seconds, right 30 seconds |
