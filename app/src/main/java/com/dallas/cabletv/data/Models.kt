@@ -15,7 +15,9 @@ data class LiveChannel(
 data class Program(
     val title: String,
     val start: Long,
-    val end: Long
+    val end: Long,
+    /** The guide's description of the programme, when the feed has one. */
+    val desc: String = ""
 )
 
 data class NowNext(
@@ -36,7 +38,17 @@ data class VodItem(
     /** Date added, used to sort provider titles newest first. */
     val addedAt: Long = 0L,
     /** True when the viewer has finished the title (Jellyfin only). */
-    val played: Boolean = false
+    val played: Boolean = false,
+    /** A wide image for the details page, when the source has one. */
+    val backdropUrl: String? = null,
+    /** Season and episode numbers for episodes. */
+    val season: Int? = null,
+    val episode: Int? = null,
+    /** The show an episode belongs to. */
+    val seriesName: String? = null,
+    val runtimeMinutes: Int? = null,
+    /** How much has been watched, from 0 to 1, when known. */
+    val progress: Float? = null
 )
 
 data class Settings(

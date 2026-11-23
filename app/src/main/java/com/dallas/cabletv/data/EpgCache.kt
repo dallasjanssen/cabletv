@@ -41,9 +41,14 @@ object EpgCache {
         http.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) error("XMLTV returned HTTP ${resp.code}")
             val body = resp.body ?: error("Empty XMLTV response")
-            val parsed = parse(body.byteStream())
-            synchronized(lock) { programs = parsed }
+            load(body.byteStream())
         }
+    }
+
+    /** Reads an XMLTV feed and replaces the cache with it. */
+    fun load(input: InputStream) {
+        val parsed = parse(input)
+        synchronized(lock) { programs = parsed }
     }
 
     /** Now and next for a channel from the full schedule, or null when the feed has nothing for it. */
@@ -56,6 +61,15 @@ object EpgCache {
         if (current == null && next == null) return null
         return NowNext(current, next)
     }
+
+    /** Every programme kept for a channel, oldest first. Empty when the feed has nothing for it. */
+    fun schedule(epgId: String?): List<Program> {
+        if (epgId.isNullOrBlank()) return emptyList()
+        return synchronized(lock) { programs[epgId] }.orEmpty()
+    }
+
+    /** True once a feed has been loaded, so screens can tell "no data yet" from "no data for this channel". */
+    fun hasData(): Boolean = synchronized(lock) { programs.isNotEmpty() }
 
     /** Programmes that already aired on a channel in the last day, newest first. */
     fun pastPrograms(epgId: String?): List<Program> {
@@ -84,7 +98,9 @@ object EpgCache {
         var start = 0L
         var stop = 0L
         var title = ""
+        var desc = ""
         var inTitle = false
+        var inDesc = false
         var event = parser.eventType
         while (event != XmlPullParser.END_DOCUMENT) {
             when (event) {
@@ -94,18 +110,24 @@ object EpgCache {
                         start = parseTime(stamp, parser.getAttributeValue(null, "start"))
                         stop = parseTime(stamp, parser.getAttributeValue(null, "stop"))
                         title = ""
+                        desc = ""
                     }
-                    // Only the first title is used when a programme has several languages.
+                    // Only the first title and description are used when a programme has several languages.
                     "title" -> inTitle = title.isEmpty()
+                    "desc" -> inDesc = desc.isEmpty()
                 }
-                XmlPullParser.TEXT -> if (inTitle) title += parser.text
+                XmlPullParser.TEXT -> {
+                    if (inTitle) title += parser.text
+                    if (inDesc) desc += parser.text
+                }
                 XmlPullParser.END_TAG -> when (parser.name) {
                     "title" -> inTitle = false
+                    "desc" -> inDesc = false
                     "programme" -> {
                         val ch = channel
                         if (ch != null && start > 0L && stop > from && start < to) {
                             out.getOrPut(ch) { mutableListOf() }
-                                .add(Program(title.trim(), start, stop))
+                                .add(Program(title.trim(), start, stop, desc.trim()))
                         }
                         channel = null
                     }

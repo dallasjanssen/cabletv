@@ -111,6 +111,7 @@ class XtreamClient(server: String, private val user: String, private val pass: S
     fun seriesEpisodes(seriesId: String): List<VodItem> {
         val info = JSONObject(api("get_series_info", "series_id=$seriesId"))
         val bySeason = info.optJSONObject("episodes") ?: return emptyList()
+        val showName = info.optJSONObject("info")?.optString("name")?.takeIf { it.isNotBlank() }
         val keyed = mutableListOf<Triple<Int, Int, VodItem>>()
         val seasons = bySeason.keys()
         while (seasons.hasNext()) {
@@ -123,15 +124,20 @@ class XtreamClient(server: String, private val user: String, private val pass: S
                 val ext = e.optString("container_extension").ifBlank { "mp4" }
                 val number = e.optInt("episode_num", 0)
                 val title = e.optString("title")
+                val epInfo = e.optJSONObject("info")
                 val item = VodItem(
                     id = id,
-                    name = "S$season E$number  $title",
+                    name = title.ifBlank { "Episode $number" },
                     year = null,
-                    overview = null,
-                    posterUrl = "",
+                    overview = epInfo?.optString("plot")?.takeIf { it.isNotBlank() },
+                    posterUrl = epInfo?.optString("movie_image").orEmpty(),
                     streamUrl = "$base/series/${enc(user)}/${enc(pass)}/$id.$ext",
                     type = "Episode",
-                    source = "xtream"
+                    source = "xtream",
+                    season = season,
+                    episode = number,
+                    seriesName = showName,
+                    runtimeMinutes = epInfo?.optInt("duration_secs", 0)?.takeIf { it > 0 }?.let { it / 60 }
                 )
                 keyed += Triple(season, number, item)
             }
@@ -159,7 +165,8 @@ class XtreamClient(server: String, private val user: String, private val pass: S
             Program(
                 title = decodeB64(o.optString("title")),
                 start = o.optLong("start_timestamp") * 1000L,
-                end = o.optLong("stop_timestamp") * 1000L
+                end = o.optLong("stop_timestamp") * 1000L,
+                desc = decodeB64(o.optString("description")).trim()
             )
         }
 

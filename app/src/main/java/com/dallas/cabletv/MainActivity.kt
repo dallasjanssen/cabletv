@@ -6,7 +6,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import com.dallas.cabletv.data.SettingsStore
 import com.dallas.cabletv.ui.CableApp
-import com.dallas.cabletv.ui.CableTheme
+import com.dallas.cabletv.ui.TvTheme
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -16,7 +16,7 @@ class MainActivity : ComponentActivity() {
 
         val store = SettingsStore(this)
         setContent {
-            CableTheme {
+            TvTheme {
                 CableApp(store)
             }
         }

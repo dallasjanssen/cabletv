@@ -1,23 +1,30 @@
 package com.dallas.cabletv.ui
 
+import android.view.KeyEvent
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.focusable
+import androidx.compose.foundation.gestures.LocalBringIntoViewSpec
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyListState
-import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.onPreviewKeyEvent
@@ -27,11 +34,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
-import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
-import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
@@ -43,582 +48,453 @@ import com.dallas.cabletv.data.VodItem
 import com.dallas.cabletv.data.XtreamClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-/** The season number in a provider episode name such as "S2 E5  Title", or null. */
-private fun seasonNumber(name: String): Int? =
-    Regex("^S(\\d+) E").find(name)?.groupValues?.get(1)?.toIntOrNull()
-
-@Composable
-fun OnDemandScreen(
-    settings: Settings,
-    profileId: String,
-    pendingVod: VodItem?,
-    onPendingConsumed: () -> Unit,
-    onExit: () -> Unit
+/** Everything the movie and show rows need, loaded once by the app and shared with Home. */
+data class VodShelves(
+    val continueWatching: List<VodItem> = emptyList(),
+    val recent: List<VodItem> = emptyList(),
+    val movies: List<VodItem> = emptyList(),
+    val series: List<VodItem> = emptyList(),
+    val loading: Boolean = false,
+    val error: String? = null
 ) {
-    if (settings.hasJellyfin || settings.hasXtream) {
-        JellyfinBrowser(settings, profileId, pendingVod, onPendingConsumed, onExit)
-    } else {
-        Column(Modifier.fillMaxSize().scanlines()) {
-            CableHeader(title = "ON DEMAND", onBack = onExit)
-            EmptyState(
-                title = "No on-demand source yet",
-                body = "Add a Jellyfin server or use a provider login in Settings.",
-                modifier = Modifier.weight(1f)
-            )
-        }
-    }
+    val isEmpty: Boolean get() = continueWatching.isEmpty() && recent.isEmpty() && movies.isEmpty() && series.isEmpty()
 }
 
-/** Shows Jellyfin and provider titles side by side. Either source can be missing. */
+private fun keyOf(item: VodItem) = "${item.source}:${item.id}"
+
+/**
+ * Movies and shows from Jellyfin and the TV provider. Picking a title opens its details page,
+ * which plays, resumes, or lists the episodes. Back steps out one level at a time.
+ */
 @Composable
-private fun JellyfinBrowser(
+fun OnDemandScreen(
+    nav: NavActions,
     settings: Settings,
-    profileId: String,
+    shelves: VodShelves,
+    userState: UserStateStore,
     pendingVod: VodItem?,
     onPendingConsumed: () -> Unit,
-    onExit: () -> Unit
+    onPlaybackEnded: () -> Unit,
+    onLeaveDetail: () -> Unit
 ) {
-    val client = remember(settings) {
-        JellyfinClient(settings.jellyfinServer, settings.jellyfinToken, settings.jellyfinUserId)
+    val jellyfin = remember(settings) {
+        if (settings.hasJellyfin) JellyfinClient(settings.jellyfinServer, settings.jellyfinToken, settings.jellyfinUserId) else null
     }
     val xtream = remember(settings) {
-        if (settings.hasXtream) {
-            XtreamClient(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass)
-        } else {
-            null
-        }
+        if (settings.hasXtream) XtreamClient(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass) else null
     }
-    val context = LocalContext.current
-    val userState = remember(profileId) { UserStateStore(context, profileId) }
-    val scope = rememberCoroutineScope()
 
-    var resumeItems by remember(userState) { mutableStateOf(userState.continueWatching()) }
-    var resume by remember { mutableStateOf<List<VodItem>>(emptyList()) }
-    var recent by remember { mutableStateOf<List<VodItem>>(emptyList()) }
-    var providerMovies by remember { mutableStateOf<List<VodItem>>(emptyList()) }
-    var providerSeries by remember { mutableStateOf<List<VodItem>>(emptyList()) }
-    var loading by remember { mutableStateOf(true) }
-    var loadError by remember { mutableStateOf<String?>(null) }
-    var series by remember { mutableStateOf<VodItem?>(null) }
-    var episodes by remember { mutableStateOf<List<VodItem>>(emptyList()) }
+    var detail by remember { mutableStateOf<VodItem?>(null) }
+    var openedFromElsewhere by remember { mutableStateOf(false) }
+    var episodes by remember { mutableStateOf<List<VodItem>?>(null) }
     var playing by remember { mutableStateOf<VodItem?>(null) }
+    var startOver by remember { mutableStateOf(false) }
+    var lastPlayedId by remember { mutableStateOf<String?>(null) }
+    var libraryFocusKey by remember { mutableStateOf<String?>(null) }
+    var resumeTick by remember { mutableIntStateOf(0) }
 
-    // Where focus goes when the library comes back: the card last picked, and the episode last played.
-    var focusKey by remember { mutableStateOf<String?>(null) }
-    var lastEpisodeId by remember { mutableStateOf<String?>(null) }
-    val focusRequester = remember { FocusRequester() }
-    // Scroll positions live here, so they survive a trip to playback and back.
-    val libraryState = rememberLazyListState()
-    val rowStates = remember { mutableMapOf<String, LazyListState>() }
-
-    // Opens a title: a series loads its episodes, anything else starts playing.
-    fun openItem(item: VodItem) {
-        if (item.type == "Series") {
-            scope.launch {
-                val eps = withContext(Dispatchers.IO) {
-                    runCatching {
-                        if (item.source == "xtream") {
-                            xtream?.seriesEpisodes(item.id).orEmpty()
-                        } else {
-                            client.episodes(item.id)
-                        }
-                    }.getOrDefault(emptyList())
-                }
-                episodes = eps
-                series = item
-            }
-        } else {
+    fun open(item: VodItem, fromElsewhere: Boolean) {
+        openedFromElsewhere = fromElsewhere
+        // A half-watched episode from a resume row plays straight away; everything else opens its page.
+        if (item.type == "Episode") {
+            detail = null
+            startOver = false
             playing = item
+            return
         }
+        detail = item
+        episodes = null
+        lastPlayedId = null
     }
 
-    // Each source loads on its own, so a failure in one still shows the other.
-    LaunchedEffect(settings) {
-        loading = true
-        loadError = null
-        if (settings.hasJellyfin) {
-            withContext(Dispatchers.IO) {
-                runCatching { client.continueWatching() to client.recentlyAdded() }
-            }
-                .onSuccess { (r, n) ->
-                    resume = r
-                    recent = n
-                }
-                .onFailure { loadError = it.message ?: "Could not reach Jellyfin" }
-        }
-        if (xtream != null) {
-            withContext(Dispatchers.IO) {
-                runCatching { xtream.vodMovies() to xtream.vodSeries() }
-            }
-                .onSuccess { (m, s) ->
-                    providerMovies = m
-                    providerSeries = s
-                }
-                .onFailure { loadError = loadError ?: (it.message ?: "Could not reach your provider") }
-        }
-        loading = false
-    }
-
-    // A title chosen in search opens here.
     LaunchedEffect(pendingVod) {
         val pick = pendingVod ?: return@LaunchedEffect
-        openItem(pick)
+        open(pick, fromElsewhere = true)
         onPendingConsumed()
     }
 
-    // Back from playback refreshes the "left off" row with the new positions.
-    LaunchedEffect(playing) {
-        if (playing == null) resumeItems = userState.continueWatching()
+    // Load a show's episodes when its page opens.
+    LaunchedEffect(detail?.id) {
+        val d = detail ?: return@LaunchedEffect
+        if (d.type != "Series") return@LaunchedEffect
+        episodes = withContext(Dispatchers.IO) {
+            runCatching {
+                if (d.source == "xtream") xtream?.seriesEpisodes(d.id).orEmpty() else jellyfin?.episodes(d.id).orEmpty()
+            }.getOrDefault(emptyList())
+        }
     }
-
-    // Back steps out one level at a time: player, then episodes, then the library.
-    BackHandler(enabled = playing != null) { playing = null }
-    BackHandler(enabled = series != null && playing == null) { series = null }
 
     val nowPlaying = playing
-    val openSeries = series
-    // The episode after the one playing, so the next one starts by itself.
-    val nextEpisode = nowPlaying?.let { p ->
-        val at = episodes.indexOfFirst { it.id == p.id }
-        if (at >= 0) episodes.getOrNull(at + 1) else null
-    }
-    // Playback fills the whole screen with no header, like live TV.
-    // Every other view keeps the header, and its back button steps out one level.
+    val openDetail = detail
     when {
-        nowPlaying != null -> VodPlayer(
-            item = nowPlaying,
-            store = userState,
-            jellyfin = if (nowPlaying.source == "jellyfin") client else null,
-            nextEpisode = nextEpisode,
-            onPlayNext = {
-                lastEpisodeId = it.id
-                playing = it
+        nowPlaying != null -> {
+            val list = episodes.orEmpty()
+            val at = list.indexOfFirst { it.id == nowPlaying.id }
+            VodPlayer(
+                item = nowPlaying,
+                startOver = startOver,
+                store = userState,
+                jellyfin = if (nowPlaying.source == "jellyfin") jellyfin else null,
+                nextEpisode = if (at >= 0) list.getOrNull(at + 1) else null,
+                onPlayNext = {
+                    lastPlayedId = it.id
+                    startOver = true
+                    playing = it
+                },
+                onExit = {
+                    playing = null
+                    resumeTick++
+                    onPlaybackEnded()
+                    if (openDetail == null && openedFromElsewhere) onLeaveDetail()
+                }
+            )
+        }
+        openDetail != null -> {
+            BackHandler {
+                detail = null
+                if (openedFromElsewhere) onLeaveDetail()
+            }
+            DetailScreen(
+                item = openDetail,
+                episodes = episodes,
+                store = userState,
+                resumeTick = resumeTick,
+                focusEpisodeId = lastPlayedId,
+                onPlay = { item, fromStart ->
+                    if (item.type == "Episode") lastPlayedId = item.id
+                    startOver = fromStart
+                    playing = item
+                }
+            )
+        }
+        else -> Library(
+            nav = nav,
+            shelves = shelves,
+            hasSource = settings.hasJellyfin || settings.hasXtream,
+            focusKey = libraryFocusKey,
+            onOpen = { key, item ->
+                libraryFocusKey = key
+                open(item, fromElsewhere = false)
             }
         )
-        openSeries != null -> Column(Modifier.fillMaxSize().scanlines()) {
-            CableHeader(title = openSeries.name.uppercase(), onBack = { series = null })
-            Box(Modifier.weight(1f).fillMaxWidth()) {
-                SeriesDetail(
-                    series = openSeries,
-                    episodes = episodes,
-                    focusEpisodeId = lastEpisodeId,
-                    onPlay = {
-                        lastEpisodeId = it.id
-                        playing = it
-                    },
-                    onBack = { series = null }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun Library(
+    nav: NavActions,
+    shelves: VodShelves,
+    hasSource: Boolean,
+    focusKey: String?,
+    onOpen: (String, VodItem) -> Unit
+) {
+    val rows = listOfNotNull(
+        shelves.continueWatching.takeIf { it.isNotEmpty() }?.let { "Continue watching" to it },
+        shelves.recent.takeIf { it.isNotEmpty() }?.let { "Recently added" to it },
+        shelves.movies.takeIf { it.isNotEmpty() }?.let { "Movies" to it },
+        shelves.series.takeIf { it.isNotEmpty() }?.let { "Shows" to it }
+    )
+    var focused by remember { mutableStateOf(rows.firstOrNull()?.second?.firstOrNull()) }
+    val target = focusKey ?: rows.firstOrNull()?.let { (t, list) -> "$t|${keyOf(list.first())}" }
+    val requester = remember { FocusRequester() }
+    LaunchedEffect(target, shelves.loading) {
+        if (target != null && !shelves.loading) {
+            withFrameNanos { }
+            runCatching { requester.requestFocus() }
+        }
+    }
+
+    TabScaffold(Tab.OnDemand, nav, modifier = Modifier.background(Tv.Bg)) { narrow ->
+        val side = gutter(narrow)
+        val shown = focused
+        if (shown != null && !narrow) {
+            Box(Modifier.align(Alignment.TopEnd).width(620.dp).height(330.dp)) {
+                AsyncImage(
+                    model = shown.backdropUrl ?: shown.posterUrl.takeIf { it.isNotBlank() },
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize().alpha(0.8f)
                 )
+                Box(Modifier.fillMaxSize().background(Brush.horizontalGradient(0f to Tv.Bg, 0.5f to Tv.Bg.copy(alpha = 0.3f), 1f to Color.Transparent)))
+                Box(Modifier.fillMaxSize().background(Brush.verticalGradient(0f to Tv.Bg.copy(alpha = 0.5f), 0.25f to Color.Transparent, 0.4f to Color.Transparent, 1f to Tv.Bg)))
             }
         }
-        else -> Column(Modifier.fillMaxSize().scanlines()) {
-            CableHeader(title = "ON DEMAND", onBack = onExit)
-            Box(Modifier.weight(1f).fillMaxWidth()) {
-                Library(
-                    loading = loading,
-                    loadError = loadError,
-                    leftOff = resumeItems.map { it.first },
-                    resume = resume,
-                    recent = recent,
-                    providerMovies = providerMovies,
-                    providerSeries = providerSeries,
-                    focusKey = focusKey,
-                    focusRequester = focusRequester,
-                    listState = libraryState,
-                    rowStates = rowStates,
-                    onSelect = { key, item ->
-                        focusKey = key
-                        openItem(item)
+        when {
+            !hasSource -> EmptyState(
+                "No movies or shows yet",
+                "Add a Jellyfin server in Settings, or sign in to a TV provider that includes movies and shows.",
+                Modifier.align(Alignment.Center)
+            )
+            shelves.loading && rows.isEmpty() -> EmptyState("Loading your library", null, Modifier.align(Alignment.Center))
+            rows.isEmpty() && shelves.error != null -> EmptyState("Your library did not load", shelves.error, Modifier.align(Alignment.Center))
+            rows.isEmpty() -> EmptyState("Nothing here yet", "Movies and shows you add show up here.", Modifier.align(Alignment.Center))
+            else -> {
+                if (shown != null) {
+                    Column(
+                        Modifier.padding(start = side, end = side, top = 62.dp).widthIn(max = 540.dp).height(if (narrow) 110.dp else 136.dp),
+                        verticalArrangement = Arrangement.Bottom
+                    ) {
+                        Text(shown.seriesName ?: shown.name, style = if (narrow) TvType.Title else TvType.Hero.copy(fontSize = TvType.Headline.fontSize * 1.2f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Spacer(Modifier.height(6.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            metaParts(shown).forEach { Text(it, style = TvType.Small, color = Tv.Ink2) }
+                            Badge(if (shown.source == "jellyfin") "Your library" else "From your provider")
+                        }
+                        shown.overview?.let {
+                            Spacer(Modifier.height(6.dp))
+                            Text(it, style = TvType.Small, color = Tv.Ink2, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        }
                     }
-                )
+                }
+                CompositionLocalProvider(LocalBringIntoViewSpec provides rememberPivotSpec(34.dp)) {
+                    LazyColumn(
+                        Modifier.fillMaxSize().padding(top = if (narrow) 176.dp else 206.dp),
+                        contentPadding = PaddingValues(bottom = 24.dp)
+                    ) {
+                        items(rows, key = { it.first }) { (title, list) ->
+                            Shelf(title, side) {
+                                items(list, key = { keyOf(it) }) { item ->
+                                    val key = "$title|${keyOf(item)}"
+                                    val mod = if (key == target) Modifier.focusRequester(requester) else Modifier
+                                    if (title == "Continue watching") {
+                                        ResumeCard(item, onClick = { onOpen(key, item) }, modifier = mod, onFocus = { if (it) focused = item })
+                                    } else {
+                                        PosterCard(item, onClick = { onOpen(key, item) }, modifier = mod, onFocus = { if (it) focused = item })
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 }
 
-@Composable
-private fun Library(
-    loading: Boolean,
-    loadError: String?,
-    leftOff: List<VodItem>,
-    resume: List<VodItem>,
-    recent: List<VodItem>,
-    providerMovies: List<VodItem>,
-    providerSeries: List<VodItem>,
-    focusKey: String?,
-    focusRequester: FocusRequester,
-    listState: LazyListState,
-    rowStates: MutableMap<String, LazyListState>,
-    onSelect: (String, VodItem) -> Unit
-) {
-    val rows = listOfNotNull(
-        leftOff.takeIf { it.isNotEmpty() }?.let { "Pick up where you left off" to it },
-        resume.takeIf { it.isNotEmpty() }?.let { "Continue watching" to it },
-        recent.takeIf { it.isNotEmpty() }?.let { "Recently added" to it },
-        providerMovies.takeIf { it.isNotEmpty() }?.let { "New movies" to it },
-        providerSeries.takeIf { it.isNotEmpty() }?.let { "New series" to it }
-    )
+private fun metaParts(item: VodItem): List<String> = listOfNotNull(
+    item.year?.toString(),
+    when (item.type) {
+        "Series" -> "Series"
+        "Episode" -> episodeLabel(item)
+        else -> item.runtimeMinutes?.let { minutesText(it.toLong()) }
+    }
+)
 
-    // The card that should hold focus: the last one picked, otherwise the first card on screen.
-    val target = focusKey ?: rows.firstOrNull()?.let { (title, list) -> "$title|${list.first().id}" }
-    LaunchedEffect(target, loading) {
-        if (!loading && target != null) {
-            withFrameNanos { }
-            runCatching { focusRequester.requestFocus() }
+/** The page for one movie or show. Movies offer Resume and Start over. Shows list their seasons and episodes. */
+@Composable
+private fun DetailScreen(
+    item: VodItem,
+    episodes: List<VodItem>?,
+    store: UserStateStore,
+    resumeTick: Int,
+    focusEpisodeId: String?,
+    onPlay: (VodItem, Boolean) -> Unit
+) {
+    val primary = remember { FocusRequester() }
+    val episodeFocus = remember { FocusRequester() }
+    val isSeries = item.type == "Series"
+    val resumeMs = remember(item.id, resumeTick) { if (isSeries) 0L else store.resumePosition(item) }
+
+    // For a show, Resume picks the episode watched most recently, otherwise the first unwatched one.
+    val resumeEpisode = remember(episodes, resumeTick) {
+        val list = episodes.orEmpty()
+        val recent = store.continueWatching().map { keyOf(it.first) }
+        recent.firstNotNullOfOrNull { k -> list.firstOrNull { keyOf(it) == k } }
+    }
+    val startEpisode = resumeEpisode ?: episodes.orEmpty().let { list -> list.firstOrNull { !it.played } ?: list.firstOrNull() }
+    val seasons = remember(episodes) { episodes.orEmpty().mapNotNull { it.season }.distinct().sorted() }
+    var season by remember(item.id, seasons) { mutableStateOf(startEpisode?.season ?: seasons.firstOrNull()) }
+    val shown = remember(episodes, season) { episodes.orEmpty().filter { season == null || it.season == season } }
+
+    LaunchedEffect(item.id, episodes != null) {
+        withFrameNanos { }
+        if (focusEpisodeId != null && shown.any { it.id == focusEpisodeId }) {
+            runCatching { episodeFocus.requestFocus() }
+        } else {
+            runCatching { primary.requestFocus() }
         }
     }
 
-    Column(
-        Modifier
-            .fillMaxSize()
-            .padding(start = 48.dp, end = 48.dp, top = 32.dp)
-    ) {
-        when {
-            loading -> EmptyState(
-                title = "Loading your library...",
-                modifier = Modifier.weight(1f)
+    BoxWithConstraints(Modifier.fillMaxSize().background(Tv.Bg)) {
+        val narrow = maxWidth < 600.dp
+        val side = gutter(narrow)
+        Box(Modifier.align(Alignment.TopEnd).fillMaxHeight().width(maxWidth * 0.72f)) {
+            AsyncImage(
+                model = item.backdropUrl ?: item.posterUrl.takeIf { it.isNotBlank() },
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize().alpha(0.55f)
             )
-            rows.isEmpty() && loadError != null -> EmptyState(
-                title = "Couldn't reach your sources",
-                body = loadError,
-                modifier = Modifier.weight(1f)
-            )
-            rows.isEmpty() -> EmptyState(
-                title = "Nothing here yet",
-                body = "Add media to Jellyfin or your provider and it will show up here.",
-                modifier = Modifier.weight(1f)
-            )
-            else -> LazyColumn(
-                Modifier.weight(1f),
-                state = listState,
-                verticalArrangement = Arrangement.spacedBy(36.dp),
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 40.dp)
-            ) {
-                if (loadError != null) {
-                    item {
-                        Text(
-                            text = loadError,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = Cable.Accent
+            Box(Modifier.fillMaxSize().background(Brush.horizontalGradient(0f to Tv.Bg, 0.55f to Tv.Bg.copy(alpha = 0.2f), 1f to Color.Transparent)))
+            Box(Modifier.fillMaxSize().background(Brush.verticalGradient(0.5f to Color.Transparent, 1f to Tv.Bg)))
+        }
+
+        val info: @Composable ColumnScope.() -> Unit = {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Badge(if (isSeries) "Series" else "Movie")
+                metaParts(item).filter { it != "Series" }.forEach { Text(it, style = TvType.Small, color = Tv.Ink2) }
+                if (isSeries && seasons.isNotEmpty()) Text("${seasons.size} season${if (seasons.size == 1) "" else "s"}", style = TvType.Small, color = Tv.Ink2)
+            }
+            Text(item.name, style = TvType.Display, maxLines = 3, overflow = TextOverflow.Ellipsis)
+            item.overview?.let { Text(it, style = TvType.Body, color = Tv.Ink2, maxLines = if (narrow) 4 else 6, overflow = TextOverflow.Ellipsis) }
+            if (!isSeries && resumeMs > 0) {
+                val total = item.runtimeMinutes?.let { it * 60_000L }
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    if (total != null) ProgressBar(resumeMs.toFloat() / total, Modifier.width(160.dp), color = Tv.Accent)
+                    Text("Stopped at ${formatPosition(resumeMs)}", style = TvType.Caption, color = Tv.Ink3)
+                }
+            }
+            Spacer(Modifier.height(4.dp))
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                when {
+                    !isSeries && resumeMs > 0 -> {
+                        PillButton("Resume from ${formatPosition(resumeMs)}", { onPlay(item, false) }, icon = TvIcons.Play, modifier = Modifier.focusRequester(primary))
+                        PillButton("Start over", { onPlay(item, true) }, icon = TvIcons.Replay)
+                    }
+                    !isSeries -> PillButton("Play", { onPlay(item, true) }, icon = TvIcons.Play, modifier = Modifier.focusRequester(primary))
+                    episodes == null -> PillButton("Loading episodes", {}, modifier = Modifier.focusRequester(primary))
+                    startEpisode != null -> {
+                        val label = episodeLabel(startEpisode)?.let { " $it" }.orEmpty()
+                        PillButton(
+                            (if (resumeEpisode != null) "Resume" else "Play") + label,
+                            { onPlay(startEpisode, resumeEpisode == null) },
+                            icon = TvIcons.Play,
+                            modifier = Modifier.focusRequester(primary)
                         )
                     }
+                    else -> PillButton("No episodes found", {}, modifier = Modifier.focusRequester(primary))
                 }
-                items(rows, key = { it.first }) { (title, list) ->
-                    PosterRow(
-                        title = title,
-                        list = list,
-                        target = target,
-                        focusRequester = focusRequester,
-                        rowState = rowStates.getOrPut(title) { LazyListState() },
-                        onSelect = { vod -> onSelect("$title|${vod.id}", vod) }
+            }
+        }
+
+        val episodesList: @Composable ColumnScope.() -> Unit = {
+            if (seasons.size > 1) {
+                Row(Modifier.horizontalScroll(rememberScrollState()).padding(vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    seasons.forEach { s -> Chip("Season $s", selected = s == season, onClick = { season = s }) }
+                }
+                Spacer(Modifier.height(8.dp))
+            }
+            LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp), contentPadding = PaddingValues(vertical = 2.dp)) {
+                items(shown, key = { it.id }) { ep ->
+                    EpisodeRow(
+                        ep,
+                        resumed = resumeEpisode?.id == ep.id,
+                        modifier = if (ep.id == focusEpisodeId) Modifier.focusRequester(episodeFocus) else Modifier,
+                        onClick = { onPlay(ep, resumeEpisode?.id != ep.id) }
                     )
                 }
             }
         }
-    }
-}
 
-@Composable
-private fun PosterRow(
-    title: String,
-    list: List<VodItem>,
-    target: String?,
-    focusRequester: FocusRequester,
-    rowState: LazyListState,
-    onSelect: (VodItem) -> Unit
-) {
-    Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-        Text(
-            text = title,
-            style = MaterialTheme.typography.titleLarge,
-            color = Cable.Led
-        )
-        LazyRow(
-            state = rowState,
-            horizontalArrangement = Arrangement.spacedBy(28.dp),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 6.dp, vertical = 10.dp)
-        ) {
-            items(list, key = { it.id }) { vod ->
-                val holdsFocus = target == "$title|${vod.id}"
-                PosterCard(
-                    vod = vod,
-                    modifier = if (holdsFocus) Modifier.focusRequester(focusRequester) else Modifier,
-                    onClick = { onSelect(vod) }
-                )
+        if (narrow) {
+            Column(Modifier.fillMaxSize().padding(horizontal = side, vertical = 24.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                info()
+                if (isSeries) episodesList()
+            }
+        } else {
+            Row(Modifier.fillMaxSize().padding(start = side, end = side, top = 44.dp, bottom = 20.dp), horizontalArrangement = Arrangement.spacedBy(30.dp)) {
+                Column(Modifier.width(430.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) { info() }
+                if (isSeries) {
+                    Column(Modifier.weight(1f).fillMaxHeight()) { episodesList() }
+                }
             }
         }
     }
 }
 
 @Composable
-private fun PosterCard(vod: VodItem, modifier: Modifier, onClick: () -> Unit) {
-    Column(
-        Modifier.width(184.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
-    ) {
-        FocusSurface(
-            onClick = onClick,
-            modifier = modifier
-                .width(184.dp)
-                .height(276.dp),
-            shape = RoundedCornerShape(8.dp),
-            focusScale = 1.05f
-        ) {
-            AsyncImage(
-                model = vod.posterUrl,
-                contentDescription = vod.name,
-                contentScale = ContentScale.Crop,
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(Cable.SurfaceHi)
-            )
-            if (vod.played) {
-                Pill(
-                    text = "WATCHED",
-                    color = Cable.Led,
-                    textColor = Cable.Canvas,
-                    modifier = Modifier
-                        .align(Alignment.TopEnd)
-                        .padding(8.dp)
+private fun EpisodeRow(ep: VodItem, resumed: Boolean, modifier: Modifier, onClick: () -> Unit) {
+    Focusable(onClick = onClick, modifier = modifier.fillMaxWidth(), shape = RoundedCornerShape(10.dp)) {
+        Row(Modifier.padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.size(112.dp, 63.dp).clip(RoundedCornerShape(7.dp))) {
+                ArtPlaceholder("")
+                AsyncImage(
+                    model = ep.posterUrl.takeIf { it.isNotBlank() },
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize()
                 )
+                if (resumed && ep.progress != null) {
+                    ProgressBar(ep.progress, Modifier.align(Alignment.BottomStart).fillMaxWidth().padding(6.dp), color = Tv.Accent, height = 3.dp)
+                }
             }
-        }
-        Text(
-            text = vod.name,
-            style = MaterialTheme.typography.bodyLarge,
-            color = Cable.Ink,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis
-        )
-        vod.year?.let {
-            Text(
-                text = it.toString(),
-                style = MaterialTheme.typography.bodyMedium,
-                color = Cable.Ink3
-            )
-        }
-    }
-}
-
-@Composable
-private fun SeriesDetail(
-    series: VodItem,
-    episodes: List<VodItem>,
-    focusEpisodeId: String?,
-    onPlay: (VodItem) -> Unit,
-    onBack: () -> Unit
-) {
-    // Provider series list their episodes by season, so a season row appears for them.
-    val seasons = episodes.mapNotNull { seasonNumber(it.name) }.distinct().sorted()
-    var season by remember(series.id) { mutableStateOf(seasons.firstOrNull()) }
-    val shown = if (season == null) episodes else episodes.filter { seasonNumber(it.name) == season }
-
-    val firstEpisode = remember { FocusRequester() }
-    // Focus returns to the episode last played, or the first one shown.
-    val targetId = focusEpisodeId?.takeIf { id -> shown.any { it.id == id } }
-        ?: shown.firstOrNull()?.id
-    LaunchedEffect(targetId) {
-        if (targetId != null) {
-            withFrameNanos { }
-            runCatching { firstEpisode.requestFocus() }
-        }
-    }
-
-    Row(
-        Modifier
-            .fillMaxSize()
-            .padding(horizontal = 48.dp, vertical = 32.dp),
-        horizontalArrangement = Arrangement.spacedBy(48.dp)
-    ) {
-        Column(
-            Modifier
-                .width(280.dp)
-                .fillMaxHeight(),
-            verticalArrangement = Arrangement.spacedBy(20.dp)
-        ) {
-            CableButton(label = "BACK TO LIBRARY", onClick = onBack)
-            // The poster takes whatever height is left, so it never pushes the year off screen.
-            AsyncImage(
-                model = series.posterUrl,
-                contentDescription = series.name,
-                contentScale = ContentScale.Crop,
-                modifier = Modifier
-                    .width(280.dp)
-                    .weight(1f)
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(Cable.SurfaceHi)
-            )
-            series.year?.let {
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
                 Text(
-                    text = it.toString(),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = Cable.Ink3
-                )
-            }
-        }
-
-        Column(
-            Modifier
-                .weight(1f)
-                .fillMaxHeight(),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
-        ) {
-            series.overview?.takeIf { it.isNotBlank() }?.let {
-                Text(
-                    text = it,
-                    style = MaterialTheme.typography.bodyLarge,
-                    color = Cable.Ink2,
-                    maxLines = 4,
+                    listOfNotNull(ep.episode?.let { "$it." }, ep.name).joinToString(" "),
+                    style = TvType.BodyStrong,
+                    maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
-            }
-            Text(
-                text = "EPISODES",
-                style = MaterialTheme.typography.titleLarge,
-                color = Cable.Accent
-            )
-            if (seasons.size > 1) {
-                LazyRow(
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 6.dp)
-                ) {
-                    items(seasons, key = { it }) { s ->
-                        SeasonChip(label = "SEASON $s", selected = season == s) { season = s }
+                val bits = listOfNotNull(
+                    ep.runtimeMinutes?.let { minutesText(it.toLong()) },
+                    when {
+                        ep.played -> "Watched"
+                        resumed -> "In progress"
+                        else -> null
                     }
-                }
-            }
-            if (shown.isEmpty()) {
-                EmptyState(
-                    title = "No episodes found",
-                    modifier = Modifier.weight(1f)
                 )
-            } else {
-                LazyColumn(
-                    Modifier.weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(10.dp),
-                    contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 4.dp)
-                ) {
-                    items(shown, key = { it.id }) { ep ->
-                        EpisodeRow(
-                            episode = ep,
-                            focusRequester = if (ep.id == targetId) firstEpisode else null
-                        ) { onPlay(ep) }
-                    }
-                }
+                if (bits.isNotEmpty()) Text(bits.joinToString(" · "), style = TvType.Caption, color = ink3)
+                ep.overview?.let { Text(it, style = TvType.Caption, color = ink3, maxLines = 1, overflow = TextOverflow.Ellipsis) }
             }
         }
     }
 }
-
-@Composable
-private fun SeasonChip(label: String, selected: Boolean, onClick: () -> Unit) {
-    FocusSurface(
-        onClick = onClick,
-        shape = RoundedCornerShape(50),
-        focusScale = 1.06f
-    ) {
-        Text(
-            text = label,
-            style = MaterialTheme.typography.labelLarge,
-            color = if (selected) Cable.Canvas else Cable.Ink,
-            modifier = Modifier
-                .background(if (selected) Cable.Accent else Cable.SurfaceHi)
-                .padding(horizontal = 24.dp, vertical = 12.dp)
-        )
-    }
-}
-
-@Composable
-private fun EpisodeRow(
-    episode: VodItem,
-    focusRequester: FocusRequester?,
-    onClick: () -> Unit
-) {
-    val rowModifier = if (focusRequester != null) {
-        Modifier.fillMaxWidth().focusRequester(focusRequester)
-    } else {
-        Modifier.fillMaxWidth()
-    }
-    FocusSurface(
-        onClick = onClick,
-        modifier = rowModifier,
-        shape = RoundedCornerShape(8.dp),
-        focusScale = 1f
-    ) {
-        Row(
-            Modifier
-                .fillMaxWidth()
-                .background(Cable.Surface)
-                .padding(horizontal = 28.dp, vertical = 22.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                text = episode.name,
-                style = MaterialTheme.typography.titleMedium,
-                color = Cable.Ink,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f)
-            )
-            if (episode.played) {
-                Spacer(Modifier.width(16.dp))
-                Pill(text = "WATCHED", color = Cable.Led, textColor = Cable.Canvas)
-            }
-            Spacer(Modifier.width(16.dp))
-            Text(
-                text = "PLAY",
-                style = MaterialTheme.typography.labelLarge,
-                color = Cable.Led
-            )
-        }
-    }
-}
-
-/** Label for a track: its title, its language, or its position. */
-private fun trackLabel(format: androidx.media3.common.Format, index: Int): String =
-    format.label ?: format.language?.uppercase() ?: "Track ${index + 1}"
 
 /**
- * Full-screen playback. It starts where the viewer stopped last time, saves the position,
- * reports progress to Jellyfin, plays the next episode by itself, and shows a menu for
- * audio, subtitles and picture size when MENU is pressed.
+ * Full-screen playback with the app's own controls. Any key shows them. OK pauses, left and right
+ * skip ten seconds, and Audio and captions picks language, subtitles and picture size. Playback
+ * starts where it stopped last time, saves its place, reports to Jellyfin, and plays the next
+ * episode by itself.
  */
 @Composable
 private fun VodPlayer(
     item: VodItem,
+    startOver: Boolean,
     store: UserStateStore,
     jellyfin: JellyfinClient?,
     nextEpisode: VodItem?,
-    onPlayNext: (VodItem) -> Unit
+    onPlayNext: (VodItem) -> Unit,
+    onExit: () -> Unit
 ) {
     val context = LocalContext.current
     val player = remember { ExoPlayer.Builder(context).build() }
     var failed by remember { mutableStateOf(false) }
-    var showMenu by remember { mutableStateOf(false) }
+    var controls by remember { mutableStateOf(true) }
+    var tracks by remember { mutableStateOf(false) }
+    var playingNow by remember { mutableStateOf(true) }
+    var position by remember { mutableLongStateOf(0L) }
+    var duration by remember { mutableLongStateOf(0L) }
+    var lastKey by remember { mutableLongStateOf(System.currentTimeMillis()) }
     var resizeMode by remember { mutableIntStateOf(AspectRatioFrameLayout.RESIZE_MODE_FIT) }
     val latestNext by rememberUpdatedState(nextEpisode)
     val latestOnNext by rememberUpdatedState(onPlayNext)
-    val menuFocus = remember { FocusRequester() }
-    BackHandler(enabled = showMenu) { showMenu = false }
+    val latestExit by rememberUpdatedState(onExit)
+    val root = remember { FocusRequester() }
+    val seek = remember { FocusRequester() }
 
-    // The duration is unknown until the stream is ready, so nothing is saved before then.
     fun savePosition() {
-        val duration = player.duration
-        if (duration > 0) store.saveResume(item, player.currentPosition, duration)
+        val d = player.duration
+        if (d > 0) store.saveResume(item.copy(runtimeMinutes = (d / 60_000L).toInt()), player.currentPosition, d)
     }
 
     DisposableEffect(player) {
         val listener = object : Player.Listener {
-            override fun onPlayerError(e: PlaybackException) {
+            override fun onPlayerError(error: PlaybackException) {
                 failed = true
+            }
+
+            override fun onIsPlayingChanged(isPlaying: Boolean) {
+                playingNow = isPlaying
             }
 
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (playbackState == Player.STATE_ENDED) {
                     val next = latestNext
-                    if (next != null) latestOnNext(next)
+                    if (next != null) latestOnNext(next) else latestExit()
                 }
             }
         }
@@ -636,14 +512,16 @@ private fun VodPlayer(
 
     LaunchedEffect(item.streamUrl) {
         failed = false
-        val start = store.resumePosition(item)
+        val start = if (startOver) 0L else store.resumePosition(item)
         player.setMediaItem(MediaItem.fromUri(item.streamUrl), start)
         player.prepare()
         player.playWhenReady = true
-        jellyfin?.let { c -> runCatching { withContext(Dispatchers.IO) { c.reportStart(item.id, start) } } }
+        controls = true
+        lastKey = System.currentTimeMillis()
+        jellyfin?.let { c -> withContext(Dispatchers.IO) { runCatching { c.reportStart(item.id, start) } } }
     }
 
-    // Every ten seconds: save the position on the TV, and tell Jellyfin where playback is.
+    // Every ten seconds: save the position here, and tell Jellyfin where playback is.
     LaunchedEffect(item.streamUrl) {
         while (true) {
             delay(10_000)
@@ -657,15 +535,40 @@ private fun VodPlayer(
         }
     }
 
-    // Audio, subtitle and picture menu, read from what the stream actually offers.
-    val audioTracks = remember(showMenu) { if (showMenu) tracksOf(player, C.TRACK_TYPE_AUDIO) else emptyList() }
-    val subtitleTracks = remember(showMenu) { if (showMenu) tracksOf(player, C.TRACK_TYPE_TEXT) else emptyList() }
-    LaunchedEffect(showMenu) {
-        if (showMenu) {
-            withFrameNanos { }
-            runCatching { menuFocus.requestFocus() }
+    LaunchedEffect(Unit) {
+        while (true) {
+            position = player.currentPosition
+            duration = player.duration.coerceAtLeast(0L)
+            delay(500)
         }
     }
+
+    // The controls hide after five seconds without a key, unless paused.
+    LaunchedEffect(controls, lastKey, playingNow, tracks) {
+        if (controls && playingNow && !tracks) {
+            delay(5000)
+            controls = false
+        }
+    }
+
+    LaunchedEffect(controls, tracks) {
+        withFrameNanos { }
+        runCatching { if (controls && !tracks) seek.requestFocus() else if (!controls) root.requestFocus() }
+    }
+
+    fun skip(ms: Long) {
+        val d = player.duration
+        val target = (player.currentPosition + ms).coerceAtLeast(0L).let { if (d > 0) it.coerceAtMost(d - 1000) else it }
+        player.seekTo(target)
+        position = target
+    }
+
+    fun togglePause() {
+        if (player.isPlaying) player.pause() else player.play()
+    }
+
+    BackHandler(enabled = !tracks && controls) { controls = false }
+    BackHandler(enabled = !tracks && !controls) { onExit() }
 
     Box(
         Modifier
@@ -673,168 +576,130 @@ private fun VodPlayer(
             .background(Color.Black)
             .onPreviewKeyEvent { ev ->
                 if (ev.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
-                if (ev.nativeKeyEvent.keyCode == android.view.KeyEvent.KEYCODE_MENU && !showMenu) {
-                    showMenu = true
-                    true
-                } else {
-                    false
+                lastKey = System.currentTimeMillis()
+                when (ev.nativeKeyEvent.keyCode) {
+                    KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> { togglePause(); controls = true; return@onPreviewKeyEvent true }
+                    KeyEvent.KEYCODE_MEDIA_PLAY -> { player.play(); return@onPreviewKeyEvent true }
+                    KeyEvent.KEYCODE_MEDIA_PAUSE -> { player.pause(); controls = true; return@onPreviewKeyEvent true }
+                    KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> { skip(30_000); controls = true; return@onPreviewKeyEvent true }
+                    KeyEvent.KEYCODE_MEDIA_REWIND -> { skip(-10_000); controls = true; return@onPreviewKeyEvent true }
                 }
+                if (tracks || controls) return@onPreviewKeyEvent false
+                when (ev.nativeKeyEvent.keyCode) {
+                    KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> togglePause()
+                    KeyEvent.KEYCODE_DPAD_LEFT -> skip(-10_000)
+                    KeyEvent.KEYCODE_DPAD_RIGHT -> skip(10_000)
+                    KeyEvent.KEYCODE_BACK -> return@onPreviewKeyEvent false
+                }
+                controls = true
+                true
             }
+            .focusRequester(root)
+            .focusable()
     ) {
         AndroidView(
             factory = { ctx ->
                 PlayerView(ctx).apply {
-                    useController = true
-                    isFocusable = true
-                    isFocusableInTouchMode = true
-                    requestFocus()
+                    useController = false
+                    isFocusable = false
+                    isFocusableInTouchMode = false
                 }.also { it.player = player }
             },
-            update = { view -> view.resizeMode = resizeMode },
+            update = { it.resizeMode = resizeMode },
             modifier = Modifier.fillMaxSize()
         )
 
-        if (showMenu) {
-            TrackMenu(
-                audio = audioTracks,
-                subtitles = subtitleTracks,
+        if (controls && !tracks) {
+            Box(Modifier.fillMaxSize().background(Brush.verticalGradient(0f to Color(0xC0000000), 0.26f to Color.Transparent, 0.58f to Color.Transparent, 1f to Color(0xD9000000))))
+            Column(Modifier.align(Alignment.TopStart).padding(start = 40.dp, top = 28.dp, end = 40.dp)) {
+                Text(item.seriesName ?: item.name, style = TvType.Headline, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                val sub = if (item.type == "Episode") listOfNotNull(episodeLabel(item), item.name.takeIf { item.seriesName != null }).joinToString(" · ") else item.year?.toString()
+                if (!sub.isNullOrBlank()) Text(sub, style = TvType.Small, color = Tv.Ink2)
+            }
+            if (!playingNow) {
+                Box(
+                    Modifier.align(Alignment.Center).size(76.dp).clip(CircleShape).background(Color(0x8C000000)),
+                    contentAlignment = Alignment.Center
+                ) { Icon(TvIcons.Pause, contentDescription = "Paused", modifier = Modifier.size(30.dp)) }
+            }
+            Column(Modifier.align(Alignment.BottomStart).trapFocus().fillMaxWidth().padding(horizontal = 40.dp, vertical = 24.dp)) {
+                SeekBar(
+                    fraction = if (duration > 0) position.toFloat() / duration else 0f,
+                    modifier = Modifier.focusRequester(seek),
+                    onTogglePause = { togglePause() },
+                    onSkip = { skip(it) }
+                )
+                Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp)) {
+                    Text(formatPosition(position), style = TvType.Caption, color = Tv.Ink2)
+                    Spacer(Modifier.weight(1f))
+                    Text(
+                        if (playingNow) "◀ ▶ skip 10 seconds · OK pauses" else "Paused · OK plays",
+                        style = TvType.Caption,
+                        color = Tv.Ink2
+                    )
+                    Spacer(Modifier.weight(1f))
+                    Text(if (duration > 0) formatPosition(duration) else "", style = TvType.Caption, color = Tv.Ink2)
+                }
+                Spacer(Modifier.height(6.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    PillButton(if (playingNow) "Pause" else "Play", { togglePause() }, icon = if (playingNow) TvIcons.Pause else TvIcons.Play)
+                    PillButton("Audio and captions", { tracks = true }, icon = TvIcons.Captions)
+                    if (nextEpisode != null) {
+                        PillButton("Next episode", { onPlayNext(nextEpisode) }, icon = TvIcons.Next)
+                    }
+                }
+            }
+        }
+
+        if (tracks) {
+            TrackPanel(
+                player = player,
                 resizeMode = resizeMode,
-                focusRequester = menuFocus,
-                onAudio = { group, index ->
-                    player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
-                        .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, false)
-                        .setOverrideForType(TrackSelectionOverride(group.mediaTrackGroup, index))
-                        .build()
-                },
-                onSubtitle = { group, index ->
-                    player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
-                        .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
-                        .setOverrideForType(TrackSelectionOverride(group.mediaTrackGroup, index))
-                        .build()
-                },
-                onSubtitlesOff = {
-                    player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
-                        .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
-                        .build()
-                },
                 onResize = { resizeMode = it },
-                onClose = { showMenu = false }
+                onClose = { tracks = false },
+                modifier = Modifier.align(Alignment.CenterEnd)
             )
         }
 
         if (failed) {
-            EmptyState(
-                title = "This title will not play",
-                body = "The stream may use a format this TV cannot decode. Press BACK to return.",
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(Cable.Canvas.copy(alpha = 0.8f))
-            )
-        }
-    }
-}
-
-/** One selectable track in the player menu. */
-private class TrackChoice(val group: androidx.media3.common.Tracks.Group, val index: Int, val label: String)
-
-private fun tracksOf(player: Player, type: Int): List<TrackChoice> {
-    val out = mutableListOf<TrackChoice>()
-    player.currentTracks.groups.forEach { group ->
-        if (group.type == type) {
-            for (i in 0 until group.length) {
-                if (group.isTrackSupported(i)) {
-                    out += TrackChoice(group, i, trackLabel(group.getTrackFormat(i), out.size))
-                }
+            Box(Modifier.fillMaxSize().background(Tv.Scrim), contentAlignment = Alignment.Center) {
+                EmptyState(
+                    "This title will not play",
+                    "The file may use a format this TV cannot decode. Press Back to return."
+                )
             }
         }
     }
-    return out
 }
 
+/** The playback position. When focused, left and right skip ten seconds and OK pauses. */
 @Composable
-private fun TrackMenu(
-    audio: List<TrackChoice>,
-    subtitles: List<TrackChoice>,
-    resizeMode: Int,
-    focusRequester: FocusRequester,
-    onAudio: (androidx.media3.common.Tracks.Group, Int) -> Unit,
-    onSubtitle: (androidx.media3.common.Tracks.Group, Int) -> Unit,
-    onSubtitlesOff: () -> Unit,
-    onResize: (Int) -> Unit,
-    onClose: () -> Unit
-) {
-    Column(
-        Modifier
-            .fillMaxHeight()
-            .width(560.dp)
-            .background(Cable.Canvas.copy(alpha = 0.94f))
-            .padding(horizontal = 28.dp, vertical = 32.dp)
+private fun SeekBar(fraction: Float, modifier: Modifier, onTogglePause: () -> Unit, onSkip: (Long) -> Unit) {
+    var focused by remember { mutableStateOf(false) }
+    Focusable(
+        onClick = onTogglePause,
+        modifier = modifier
+            .fillMaxWidth()
+            .height(22.dp)
+            .onPreviewKeyEvent { ev ->
+                if (ev.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                when (ev.nativeKeyEvent.keyCode) {
+                    KeyEvent.KEYCODE_DPAD_LEFT -> { onSkip(-10_000); true }
+                    KeyEvent.KEYCODE_DPAD_RIGHT -> { onSkip(10_000); true }
+                    else -> false
+                }
+            },
+        shape = RoundedCornerShape(11.dp),
+        look = FocusLook.Ring,
+        focusScale = 1f,
+        onFocus = { focused = it },
+        contentAlignment = Alignment.CenterStart
     ) {
-        Text(
-            text = "PICTURE AND SOUND      BACK  Close",
-            style = MaterialTheme.typography.labelMedium,
-            color = Cable.Accent
-        )
-        Spacer(Modifier.height(16.dp))
-        LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            item { Text("PICTURE SIZE", style = MaterialTheme.typography.labelMedium, color = Cable.Ink3) }
-            item {
-                TrackRow("Fit to screen", selected = resizeMode == AspectRatioFrameLayout.RESIZE_MODE_FIT,
-                    modifier = Modifier.focusRequester(focusRequester)) {
-                    onResize(AspectRatioFrameLayout.RESIZE_MODE_FIT)
-                }
-            }
-            item {
-                TrackRow("Fill screen", selected = resizeMode == AspectRatioFrameLayout.RESIZE_MODE_FILL,
-                    modifier = Modifier) {
-                    onResize(AspectRatioFrameLayout.RESIZE_MODE_FILL)
-                }
-            }
-            item {
-                TrackRow("Zoom to fill", selected = resizeMode == AspectRatioFrameLayout.RESIZE_MODE_ZOOM,
-                    modifier = Modifier) {
-                    onResize(AspectRatioFrameLayout.RESIZE_MODE_ZOOM)
-                }
-            }
-            item { Spacer(Modifier.height(12.dp)) }
-            item { Text("AUDIO", style = MaterialTheme.typography.labelMedium, color = Cable.Ink3) }
-            if (audio.isEmpty()) {
-                item { Text("Only one audio track", style = MaterialTheme.typography.bodyMedium, color = Cable.Ink2) }
-            }
-            items(audio) { t -> TrackRow(t.label, selected = false, modifier = Modifier) { onAudio(t.group, t.index) } }
-            item { Spacer(Modifier.height(12.dp)) }
-            item { Text("SUBTITLES", style = MaterialTheme.typography.labelMedium, color = Cable.Ink3) }
-            item { TrackRow("Off", selected = false, modifier = Modifier) { onSubtitlesOff() } }
-            items(subtitles) { t -> TrackRow(t.label, selected = false, modifier = Modifier) { onSubtitle(t.group, t.index) } }
-        }
-    }
-}
-
-@Composable
-private fun TrackRow(label: String, selected: Boolean, modifier: Modifier, onClick: () -> Unit) {
-    FocusSurface(
-        onClick = onClick,
-        modifier = modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(8.dp),
-        focusScale = 1f
-    ) {
-        Row(
-            Modifier
-                .fillMaxWidth()
-                .background(if (selected) Cable.SurfaceHi else Cable.Surface)
-                .padding(horizontal = 20.dp, vertical = 14.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                text = label,
-                style = MaterialTheme.typography.titleMedium,
-                color = Cable.Ink,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f)
-            )
-            if (selected) {
-                Text(text = "ON", style = MaterialTheme.typography.labelLarge, color = Cable.Led)
+        BoxWithConstraints(Modifier.fillMaxWidth().padding(horizontal = 8.dp), contentAlignment = Alignment.CenterStart) {
+            val w = maxWidth
+            ProgressBar(fraction, Modifier.fillMaxWidth(), color = Tv.Accent, height = if (focused) 6.dp else 4.dp)
+            if (focused) {
+                Box(Modifier.offset(x = w * fraction.coerceIn(0f, 1f) - 7.dp).size(14.dp).clip(CircleShape).background(Color.White))
             }
         }
     }

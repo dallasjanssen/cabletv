@@ -1,22 +1,28 @@
 package com.dallas.cabletv.ui
 
+import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import android.view.KeyEvent
+import android.view.LayoutInflater
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -29,1020 +35,658 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
-import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
-import coil.compose.AsyncImage
+import com.dallas.cabletv.R
 import com.dallas.cabletv.data.EpgCache
 import com.dallas.cabletv.data.LiveChannel
 import com.dallas.cabletv.data.NowNext
 import com.dallas.cabletv.data.Program
-import com.dallas.cabletv.data.XtreamClient
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
-import kotlinx.coroutines.withContext
 
-private const val MAX_RETRIES = 4
+/**
+ * The live TV player. It lives for the whole app, so Home and the guide can keep the channel
+ * playing behind them, and coming back to full screen never reloads the stream.
+ */
+class LivePlayer(context: Context) {
+    val exo: ExoPlayer = ExoPlayer.Builder(context).build()
+    var buffering by mutableStateOf(false)
+        private set
+    var failed by mutableStateOf(false)
+        private set
+    var resizeMode by mutableIntStateOf(AspectRatioFrameLayout.RESIZE_MODE_FIT)
 
-private fun progressOf(p: Program): Float {
-    val total = (p.end - p.start).coerceAtLeast(1L)
-    return ((System.currentTimeMillis() - p.start).toFloat() / total).coerceIn(0f, 1f)
+    private var url: String? = null
+    private var retries = 0
+    private val handler = Handler(Looper.getMainLooper())
+
+    private val listener = object : Player.Listener {
+        override fun onPlayerError(error: PlaybackException) {
+            // Most failures are brief, so retry a few times before saying there is no signal.
+            if (retries < MAX_RETRIES) {
+                retries++
+                handler.postDelayed({
+                    exo.prepare()
+                    exo.playWhenReady = true
+                }, 2000)
+            } else {
+                failed = true
+            }
+        }
+
+        override fun onPlaybackStateChanged(playbackState: Int) {
+            buffering = playbackState == Player.STATE_BUFFERING
+            if (playbackState == Player.STATE_READY) {
+                retries = 0
+                failed = false
+            }
+        }
+    }
+
+    init {
+        exo.addListener(listener)
+    }
+
+    /** Starts a stream. Asking for the one already playing does nothing. */
+    fun play(newUrl: String) {
+        if (newUrl == url) return
+        handler.removeCallbacksAndMessages(null)
+        url = newUrl
+        failed = false
+        retries = 0
+        exo.setMediaItem(MediaItem.fromUri(newUrl))
+        exo.prepare()
+        exo.playWhenReady = true
+    }
+
+    /** Stops and lets go of the provider connection, for example while a movie plays. */
+    fun stop() {
+        handler.removeCallbacksAndMessages(null)
+        url = null
+        buffering = false
+        exo.stop()
+    }
+
+    fun release() {
+        handler.removeCallbacksAndMessages(null)
+        exo.removeListener(listener)
+        exo.release()
+    }
+
+    private companion object {
+        const val MAX_RETRIES = 4
+    }
 }
 
-/** Full schedule first, then the provider's short listing as a fallback. */
-private fun lookupNowNext(channel: LiveChannel, epg: XtreamClient?): NowNext? =
-    EpgCache.nowNext(channel.epgId)
-        ?: if (epg != null) runCatching { epg.nowNext(channel.id) }.getOrNull() else null
+/** The live picture. The app places it full screen, or in the guide's corner preview. */
+@Composable
+fun LiveVideo(player: LivePlayer, modifier: Modifier = Modifier) {
+    val resize = player.resizeMode
+    AndroidView(
+        factory = { ctx ->
+            (LayoutInflater.from(ctx).inflate(R.layout.live_player_view, null) as PlayerView).also { it.player = player.exo }
+        },
+        update = { it.resizeMode = resize },
+        onRelease = { it.player = null },
+        modifier = modifier
+    )
+}
 
+private enum class LivePanel { None, Options, Channels, Replay, Tracks }
+
+/**
+ * Full-screen live TV. Up and down change channel. OK opens a bar with everything you can do,
+ * Left opens the channel list, and number keys jump to a channel. Every action is also a button,
+ * so a remote with only arrows, OK and Back can reach all of it.
+ */
 @Composable
 fun LiveTvScreen(
     channels: List<LiveChannel>,
+    index: Int,
+    player: LivePlayer,
+    guide: GuideData,
+    favorites: Set<String>,
+    recents: List<String>,
     loading: Boolean,
     error: String?,
-    startIndex: Int,
-    epg: XtreamClient?,
-    favorites: Set<String>,
+    canReplay: Boolean,
+    replaying: Boolean,
+    onTune: (Int) -> Unit,
     onToggleFavorite: (LiveChannel) -> Unit,
+    onReplay: (LiveChannel, Program) -> Unit,
+    onReturnToLive: () -> Unit,
+    onOpenGuide: () -> Unit,
     onExit: () -> Unit,
-    onChannelChanged: (LiveChannel) -> Unit = {}
+    showToast: (String) -> Unit
 ) {
-    val context = LocalContext.current
-    val player = remember { ExoPlayer.Builder(context).build() }
-
-    var index by remember(startIndex) { mutableIntStateOf(startIndex) }
-    var playerError by remember { mutableStateOf<String?>(null) }
-    var buffering by remember { mutableStateOf(false) }
-    var retries by remember { mutableIntStateOf(0) }
-    var retryTick by remember { mutableIntStateOf(0) }
-    var showBanner by remember { mutableStateOf(false) }
-    var bannerTick by remember { mutableIntStateOf(0) }
-    var digits by remember { mutableStateOf("") }
-    var nowNext by remember { mutableStateOf<NowNext?>(null) }
-    // Left opens the channel list. Up and down browse it, OK tunes, right or Back closes it.
-    var showMiniGuide by remember { mutableStateOf(false) }
-    var guideHighlight by remember { mutableIntStateOf(0) }
-    // INFO opens the replay list for channels with a catch-up archive. While a replay plays, BACK returns to live.
-    var showReplay by remember { mutableStateOf(false) }
-    var replayUrl by remember { mutableStateOf<String?>(null) }
-    val replayFocus = remember { FocusRequester() }
-    BackHandler(enabled = showMiniGuide) { showMiniGuide = false }
-    BackHandler(enabled = showReplay) { showReplay = false }
-    BackHandler(enabled = replayUrl != null && !showReplay && !showMiniGuide) { replayUrl = null }
-    val focus = remember { FocusRequester() }
     val current = channels.getOrNull(index)
-    val playUrl = replayUrl ?: current?.streamUrl
+    val nn = current?.let { guide.nowNext(it) }
+    var panel by remember { mutableStateOf(LivePanel.None) }
+    var bannerTick by remember { mutableIntStateOf(1) }
+    var showBanner by remember { mutableStateOf(false) }
+    var digits by remember { mutableStateOf("") }
+    var lastKey by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    val rootFocus = remember { FocusRequester() }
 
-    DisposableEffect(player) {
-        val listener = object : Player.Listener {
-            override fun onPlayerError(e: PlaybackException) {
-                // Retry a few times before saying there is no signal, since most failures are brief.
-                if (retries < MAX_RETRIES) {
-                    retries++
-                    retryTick++
-                } else {
-                    playerError = e.message ?: "Signal lost"
-                }
-            }
-
-            override fun onPlaybackStateChanged(playbackState: Int) {
-                buffering = playbackState == Player.STATE_BUFFERING
-                if (playbackState == Player.STATE_READY) {
-                    retries = 0
-                    playerError = null
-                }
-            }
-        }
-        player.addListener(listener)
-        onDispose {
-            player.removeListener(listener)
-            player.release()
-        }
+    fun close() {
+        panel = LivePanel.None
     }
 
-    // Retries a failed stream after a short wait.
-    LaunchedEffect(retryTick) {
-        if (retryTick > 0 && retries <= MAX_RETRIES) {
-            delay(2000)
-            player.prepare()
-            player.playWhenReady = true
-        }
-    }
-
-    // Load whatever should be on screen: the live channel or a replay. A short wait means
-    // holding a key only loads the channel you stop on, not every one on the way.
-    LaunchedEffect(playUrl) {
-        if (playUrl == null) return@LaunchedEffect
-        delay(300)
-        playerError = null
-        retries = 0
-        player.setMediaItem(MediaItem.fromUri(playUrl))
-        player.prepare()
-        player.playWhenReady = true
-    }
-
-    // Report the channel on screen, so the next launch can return to it and it joins Recent.
-    LaunchedEffect(current?.id) {
-        if (current == null) return@LaunchedEffect
-        delay(500)
-        onChannelChanged(current)
-    }
-
-    // Refresh now and next for the channel on screen.
-    LaunchedEffect(current?.id) {
-        nowNext = null
-        if (current == null) return@LaunchedEffect
-        delay(300)
-        nowNext = withContext(Dispatchers.IO) { lookupNowNext(current, epg) }
-    }
-
-    // Show the info banner for four seconds after each change.
-    LaunchedEffect(bannerTick) {
-        if (bannerTick > 0) {
-            showBanner = true
-            delay(4000)
-            showBanner = false
-        }
-    }
-
-    // Typed channel numbers tune once the user pauses.
-    LaunchedEffect(digits) {
-        if (digits.isNotEmpty()) {
-            delay(1500)
-            val target = channels.indexOfFirst { it.number == digits.toIntOrNull() }
-            if (target >= 0) index = target
-            digits = ""
-            replayUrl = null
-            bannerTick++
-        }
-    }
-
-    // Opens the replay list with focus on its first row.
-    LaunchedEffect(showReplay) {
-        if (showReplay) {
-            withFrameNanos { }
-            runCatching { replayFocus.requestFocus() }
-        }
-    }
-
-    fun flashBanner() {
+    fun tune(newIndex: Int) {
+        if (channels.isEmpty()) return
+        onTune((newIndex + channels.size) % channels.size)
+        digits = ""
         bannerTick++
     }
 
-    fun tune(delta: Int) {
-        if (channels.isEmpty()) return
-        index = (index + delta + channels.size) % channels.size
-        digits = ""
-        replayUrl = null
-        flashBanner()
-    }
+    BackHandler(enabled = panel == LivePanel.None) { if (replaying) onReturnToLive() else onExit() }
+    BackHandler(enabled = panel != LivePanel.None) { close() }
 
-    fun pickGuideChannel(idx: Int) {
-        index = idx
-        digits = ""
-        replayUrl = null
-        showMiniGuide = false
-        flashBanner()
-    }
-
-    // Consumes only the keys the list uses. Everything else, Back and volume included, goes to the system.
-    fun handleMiniGuideKey(code: Int): Boolean {
-        val last = (channels.size - 1).coerceAtLeast(0)
-        return when (code) {
-            KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_CHANNEL_UP -> {
-                guideHighlight = (guideHighlight - 1).coerceAtLeast(0)
-                true
-            }
-            KeyEvent.KEYCODE_DPAD_DOWN, KeyEvent.KEYCODE_CHANNEL_DOWN -> {
-                guideHighlight = (guideHighlight + 1).coerceAtMost(last)
-                true
-            }
-            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
-                pickGuideChannel(guideHighlight)
-                true
-            }
-            KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                showMiniGuide = false
-                true
-            }
-            // The menu key marks the highlighted channel as a favorite.
-            KeyEvent.KEYCODE_MENU -> {
-                channels.getOrNull(guideHighlight)?.let(onToggleFavorite)
-                true
-            }
-            else -> false
+    // With no panel open, the screen itself holds focus so it receives the remote's keys.
+    LaunchedEffect(panel) {
+        if (panel == LivePanel.None) {
+            withFrameNanos { }
+            runCatching { rootFocus.requestFocus() }
         }
     }
 
-    val replayPrograms = remember(current?.id, showReplay) {
-        if (current != null && current.catchup && epg != null) EpgCache.pastPrograms(current.epgId) else emptyList()
+    LaunchedEffect(bannerTick) {
+        showBanner = true
+        delay(4500)
+        showBanner = false
     }
 
-    LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
+    // The options bar and channel list close by themselves after a while without a key press.
+    LaunchedEffect(panel, lastKey) {
+        val wait = when (panel) {
+            LivePanel.Options -> 10_000L
+            LivePanel.Channels -> 20_000L
+            else -> return@LaunchedEffect
+        }
+        delay(wait)
+        close()
+    }
+
+    // Typed channel numbers tune once the viewer pauses.
+    LaunchedEffect(digits) {
+        if (digits.isEmpty()) return@LaunchedEffect
+        delay(1400)
+        val target = channels.indexOfFirst { it.number.toString() == digits }
+        if (target >= 0) {
+            panel = LivePanel.None
+            tune(target)
+        } else {
+            showToast("There is no channel $digits")
+        }
+        digits = ""
+    }
 
     Box(
         Modifier
             .fillMaxSize()
-            .background(Color.Black)
-            .focusRequester(focus)
-            .focusable()
             .onPreviewKeyEvent { ev ->
                 if (ev.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                lastKey = System.currentTimeMillis()
                 val code = ev.nativeKeyEvent.keyCode
-                // While the replay list is open, its rows handle the remote.
-                if (showReplay) return@onPreviewKeyEvent false
-                if (showMiniGuide) return@onPreviewKeyEvent handleMiniGuideKey(code)
+                if (code in KeyEvent.KEYCODE_0..KeyEvent.KEYCODE_9 && panel != LivePanel.Tracks) {
+                    if (digits.length < 4) digits += (code - KeyEvent.KEYCODE_0).toString()
+                    return@onPreviewKeyEvent true
+                }
                 when (code) {
-                    KeyEvent.KEYCODE_DPAD_LEFT -> {
-                        if (channels.isEmpty()) {
-                            false
-                        } else {
-                            guideHighlight = index
-                            showMiniGuide = true
-                            true
+                    KeyEvent.KEYCODE_CHANNEL_UP -> { panel = LivePanel.None; tune(index + 1); return@onPreviewKeyEvent true }
+                    KeyEvent.KEYCODE_CHANNEL_DOWN -> { panel = LivePanel.None; tune(index - 1); return@onPreviewKeyEvent true }
+                    KeyEvent.KEYCODE_GUIDE -> { onOpenGuide(); return@onPreviewKeyEvent true }
+                    KeyEvent.KEYCODE_LAST_CHANNEL -> return@onPreviewKeyEvent false
+                }
+                if (panel == LivePanel.Options && code == KeyEvent.KEYCODE_DPAD_DOWN) {
+                    close()
+                    return@onPreviewKeyEvent true
+                }
+                if (panel == LivePanel.Channels && code == KeyEvent.KEYCODE_DPAD_RIGHT) {
+                    close()
+                    return@onPreviewKeyEvent true
+                }
+                if (panel != LivePanel.None) return@onPreviewKeyEvent false
+                when (code) {
+                    KeyEvent.KEYCODE_DPAD_UP -> { tune(index + 1); true }
+                    KeyEvent.KEYCODE_DPAD_DOWN -> { tune(index - 1); true }
+                    KeyEvent.KEYCODE_DPAD_LEFT -> { if (channels.isNotEmpty()) panel = LivePanel.Channels; true }
+                    KeyEvent.KEYCODE_DPAD_RIGHT -> { bannerTick++; true }
+                    KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER,
+                    KeyEvent.KEYCODE_MENU, KeyEvent.KEYCODE_INFO -> {
+                        if (channels.isNotEmpty()) {
+                            showBanner = false
+                            panel = LivePanel.Options
                         }
-                    }
-                    KeyEvent.KEYCODE_INFO -> {
-                        if (replayPrograms.isNotEmpty()) showReplay = true
-                        true
-                    }
-                    KeyEvent.KEYCODE_CHANNEL_UP, KeyEvent.KEYCODE_DPAD_UP -> {
-                        tune(1)
-                        true
-                    }
-                    KeyEvent.KEYCODE_CHANNEL_DOWN, KeyEvent.KEYCODE_DPAD_DOWN -> {
-                        tune(-1)
-                        true
-                    }
-                    KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
-                        flashBanner()
-                        true
-                    }
-                    KeyEvent.KEYCODE_MENU -> {
-                        current?.let(onToggleFavorite)
-                        flashBanner()
-                        true
-                    }
-                    in KeyEvent.KEYCODE_0..KeyEvent.KEYCODE_9 -> {
-                        if (digits.length < 4) digits += (code - KeyEvent.KEYCODE_0).toString()
                         true
                     }
                     else -> false
                 }
             }
-            .clickable { flashBanner() }
+            .focusRequester(rootFocus)
+            .focusable()
+            .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) {
+                // A tap on a phone opens the options bar, like OK on a remote.
+                if (panel == LivePanel.None && channels.isNotEmpty()) panel = LivePanel.Options else close()
+            }
     ) {
-        AndroidView(
-            factory = { ctx ->
-                PlayerView(ctx).apply { useController = false }.also { it.player = player }
-            },
-            modifier = Modifier.fillMaxSize()
-        )
-
         when {
             channels.isEmpty() -> EmptyState(
                 title = when {
-                    loading -> "Finding channels..."
-                    error != null -> "Can't load channels"
+                    loading -> "Finding your channels"
+                    error != null -> "Your channels did not load"
                     else -> "No channels yet"
                 },
-                body = error ?: if (loading) null else "Open Settings to add a live source.",
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(Cable.Canvas.copy(alpha = 0.8f))
+                body = when {
+                    loading -> "This takes a few seconds the first time."
+                    error != null -> "$error. Check your login in Settings, Live TV."
+                    else -> "Add your TV provider in Settings, Live TV."
+                },
+                modifier = Modifier.fillMaxSize().background(Tv.Scrim)
             )
-            playerError != null -> EmptyState(
-                title = "No signal",
-                body = "This channel is not responding. Press up or down to try another.",
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(Cable.Canvas.copy(alpha = 0.6f))
-            )
+            player.failed -> Box(Modifier.fillMaxSize().background(Color(0x99000000)), contentAlignment = Alignment.Center) {
+                EmptyState(
+                    title = "No signal on ${current?.name ?: "this channel"}",
+                    body = "The provider is not sending this channel right now. Press up or down to try another."
+                )
+            }
         }
 
-        // Shown while the stream is waiting for more data, so a stall never looks like a freeze.
-        if (buffering && playerError == null && channels.isNotEmpty() && !showBanner) {
+        if (player.buffering && !player.failed && channels.isNotEmpty() && !showBanner && panel == LivePanel.None) {
             Text(
-                text = "BUFFERING...",
-                style = MaterialTheme.typography.labelMedium,
-                color = Cable.Accent,
+                "Loading",
+                style = TvType.SmallStrong,
                 modifier = Modifier
                     .align(Alignment.BottomStart)
                     .padding(40.dp)
-                    .clip(RoundedCornerShape(6.dp))
-                    .background(Cable.Canvas.copy(alpha = 0.8f))
-                    .padding(horizontal = 14.dp, vertical = 6.dp)
+                    .clip(RoundedCornerShape(999.dp))
+                    .background(Tv.Scrim)
+                    .padding(horizontal = 14.dp, vertical = 7.dp)
             )
         }
 
-        // Digits typed on the remote appear in the top corner.
-        if (digits.isNotEmpty()) {
-            Text(
-                text = digits,
-                style = MaterialTheme.typography.headlineLarge,
-                color = Cable.Accent,
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(40.dp)
-                    .clip(RoundedCornerShape(16.dp))
-                    .background(Cable.Canvas.copy(alpha = 0.85f))
-                    .padding(horizontal = 28.dp, vertical = 10.dp)
-            )
-        }
-
-        if (replayUrl != null) {
-            Text(
-                text = "REPLAY    BACK  Return to live",
-                style = MaterialTheme.typography.labelMedium,
-                color = Cable.Led,
-                modifier = Modifier
+        if (replaying && panel == LivePanel.None) {
+            Row(
+                Modifier
                     .align(Alignment.TopStart)
-                    .padding(40.dp)
-                    .clip(RoundedCornerShape(6.dp))
-                    .background(Cable.Canvas.copy(alpha = 0.8f))
-                    .padding(horizontal = 14.dp, vertical = 6.dp)
+                    .padding(30.dp)
+                    .clip(RoundedCornerShape(999.dp))
+                    .background(Tv.Scrim)
+                    .padding(horizontal = 14.dp, vertical = 7.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Icon(TvIcons.Replay, contentDescription = null, modifier = Modifier.size(16.dp))
+                Text("Replay. Back returns to live.", style = TvType.CaptionStrong)
+            }
+        }
+
+        if (digits.isNotEmpty()) {
+            val match = channels.firstOrNull { it.number.toString() == digits }
+            Column(
+                Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(30.dp)
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(Tv.Scrim)
+                    .padding(horizontal = 18.dp, vertical = 10.dp),
+                horizontalAlignment = Alignment.End
+            ) {
+                Text(digits, style = TvType.Display.copy(fontSize = 38.sp), color = Tv.Accent)
+                Text(match?.name ?: "No channel $digits", style = TvType.Small, color = Tv.Ink2)
+            }
+        }
+
+        AnimatedVisibility(
+            visible = showBanner && panel == LivePanel.None && current != null,
+            enter = fadeIn(),
+            exit = fadeOut(),
+            modifier = Modifier.align(Alignment.BottomStart)
+        ) {
+            if (current != null) ChannelBanner(current, nn, current.id in favorites)
+        }
+
+        if (panel == LivePanel.Options && current != null) {
+            OptionsBar(
+                channel = current,
+                nn = nn,
+                isFavorite = current.id in favorites,
+                canReplay = canReplay && current.catchup,
+                onGuide = onOpenGuide,
+                onChannels = { panel = LivePanel.Channels },
+                onFavorite = {
+                    val adding = current.id !in favorites
+                    onToggleFavorite(current)
+                    showToast(if (adding) "Added ${current.name} to favorites" else "Removed ${current.name} from favorites")
+                },
+                onReplay = { panel = LivePanel.Replay },
+                onTracks = { panel = LivePanel.Tracks },
+                modifier = Modifier.align(Alignment.BottomCenter)
             )
         }
 
-        if (showMiniGuide && channels.isNotEmpty()) {
-            MiniGuide(
+        AnimatedVisibility(
+            visible = panel == LivePanel.Channels,
+            enter = slideInHorizontally { -it } + fadeIn(),
+            exit = slideOutHorizontally { -it } + fadeOut(),
+            modifier = Modifier.align(Alignment.CenterStart)
+        ) {
+            ChannelListPanel(
                 channels = channels,
-                highlight = guideHighlight,
-                current = index,
+                currentIndex = index,
                 favorites = favorites,
-                onPick = { pickGuideChannel(it) },
-                modifier = Modifier.align(Alignment.CenterStart)
+                recents = recents,
+                guide = guide,
+                onPick = {
+                    close()
+                    tune(it)
+                }
             )
         }
 
-        if (showReplay && current != null) {
+        if (panel == LivePanel.Replay && current != null) {
             ReplayPanel(
-                channelName = current.name,
-                programs = replayPrograms,
-                focusRequester = replayFocus,
+                channel = current,
+                now = nn?.now,
                 onPick = { p ->
-                    val url = epg?.timeshiftUrl(current.id, p.start, p.end)
-                    if (url != null) {
-                        replayUrl = url
-                        showReplay = false
-                        flashBanner()
-                    }
+                    close()
+                    onReplay(current, p)
                 },
                 modifier = Modifier.align(Alignment.CenterEnd)
             )
         }
 
-        AnimatedVisibility(
-            visible = showBanner && current != null && !showMiniGuide && !showReplay,
-            modifier = Modifier.align(Alignment.BottomCenter),
-            enter = fadeIn(),
-            exit = fadeOut()
-        ) {
-            if (current != null) {
-                ChannelBanner(
-                    channel = current,
-                    nn = nowNext,
-                    isFavorite = current.id in favorites,
-                    canReplay = replayPrograms.isNotEmpty()
-                )
-            }
+        if (panel == LivePanel.Tracks) {
+            TrackPanel(
+                player = player.exo,
+                resizeMode = player.resizeMode,
+                onResize = { player.resizeMode = it },
+                onClose = { close() },
+                modifier = Modifier.align(Alignment.CenterEnd)
+            )
         }
     }
 }
 
+/** Shown for a few seconds after each channel change. */
 @Composable
-private fun ChannelBanner(channel: LiveChannel, nn: NowNext?, isFavorite: Boolean, canReplay: Boolean) {
+private fun ChannelBanner(channel: LiveChannel, nn: NowNext?, isFavorite: Boolean) {
     val now = nn?.now
-    val next = nn?.next
-
-    Box(
+    Column(
         Modifier
-            .fillMaxWidth()
-            .background(
-                Brush.verticalGradient(
-                    listOf(Color.Transparent, Cable.Canvas.copy(alpha = 0.92f), Cable.Canvas)
-                )
-            )
-            .padding(horizontal = 56.dp, vertical = 48.dp)
+            .padding(start = 40.dp, bottom = 28.dp, end = 40.dp)
+            .widthIn(max = 540.dp)
+            .clip(RoundedCornerShape(14.dp))
+            .background(Tv.Scrim)
+            .padding(horizontal = 16.dp, vertical = 14.dp)
     ) {
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Bottom) {
-            Column(
-                Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            ChannelLogo(channel, Modifier.size(78.dp, 44.dp))
+            Spacer(Modifier.width(14.dp))
+            Column(Modifier.weight(1f, fill = false)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        text = channel.number.toString(),
-                        style = MaterialTheme.typography.headlineLarge,
-                        color = Cable.Accent
-                    )
-                    Spacer(Modifier.width(20.dp))
-                    Text(
-                        text = channel.name,
-                        style = MaterialTheme.typography.headlineMedium,
-                        color = Cable.Ink,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
+                    Text(channel.number.toString(), style = TvType.BodyStrong, color = Tv.Accent)
+                    Spacer(Modifier.width(9.dp))
+                    Text(channel.name, style = TvType.Title.copy(fontWeight = FontWeight.ExtraBold), maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
                     if (isFavorite) {
-                        Spacer(Modifier.width(20.dp))
-                        Pill(text = "FAVORITE", color = Cable.Led, textColor = Cable.Canvas)
+                        Spacer(Modifier.width(8.dp))
+                        Icon(TvIcons.StarFilled, contentDescription = "Favorite", tint = Tv.Accent, modifier = Modifier.size(16.dp))
                     }
                 }
-
+                Spacer(Modifier.height(4.dp))
                 if (now != null) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Pill(text = "LIVE", color = Cable.Live)
-                        Spacer(Modifier.width(14.dp))
-                        Text(
-                            text = now.title,
-                            style = MaterialTheme.typography.titleLarge,
-                            color = Cable.Led,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
+                        Text(now.title, style = TvType.SmallStrong, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+                        Spacer(Modifier.width(8.dp))
+                        ProgressBar(progressOf(now), Modifier.width(80.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text(timeLeft(now), style = TvType.Small, color = Tv.Ink2, maxLines = 1)
                     }
-                    ProgressLine(progressOf(now), Modifier.fillMaxWidth(0.55f))
-                    Text(
-                        text = "${formatTime(now.start)} to ${formatTime(now.end)}",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = Cable.Ink2
-                    )
                 } else {
-                    Text(
-                        text = "No guide data for this channel",
-                        style = MaterialTheme.typography.bodyLarge,
-                        color = Cable.Ink3
-                    )
+                    Text("No guide information for this channel", style = TvType.Small, color = Tv.Ink3)
                 }
-
-                Spacer(Modifier.height(8.dp))
-                Text(
-                    text = if (canReplay) {
-                        "UP / DOWN  Channel    LEFT  Channel list    INFO  Replay    MENU  Favorite"
-                    } else {
-                        "UP / DOWN  Channel    LEFT  Channel list    MENU  Favorite    0-9  Jump"
-                    },
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = Cable.Ink2
-                )
             }
-
-            next?.let { UpNextCard(it) }
+        }
+        Spacer(Modifier.height(10.dp))
+        Box(Modifier.fillMaxWidth().height(1.dp).background(Color(0x14FFFFFF)))
+        Spacer(Modifier.height(9.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+            KeyHint("OK", "More options")
+            KeyHint("◀", "Channel list")
+            KeyHint("▲▼", "Change channel")
         }
     }
 }
 
-/** Past programmes on a channel with catch-up, newest first. OK plays one from the provider's archive. */
+/** Everything you can do while watching, as buttons. Opens with OK. */
 @Composable
-private fun ReplayPanel(
-    channelName: String,
-    programs: List<Program>,
-    focusRequester: FocusRequester,
-    onPick: (Program) -> Unit,
+private fun OptionsBar(
+    channel: LiveChannel,
+    nn: NowNext?,
+    isFavorite: Boolean,
+    canReplay: Boolean,
+    onGuide: () -> Unit,
+    onChannels: () -> Unit,
+    onFavorite: () -> Unit,
+    onReplay: () -> Unit,
+    onTracks: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    Column(
+    val first = remember { FocusRequester() }
+    LaunchedEffect(Unit) {
+        withFrameNanos { }
+        runCatching { first.requestFocus() }
+    }
+    val now = nn?.now
+    val next = nn?.next
+    BoxWithConstraints(
         modifier
-            .fillMaxHeight()
-            .width(620.dp)
-            .background(Cable.Canvas.copy(alpha = 0.92f))
-            .padding(vertical = 32.dp, horizontal = 24.dp)
+            .fillMaxWidth()
+            .background(Brush.verticalGradient(listOf(Color.Transparent, Color(0xE60D0F13), Color(0xF80D0F13))))
     ) {
-        Text(
-            text = "REPLAY  $channelName",
-            style = MaterialTheme.typography.labelMedium,
-            color = Cable.Accent,
-            modifier = Modifier.padding(bottom = 12.dp)
-        )
-        LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            itemsIndexed(programs, key = { _, p -> p.start }) { idx, p ->
-                FocusSurface(
-                    onClick = { onPick(p) },
-                    modifier = (if (idx == 0) Modifier.focusRequester(focusRequester) else Modifier).fillMaxWidth(),
-                    shape = RoundedCornerShape(8.dp),
-                    focusScale = 1f
-                ) {
-                    Row(
-                        Modifier
-                            .fillMaxWidth()
-                            .background(Cable.Surface)
-                            .padding(horizontal = 20.dp, vertical = 14.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = formatTime(p.start),
-                            style = MaterialTheme.typography.labelLarge,
-                            color = Cable.Accent,
-                            modifier = Modifier.width(120.dp)
-                        )
-                        Text(
-                            text = p.title,
-                            style = MaterialTheme.typography.titleMedium,
-                            color = Cable.Ink,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.weight(1f)
-                        )
+        val side = if (maxWidth < 600.dp) 16.dp else 40.dp
+        val wide = maxWidth >= 700.dp
+        Column(Modifier.trapFocus().padding(start = side, end = side, top = 70.dp, bottom = 26.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                ChannelLogo(channel, Modifier.size(78.dp, 44.dp))
+                Spacer(Modifier.width(14.dp))
+                Column(Modifier.weight(1f)) {
+                    Row(verticalAlignment = Alignment.Bottom) {
+                        Text(channel.number.toString(), style = TvType.Section, color = Tv.Accent)
+                        Spacer(Modifier.width(10.dp))
+                        Text(channel.name, style = TvType.Headline.copy(fontSize = 24.sp), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                    Text(
+                        if (isFavorite) "★ Favorite" else channel.group,
+                        style = TvType.SmallStrong,
+                        color = if (isFavorite) Tv.Accent else Tv.Ink3,
+                        maxLines = 1
+                    )
+                }
+                Clock()
+            }
+            Spacer(Modifier.height(10.dp))
+            if (now != null) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    LivePill()
+                    Spacer(Modifier.width(10.dp))
+                    Text(now.title, style = TvType.Title.copy(fontSize = 17.sp, fontWeight = FontWeight.SemiBold), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+                Spacer(Modifier.height(6.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(formatRange(now), style = TvType.Small, color = Tv.Ink2)
+                    Spacer(Modifier.width(10.dp))
+                    ProgressBar(progressOf(now), Modifier.width(220.dp))
+                    Spacer(Modifier.width(10.dp))
+                    Text(timeLeft(now), style = TvType.Small, color = Tv.Ink2)
+                    Spacer(Modifier.weight(1f))
+                    if (next != null && wide) {
+                        Column(horizontalAlignment = Alignment.End) {
+                            Text("Next at ${formatTime(next.start)}", style = TvType.Small, color = Tv.Ink2)
+                            Text(next.title, style = TvType.BodyStrong, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 280.dp))
+                        }
                     }
                 }
-            }
-        }
-        Text(
-            text = "BACK  Close",
-            style = MaterialTheme.typography.labelMedium,
-            color = Cable.Ink2,
-            modifier = Modifier.padding(top = 12.dp)
-        )
-    }
-}
-
-/**
- * A channel list over the left side of the picture. The highlighted row moves
- * with the remote and does not change the channel until OK is pressed.
- */
-@Composable
-private fun MiniGuide(
-    channels: List<LiveChannel>,
-    highlight: Int,
-    current: Int,
-    favorites: Set<String>,
-    onPick: (Int) -> Unit,
-    modifier: Modifier = Modifier
-) {
-    val listState = rememberLazyListState()
-    LaunchedEffect(highlight) {
-        if (highlight in channels.indices) listState.animateScrollToItem(highlight)
-    }
-
-    Column(
-        modifier
-            .fillMaxHeight()
-            .width(560.dp)
-            .background(Cable.Canvas.copy(alpha = 0.92f))
-            .padding(vertical = 32.dp)
-    ) {
-        Text(
-            text = "CHANNELS      MENU  Favorite",
-            style = MaterialTheme.typography.labelMedium,
-            color = Cable.Accent,
-            modifier = Modifier.padding(start = 28.dp, bottom = 12.dp)
-        )
-        LazyColumn(Modifier.weight(1f), state = listState) {
-            itemsIndexed(channels, key = { _, c -> c.id }) { idx, ch ->
-                val selected = idx == highlight
-                Row(
-                    Modifier
-                        .fillMaxWidth()
-                        .background(if (selected) Cable.SurfaceHi else Color.Transparent)
-                        .border(2.dp, if (selected) Cable.Led else Color.Transparent)
-                        .clickable { onPick(idx) }
-                        .padding(horizontal = 28.dp, vertical = 14.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = ch.number.toString(),
-                        style = MaterialTheme.typography.titleMedium,
-                        color = Cable.Accent,
-                        modifier = Modifier.width(88.dp)
-                    )
-                    Text(
-                        text = (if (ch.id in favorites) "* " else "") + ch.name,
-                        style = MaterialTheme.typography.titleMedium,
-                        color = if (idx == current) Cable.Led else Cable.Ink,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
+                if (now.desc.isNotBlank()) {
+                    Spacer(Modifier.height(6.dp))
+                    Text(now.desc, style = TvType.Small, color = Tv.Ink2, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 620.dp))
                 }
+            } else {
+                Text("No guide information for this channel", style = TvType.Body, color = Tv.Ink3)
+            }
+            Spacer(Modifier.height(16.dp))
+            Row(
+                Modifier.horizontalScroll(rememberScrollState()).padding(vertical = 2.dp),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                PillButton("Guide", onGuide, icon = TvIcons.Guide, modifier = Modifier.focusRequester(first))
+                PillButton("Channel list", onChannels, icon = TvIcons.List)
+                PillButton(
+                    if (isFavorite) "Remove favorite" else "Add to favorites",
+                    onFavorite,
+                    icon = if (isFavorite) TvIcons.StarFilled else TvIcons.Star
+                )
+                if (canReplay) PillButton("Watch from the start", onReplay, icon = TvIcons.Replay)
+                PillButton("Audio and captions", onTracks, icon = TvIcons.Captions)
             }
         }
     }
 }
 
+private enum class ListTab(val label: String) { All("All"), Favorites("Favorites"), Recent("Recent") }
+
+/** The channel list over the left of the picture. The highlight moves without changing channel until OK. */
 @Composable
-private fun UpNextCard(program: Program) {
-    Column(
-        Modifier
-            .width(340.dp)
-            .clip(RoundedCornerShape(16.dp))
-            .background(Cable.Canvas.copy(alpha = 0.8f))
-            .padding(20.dp),
-        verticalArrangement = Arrangement.spacedBy(6.dp)
-    ) {
-        Text(
-            text = "UP NEXT",
-            style = MaterialTheme.typography.labelMedium,
-            color = Cable.Ink3
-        )
-        Text(
-            text = program.title,
-            style = MaterialTheme.typography.titleMedium,
-            color = Cable.Ink,
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis
-        )
-        Text(
-            text = formatTime(program.start),
-            style = MaterialTheme.typography.bodyMedium,
-            color = Cable.Ink2
-        )
-    }
-}
-
-private const val ALL_GROUP = "All"
-private const val FAVS_GROUP = "FAVORITES"
-private const val RECENT_GROUP = "RECENT"
-
-private fun groupOf(ch: LiveChannel): String = ch.group.ifBlank { "Other" }
-
-@Composable
-fun GuideScreen(
+private fun ChannelListPanel(
     channels: List<LiveChannel>,
-    epg: XtreamClient?,
+    currentIndex: Int,
     favorites: Set<String>,
     recents: List<String>,
-    onWatch: (Int) -> Unit,
-    onToggleFavorite: (LiveChannel) -> Unit
+    guide: GuideData,
+    onPick: (Int) -> Unit
 ) {
-    val cache = remember { mutableStateMapOf<String, NowNext>() }
-    val gate = remember { Semaphore(3) } // limit guide requests so the provider is not flooded
-    val firstRow = remember { FocusRequester() }
-
-    val categories = remember(channels) { channels.map(::groupOf).distinct().sorted() }
-    // Favorites and Recent come before All, so they are one press away.
-    val groups = listOf(FAVS_GROUP, RECENT_GROUP, ALL_GROUP) + categories
-    var selectedGroup by remember { mutableStateOf(ALL_GROUP) }
-    LaunchedEffect(groups) {
-        if (selectedGroup !in groups) selectedGroup = ALL_GROUP
-    }
-    val visible = remember(channels, selectedGroup, favorites, recents) {
-        when (selectedGroup) {
-            ALL_GROUP -> channels
-            FAVS_GROUP -> channels.filter { it.id in favorites }
-            RECENT_GROUP -> recents.mapNotNull { id -> channels.firstOrNull { it.id == id } }
-            else -> channels.filter { groupOf(it) == selectedGroup }
+    var tab by remember { mutableStateOf(ListTab.All) }
+    val shown: List<Int> = remember(tab, channels, favorites, recents) {
+        when (tab) {
+            ListTab.All -> channels.indices.toList()
+            ListTab.Favorites -> channels.indices.filter { channels[it].id in favorites }
+            ListTab.Recent -> recents.mapNotNull { id -> channels.indexOfFirst { it.id == id }.takeIf { it >= 0 } }
         }
     }
-
-    // Wait one frame so the first row exists before focus moves onto it.
-    LaunchedEffect(channels.size, selectedGroup) {
-        if (visible.isNotEmpty()) {
+    val listState = rememberLazyListState()
+    val start = remember { FocusRequester() }
+    val startPos = shown.indexOf(currentIndex).coerceAtLeast(0)
+    LaunchedEffect(tab) {
+        if (shown.isNotEmpty()) {
+            listState.scrollToItem((startPos - 3).coerceAtLeast(0))
             withFrameNanos { }
-            runCatching { firstRow.requestFocus() }
+            runCatching { start.requestFocus() }
         }
     }
 
-    Column(
-        Modifier
-            .fillMaxSize()
-            .padding(horizontal = 48.dp, vertical = 40.dp)
-    ) {
-        Text(
-            text = if (epg == null) {
-                "Connect a live source to see what is on."
-            } else {
-                "What is on now, and what is next."
-            },
-            style = MaterialTheme.typography.bodyLarge,
-            color = Cable.Ink2
-        )
-        Spacer(Modifier.height(20.dp))
-
-        if (channels.isEmpty()) {
-            EmptyState(
-                title = "No channels loaded",
-                body = "Add a live source in Settings.",
-                modifier = Modifier.weight(1f)
-            )
-        } else {
-            LazyRow(
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 6.dp)
-            ) {
-                items(groups, key = { it }) { group ->
-                    CategoryChip(label = groupLabel(group), selected = group == selectedGroup) {
-                        selectedGroup = group
-                    }
-                }
+    BoxWithConstraints {
+        SidePanel("Channels", Modifier.width(minOf(340.dp, maxWidth * 0.88f))) {
+            Row(Modifier.padding(horizontal = 24.dp).padding(bottom = 10.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                ListTab.entries.forEach { t -> Chip(t.label, selected = t == tab, onClick = { tab = t }) }
             }
-            Spacer(Modifier.height(20.dp))
-
-            if (visible.isEmpty()) {
-                EmptyState(
-                    title = if (selectedGroup == FAVS_GROUP) "No favorites yet" else "Nothing here yet",
-                    body = if (selectedGroup == FAVS_GROUP) {
-                        "Press the favorite button on a channel, or MENU on the remote while watching."
-                    } else {
-                        "Channels you watch will appear here."
-                    },
-                    modifier = Modifier.weight(1f)
-                )
-            } else {
-                LazyColumn(
-                    Modifier.weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(10.dp),
-                    contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 4.dp)
-                ) {
-                    itemsIndexed(visible, key = { _, c -> c.id }) { idx, ch ->
-                        GuideRow(
-                            ch = ch,
-                            cache = cache,
-                            epg = epg,
-                            gate = gate,
-                            favorite = ch.id in favorites,
-                            focusRequester = if (idx == 0) firstRow else null,
-                            onClick = {
-                                // Tune using the index in the full list, not the filtered one.
-                                onWatch(channels.indexOfFirst { it.id == ch.id })
-                            },
-                            onFavorite = { onToggleFavorite(ch) }
-                        )
-                    }
-                }
-            }
-        }
-    }
-}
-
-private fun groupLabel(group: String): String = when (group) {
-    FAVS_GROUP -> "FAVORITES"
-    RECENT_GROUP -> "RECENT"
-    else -> group
-}
-
-@Composable
-private fun CategoryChip(label: String, selected: Boolean, onClick: () -> Unit) {
-    FocusSurface(
-        onClick = onClick,
-        shape = RoundedCornerShape(50),
-        focusScale = 1.06f
-    ) {
-        Text(
-            text = label,
-            style = MaterialTheme.typography.labelLarge,
-            color = if (selected) Cable.Canvas else Cable.Ink,
-            modifier = Modifier
-                .background(if (selected) Cable.Accent else Cable.SurfaceHi)
-                .padding(horizontal = 24.dp, vertical = 12.dp)
-        )
-    }
-}
-
-/**
- * One guide row. Wide screens (TVs) show the name, the programme and the next one side by
- * side. Narrow screens (phones) stack them, so nothing is squeezed out.
- */
-@Composable
-private fun GuideRow(
-    ch: LiveChannel,
-    cache: MutableMap<String, NowNext>,
-    epg: XtreamClient?,
-    gate: Semaphore,
-    favorite: Boolean,
-    focusRequester: FocusRequester?,
-    onClick: () -> Unit,
-    onFavorite: () -> Unit
-) {
-    LaunchedEffect(ch.id) {
-        if (epg == null || cache.containsKey(ch.id) || EpgCache.nowNext(ch.epgId) != null) return@LaunchedEffect
-        val result = withContext(Dispatchers.IO) {
-            gate.withPermit { runCatching { epg.nowNext(ch.id) }.getOrNull() }
-        }
-        if (result != null) cache[ch.id] = result
-    }
-
-    BoxWithConstraints(Modifier.fillMaxWidth()) {
-        if (maxWidth >= 600.dp) {
-            GuideRowWide(ch, cache, epg, gate, favorite, focusRequester, onClick, onFavorite)
-        } else {
-            GuideRowNarrow(ch, cache, epg, favorite, focusRequester, onClick, onFavorite)
-        }
-    }
-}
-
-@Composable
-private fun GuideRowNarrow(
-    ch: LiveChannel,
-    cache: MutableMap<String, NowNext>,
-    epg: XtreamClient?,
-    favorite: Boolean,
-    focusRequester: FocusRequester?,
-    onClick: () -> Unit,
-    onFavorite: () -> Unit
-) {
-    val nn = EpgCache.nowNext(ch.epgId) ?: cache[ch.id]
-    val now = nn?.now
-    val next = nn?.next
-    val mainModifier = if (focusRequester != null) {
-        Modifier.fillMaxWidth().focusRequester(focusRequester)
-    } else {
-        Modifier.fillMaxWidth()
-    }
-
-    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        FocusSurface(
-            onClick = onClick,
-            modifier = mainModifier,
-            shape = RoundedCornerShape(12.dp),
-            focusScale = 1f
-        ) {
-            Column(
-                Modifier
-                    .fillMaxWidth()
-                    .background(Cable.Surface)
-                    .padding(horizontal = 16.dp, vertical = 14.dp),
-                verticalArrangement = Arrangement.spacedBy(4.dp)
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        text = ch.number.toString(),
-                        style = MaterialTheme.typography.titleMedium,
-                        color = Cable.Accent
-                    )
-                    Spacer(Modifier.width(12.dp))
-                    Text(
-                        text = if (favorite) "* ${ch.name}" else ch.name,
-                        style = MaterialTheme.typography.titleMedium,
-                        color = Cable.Ink,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f)
-                    )
-                }
-                if (now != null) {
-                    Text(
-                        text = now.title,
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = Cable.Led,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    ProgressLine(progressOf(now), Modifier.fillMaxWidth().padding(top = 2.dp))
-                } else {
-                    Text(
-                        text = if (epg == null) "No guide source" else "No guide data",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = Cable.Ink3
-                    )
-                }
-                if (next != null) {
-                    Text(
-                        text = "NEXT ${formatTime(next.start)}  ${next.title}",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = Cable.Ink2,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-            }
-        }
-
-        // The favorite button is its own small target under the row, so it never pushes the name off screen.
-        FocusSurface(
-            onClick = onFavorite,
-            shape = RoundedCornerShape(12.dp),
-            focusScale = 1f
-        ) {
-            Text(
-                text = if (favorite) "* FAVORITE" else "ADD FAVORITE",
-                style = MaterialTheme.typography.labelLarge,
-                color = if (favorite) Cable.Led else Cable.Ink2,
-                modifier = Modifier
-                    .background(Cable.Surface)
-                    .padding(horizontal = 18.dp, vertical = 10.dp)
-            )
-        }
-    }
-}
-
-@Composable
-private fun GuideRowWide(
-    ch: LiveChannel,
-    cache: MutableMap<String, NowNext>,
-    epg: XtreamClient?,
-    gate: Semaphore,
-    favorite: Boolean,
-    focusRequester: FocusRequester?,
-    onClick: () -> Unit,
-    onFavorite: () -> Unit
-) {
-    val nn = EpgCache.nowNext(ch.epgId) ?: cache[ch.id]
-    val now = nn?.now
-    val next = nn?.next
-
-    Row(
-        Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
-        // weight is a RowScope modifier, so the main target is built inside the row.
-        val mainModifier = if (focusRequester != null) {
-            Modifier.weight(1f).focusRequester(focusRequester)
-        } else {
-            Modifier.weight(1f)
-        }
-        FocusSurface(
-            onClick = onClick,
-            modifier = mainModifier,
-            shape = RoundedCornerShape(14.dp),
-            focusScale = 1f
-        ) {
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .background(Cable.Surface)
-                    .padding(horizontal = 24.dp, vertical = 16.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
+            if (shown.isEmpty()) {
                 Text(
-                    text = ch.number.toString(),
-                    style = MaterialTheme.typography.titleLarge,
-                    color = Cable.Accent,
-                    modifier = Modifier.width(88.dp)
+                    if (tab == ListTab.Favorites) "No favorites yet. Use Add to favorites while watching." else "Channels you watch show up here.",
+                    style = TvType.Small,
+                    color = Tv.Ink2,
+                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp)
                 )
-                ChannelLogo(ch.logo)
-                Spacer(Modifier.width(20.dp))
-                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text(
-                        text = if (favorite) "* ${ch.name}" else ch.name,
-                        style = MaterialTheme.typography.titleMedium,
-                        color = Cable.Ink,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    if (now != null) {
-                        Text(
-                            text = now.title,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = Cable.Led,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                        ProgressLine(progressOf(now), Modifier.fillMaxWidth(0.7f).padding(top = 4.dp))
-                    } else {
-                        Text(
-                            text = if (epg == null) "No guide source" else "No guide data",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = Cable.Ink3
-                        )
+            }
+            LazyColumn(Modifier.weight(1f), state = listState, contentPadding = PaddingValues(horizontal = 12.dp, vertical = 2.dp)) {
+                itemsIndexed(shown, key = { _, i -> channels[i].id }) { pos, i ->
+                    val ch = channels[i]
+                    val now = guide.nowNext(ch)?.now
+                    Focusable(
+                        onClick = { onPick(i) },
+                        modifier = (if (pos == startPos) Modifier.focusRequester(start) else Modifier).fillMaxWidth(),
+                        shape = RoundedCornerShape(9.dp)
+                    ) {
+                        Row(Modifier.padding(horizontal = 10.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                ch.number.toString(),
+                                style = TvType.SmallStrong,
+                                color = if (LocalFocused.current) Tv.FocusInk else if (i == currentIndex) Tv.Accent else Tv.Ink3,
+                                modifier = Modifier.width(34.dp),
+                                maxLines = 1
+                            )
+                            ChannelLogo(ch, Modifier.size(52.dp, 30.dp), compact = true)
+                            Spacer(Modifier.width(12.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(ch.name, style = TvType.BodyStrong, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(now?.title ?: "No guide information", style = TvType.Caption, color = ink3, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                if (now != null) {
+                                    Spacer(Modifier.height(5.dp))
+                                    ProgressBar(progressOf(now), Modifier.widthIn(max = 150.dp).fillMaxWidth(), height = 3.dp)
+                                }
+                            }
+                        }
                     }
                 }
-                if (next != null) {
-                    Spacer(Modifier.width(24.dp))
-                    Column(Modifier.width(300.dp), horizontalAlignment = Alignment.End) {
+            }
+            Row(Modifier.padding(horizontal = 24.dp).padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                KeyHint("OK", "Watch")
+                KeyHint("▶", "Close")
+            }
+        }
+    }
+}
+
+/** Earlier shows on a channel with catch-up, and the current one from its start. */
+@Composable
+private fun ReplayPanel(channel: LiveChannel, now: Program?, onPick: (Program) -> Unit, modifier: Modifier = Modifier) {
+    val past = remember(channel.id) { EpgCache.pastPrograms(channel.epgId).take(30) }
+    val items = listOfNotNull(now) + past
+    val first = remember { FocusRequester() }
+    LaunchedEffect(Unit) {
+        withFrameNanos { }
+        runCatching { first.requestFocus() }
+    }
+    SidePanel("Watch from the start", modifier.width(360.dp)) {
+        if (items.isEmpty()) {
+            Text(
+                "There is nothing to replay on this channel yet.",
+                style = TvType.Small,
+                color = Tv.Ink2,
+                modifier = Modifier.padding(horizontal = 24.dp)
+            )
+        }
+        LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(horizontal = 12.dp)) {
+            itemsIndexed(items, key = { _, p -> p.start }) { i, p ->
+                Focusable(
+                    onClick = { onPick(p) },
+                    modifier = (if (i == 0) Modifier.focusRequester(first) else Modifier).fillMaxWidth(),
+                    shape = RoundedCornerShape(9.dp)
+                ) {
+                    Column(Modifier.padding(horizontal = 12.dp, vertical = 9.dp)) {
+                        Text(p.title, style = TvType.BodyStrong, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         Text(
-                            text = "NEXT  ${formatTime(next.start)}",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = Cable.Ink3
-                        )
-                        Text(
-                            text = next.title,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = Cable.Ink2,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
+                            if (p == now) "On now. Started at ${formatTime(p.start)}" else "Earlier, ${formatRange(p)}",
+                            style = TvType.Caption,
+                            color = ink3
                         )
                     }
                 }
             }
         }
-
-        FocusSurface(
-            onClick = onFavorite,
-            modifier = Modifier.width(190.dp),
-            shape = RoundedCornerShape(14.dp),
-            focusScale = 1f
-        ) {
-            Text(
-                text = if (favorite) "* FAVORITE" else "ADD FAVORITE",
-                style = MaterialTheme.typography.labelLarge,
-                color = if (favorite) Cable.Led else Cable.Ink2,
-                modifier = Modifier
-                    .background(Cable.Surface)
-                    .padding(horizontal = 20.dp, vertical = 22.dp)
-            )
-        }
-    }
-}
-
-@Composable
-private fun ChannelLogo(url: String?) {
-    if (url.isNullOrBlank()) {
-        Spacer(Modifier.width(72.dp))
-    } else {
-        AsyncImage(
-            model = url,
-            contentDescription = null,
-            contentScale = ContentScale.Fit,
-            modifier = Modifier.size(width = 72.dp, height = 44.dp)
+        Text(
+            "Your provider keeps about a day of shows for ${channel.name}.",
+            style = TvType.Caption,
+            color = Tv.Ink3,
+            modifier = Modifier.padding(horizontal = 24.dp).padding(top = 8.dp)
         )
     }
 }

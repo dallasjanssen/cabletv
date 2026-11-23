@@ -55,6 +55,9 @@ class UserStateStore(context: Context, profileId: String = ProfileStore.DEFAULT_
                     .put("url", item.streamUrl)
                     .put("type", item.type)
                     .put("source", item.source)
+                    .put("season", item.season ?: JSONObject.NULL)
+                    .put("episode", item.episode ?: JSONObject.NULL)
+                    .put("series", item.seriesName ?: JSONObject.NULL)
                     .put("pos", positionMs)
                     .put("dur", durationMs)
                     .put("at", System.currentTimeMillis())
@@ -82,7 +85,12 @@ class UserStateStore(context: Context, profileId: String = ProfileStore.DEFAULT_
                 posterUrl = o.optString("poster"),
                 streamUrl = o.optString("url"),
                 type = o.optString("type"),
-                source = o.optString("source", "jellyfin")
+                source = o.optString("source", "jellyfin"),
+                season = if (o.isNull("season")) null else o.optInt("season").takeIf { it > 0 },
+                episode = if (o.isNull("episode")) null else o.optInt("episode").takeIf { it > 0 },
+                seriesName = if (o.isNull("series")) null else o.optString("series").takeIf { it.isNotBlank() },
+                progress = o.optLong("dur").takeIf { it > 0 }?.let { (o.optLong("pos").toFloat() / it).coerceIn(0f, 1f) },
+                runtimeMinutes = (o.optLong("dur") / 60_000L).toInt().takeIf { it > 0 }
             )
             entries += Triple(o.optLong("at"), item, o.optLong("pos"))
         }
