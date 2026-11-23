@@ -44,8 +44,21 @@ fun normalizeXtreamServerUrl(value: String): String {
     val scheme = uri.scheme?.lowercase()
     require(scheme == "http" || scheme == "https") { "Server URL must start with http:// or https://" }
     require(uri.rawUserInfo.isNullOrEmpty()) { "Put the username and password in their own fields" }
-    val host = uri.host ?: throw IllegalArgumentException("Server URL is not valid")
-    val port = if (uri.port == -1) "" else ":${uri.port}"
+    var host = uri.host
+    var port = if (uri.port == -1) "" else ":${uri.port}"
+    if (host == null) {
+        // java.net.URI has no host for names with underscores. Read the authority by hand.
+        val authority = uri.rawAuthority.orEmpty()
+        require('@' !in authority) { "Put the username and password in their own fields" }
+        val name = authority.substringBeforeLast(':', authority)
+        val portText = if (authority.contains(':')) authority.substringAfterLast(':') else ""
+        require(name.isNotEmpty() && name.all { it.isLetterOrDigit() || it == '-' || it == '_' || it == '.' }) {
+            "Server URL is not valid"
+        }
+        require(portText.isEmpty() || portText.all { it.isDigit() }) { "Server URL is not valid" }
+        host = name
+        port = if (portText.isEmpty()) "" else ":$portText"
+    }
     val path = uri.path.orEmpty().trimEnd('/').replace(apiSuffix, "").trimEnd('/')
     return "$scheme://$host$port$path"
 }
@@ -229,7 +242,9 @@ fun catchupUrl(
 /** `Y-m-d:H-M` in the panel's clock. With no usable zone, the device clock is the remaining guess. */
 fun formatCatchupStart(startMs: Long, serverTimezone: String?): String {
     val zoned = Instant.ofEpochMilli(startMs).atZone(zoneFor(serverTimezone))
-    return "%04d-%02d-%02d:%02d-%02d".format(
+    return String.format(
+        java.util.Locale.US,
+        "%04d-%02d-%02d:%02d-%02d",
         zoned.year,
         zoned.monthValue,
         zoned.dayOfMonth,

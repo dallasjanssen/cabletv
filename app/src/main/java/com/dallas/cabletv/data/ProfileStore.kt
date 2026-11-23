@@ -13,15 +13,23 @@ data class Profile(val id: String, val name: String)
  */
 class ProfileStore(context: Context) {
 
+    private val appContext = context.applicationContext
     private val prefs = context.getSharedPreferences("cabletv_profiles", Context.MODE_PRIVATE)
 
     fun profiles(): List<Profile> {
-        val arr = JSONArray(prefs.getString(K_LIST, null) ?: defaultList())
-        return (0 until arr.length()).map { i ->
-            val o = arr.getJSONObject(i)
-            Profile(id = o.getString("id"), name = o.getString("name"))
+        return try {
+            val arr = JSONArray(prefs.getString(K_LIST, null) ?: defaultList())
+            val list = (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                Profile(id = o.getString("id"), name = o.getString("name"))
+            }
+            list.ifEmpty { defaultProfiles() }
+        } catch (e: Exception) {
+            defaultProfiles()
         }
     }
+
+    private fun defaultProfiles(): List<Profile> = listOf(Profile(DEFAULT_ID, "Main"))
 
     fun active(): String {
         val id = prefs.getString(K_ACTIVE, DEFAULT_ID) ?: DEFAULT_ID
@@ -46,6 +54,7 @@ class ProfileStore(context: Context) {
         if (id == DEFAULT_ID) return
         save(profiles().filter { it.id != id })
         if (active() == id) setActive(DEFAULT_ID)
+        runCatching { appContext.deleteSharedPreferences(userStatePrefsName(id)) }
     }
 
     private fun save(list: List<Profile>) {

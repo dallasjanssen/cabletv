@@ -1,11 +1,12 @@
 package com.dallas.cabletv.data
 
+import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import androidx.core.content.FileProvider
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import org.json.JSONObject
+import org.json.JSONArray
 import java.io.File
 import java.util.concurrent.TimeUnit
 
@@ -29,25 +30,29 @@ object AppUpdater {
     /** Returns the newest release if it is newer than [currentCode], otherwise null. */
     fun latest(currentCode: Int): Release? {
         val req = Request.Builder()
-            .url("https://api.github.com/repos/$REPO/releases/latest")
+            .url("https://api.github.com/repos/$REPO/releases?per_page=20")
             .header("Accept", "application/vnd.github+json")
             .header("User-Agent", "CableTV/1.0")
             .build()
         http.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) error("GitHub returned HTTP ${resp.code}")
-            val json = JSONObject(resp.body?.string() ?: error("Empty response from GitHub"))
-            val code = json.optString("tag_name").removePrefix("build-").toIntOrNull()
-                ?: error("Latest release has no build number")
-            if (code <= currentCode) return null
-
-            val assets = json.optJSONArray("assets") ?: return null
-            for (i in 0 until assets.length()) {
-                val asset = assets.getJSONObject(i)
-                if (asset.optString("name") == APK_NAME) {
-                    return Release(code, asset.getString("browser_download_url"))
+            val releases = JSONArray(resp.body?.string() ?: error("Empty response from GitHub"))
+            var best: Release? = null
+            for (i in 0 until releases.length()) {
+                val json = releases.optJSONObject(i) ?: continue
+                val code = buildNumber(json.optString("tag_name")) ?: continue
+                if (code <= currentCode || code <= (best?.versionCode ?: 0)) continue
+                val assets = json.optJSONArray("assets") ?: continue
+                for (a in 0 until assets.length()) {
+                    val asset = assets.optJSONObject(a) ?: continue
+                    if (asset.optString("name") == APK_NAME) {
+                        val link = asset.optString("browser_download_url")
+                        if (link.isNotEmpty()) best = Release(code, link)
+                        break
+                    }
                 }
             }
-            return null
+            return best
         }
     }
 
@@ -55,11 +60,17 @@ object AppUpdater {
     fun download(release: Release, dir: File): File {
         dir.mkdirs()
         val file = File(dir, "cabletv-update.apk")
+        file.delete()
         val req = Request.Builder().url(release.apkUrl).header("User-Agent", "CableTV/1.0").build()
         http.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) error("Download returned HTTP ${resp.code}")
             val body = resp.body ?: error("Empty download")
             file.outputStream().use { out -> body.byteStream().copyTo(out) }
+            val expected = body.contentLength()
+            if (expected > 0L && file.length() != expected) {
+                file.delete()
+                throw Exception("The download was incomplete.")
+            }
         }
         return file
     }
@@ -70,6 +81,14 @@ object AppUpdater {
         val intent = Intent(Intent.ACTION_VIEW)
             .setDataAndType(uri, "application/vnd.android.package-archive")
             .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
-        context.startActivity(intent)
+        try {
+            context.startActivity(intent)
+        } catch (e: ActivityNotFoundException) {
+            throw Exception("This TV has no installer that can open the update.")
+        }
     }
+
+    /** The number in a tag like build-42, or null for any other tag. */
+    private fun buildNumber(tag: String): Int? =
+        Regex("build-(\\d+)").matchEntire(tag)?.groupValues?.get(1)?.toIntOrNull()
 }

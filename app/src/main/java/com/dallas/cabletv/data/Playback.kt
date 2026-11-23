@@ -1,6 +1,7 @@
 package com.dallas.cabletv.data
 
 import android.content.Context
+import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
@@ -13,18 +14,40 @@ import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 /** How far back a live channel can be paused or rewound from what is already buffered. */
 const val LIVE_BUFFER_MS = 3 * 60_000
 
-/** A player that sends the same client identity the provider API calls use. */
-fun newPlayer(context: Context): ExoPlayer {
+/**
+ * A player that sends the same client identity the provider API calls use.
+ * [compact] keeps a small buffer and no rewind, for the two small pictures of Two channels.
+ * Those two leave audio focus alone, because two players asking for it would pause each other.
+ */
+fun newPlayer(context: Context, compact: Boolean = false): ExoPlayer {
     val http = DefaultHttpDataSource.Factory()
         .setUserAgent(PLAYER_USER_AGENT)
         .setAllowCrossProtocolRedirects(true)
-    val load = DefaultLoadControl.Builder()
-        .setBufferDurationsMs(15_000, LIVE_BUFFER_MS, 1_500, 3_000)
-        .setBackBuffer(LIVE_BUFFER_MS, true)
+    val load = if (compact) {
+        DefaultLoadControl.Builder()
+            .setBufferDurationsMs(8_000, 15_000, 1_500, 3_000)
+            .setBackBuffer(0, false)
+            .setTargetBufferBytes(16 * 1024 * 1024)
+            .build()
+    } else {
+        // The size cap keeps a high bitrate stream from filling the memory before the time limit.
+        // The first 15 seconds still load past the cap, so the rewind buffer can never stall playback.
+        DefaultLoadControl.Builder()
+            .setBufferDurationsMs(15_000, LIVE_BUFFER_MS, 1_500, 3_000)
+            .setBackBuffer(LIVE_BUFFER_MS, true)
+            .setTargetBufferBytes(100 * 1024 * 1024)
+            .setPrioritizeTimeOverSizeThresholds(true)
+            .build()
+    }
+    val audio = AudioAttributes.Builder()
+        .setUsage(C.USAGE_MEDIA)
+        .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
         .build()
     return ExoPlayer.Builder(context)
         .setLoadControl(load)
         .setMediaSourceFactory(DefaultMediaSourceFactory(http))
+        .setAudioAttributes(audio, !compact)
+        .setHandleAudioBecomingNoisy(true)
         .build()
         .also { TrackMemory.apply(context, it) }
 }

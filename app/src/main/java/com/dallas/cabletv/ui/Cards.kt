@@ -5,7 +5,9 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.LocalBringIntoViewSpec
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyListScope
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
@@ -24,13 +26,20 @@ import com.dallas.cabletv.data.Program
 import com.dallas.cabletv.data.VodItem
 
 /** A titled horizontal row of cards, as used on Home, Movies and Shows, and Search. */
-@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun Shelf(title: String, side: Dp, modifier: Modifier = Modifier, content: LazyListScope.() -> Unit) {
+    Shelf(title, side, rememberLazyListState(), modifier, content)
+}
+
+/** A shelf whose scroll position is kept by the caller, so it survives leaving the screen. */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+fun Shelf(title: String, side: Dp, state: LazyListState, modifier: Modifier = Modifier, content: LazyListScope.() -> Unit) {
     Column(modifier.fillMaxWidth().padding(bottom = 14.dp)) {
         Text(title, style = TvType.Section, modifier = Modifier.padding(horizontal = side))
         CompositionLocalProvider(LocalBringIntoViewSpec provides rememberEdgeSpec(side)) {
             LazyRow(
+                state = state,
                 contentPadding = PaddingValues(horizontal = side, vertical = 10.dp),
                 horizontalArrangement = Arrangement.spacedBy(14.dp)
             ) { content() }
@@ -42,6 +51,8 @@ fun Shelf(title: String, side: Dp, modifier: Modifier = Modifier, content: LazyL
 @Composable
 fun ChannelCard(ch: LiveChannel, now: Program?, favorite: Boolean, onClick: () -> Unit, modifier: Modifier = Modifier) {
     var focused by remember { mutableStateOf(false) }
+    // Ticks so the progress line moves while the card stays on screen.
+    val clock = rememberNow()
     Column(modifier.width(168.dp)) {
         Focusable(
             onClick = onClick,
@@ -59,9 +70,9 @@ fun ChannelCard(ch: LiveChannel, now: Program?, favorite: Boolean, onClick: () -
             if (favorite) {
                 Icon(TvIcons.StarFilled, contentDescription = "Favorite", tint = Tv.Accent, modifier = Modifier.align(Alignment.TopEnd).padding(6.dp).size(14.dp))
             }
-            if (now != null && isOnNow(now)) {
+            if (now != null && isOnNow(now, clock)) {
                 ProgressBar(
-                    progressOf(now),
+                    progressOf(now, clock),
                     Modifier.align(Alignment.BottomStart).fillMaxWidth(),
                     track = Color(0x59000000),
                     height = 3.dp

@@ -9,8 +9,13 @@ class GuideSelectionTest {
     private val end = 5_000L
 
     @Test
-    fun currentShowWithCatchupPlaysFromTheStart() {
-        assertEquals(GuideSelection.Replay, guideSelection(start, end, 3_000L, placeholder = false, catchup = true))
+    fun currentShowWithCatchupOffersLiveOrFromTheStart() {
+        assertEquals(GuideSelection.LiveOrStart, guideSelection(start, end, 3_000L, placeholder = false, catchup = true))
+    }
+
+    @Test
+    fun showThatEndsNowIsAReplay() {
+        assertEquals(GuideSelection.Replay, guideSelection(start, end, end, placeholder = false, catchup = true))
     }
 
     @Test
@@ -65,5 +70,11 @@ class ProgrammeSearchTest {
     @Test
     fun needsTwoCharacters() {
         assertEquals(emptyList<Pair<String, Program>>(), matchProgrammes(schedule, "m", nowMs = 0L))
+    }
+
+    @Test
+    fun keysLimitTheChannelsSearched() {
+        assertEquals(emptyList<Pair<String, Program>>(), matchProgrammes(schedule, "chase", nowMs = 0L, keys = setOf("bbc")))
+        assertEquals(listOf("itv"), matchProgrammes(schedule, "chase", nowMs = 0L, keys = setOf("itv")).map { it.first })
     }
 }

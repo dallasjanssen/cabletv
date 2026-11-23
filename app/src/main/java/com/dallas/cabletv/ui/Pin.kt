@@ -67,6 +67,11 @@ fun PinPad(
                         press((code - KeyEvent.KEYCODE_0).toString())
                         true
                     }
+                    // The number pad on a keyboard, or on remotes that send those codes.
+                    in KeyEvent.KEYCODE_NUMPAD_0..KeyEvent.KEYCODE_NUMPAD_9 -> {
+                        press((code - KeyEvent.KEYCODE_NUMPAD_0).toString())
+                        true
+                    }
                     KeyEvent.KEYCODE_DEL -> {
                         press("del")
                         true

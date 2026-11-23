@@ -1,13 +1,16 @@
 package com.dallas.cabletv.ui
 
 import android.view.KeyEvent
+import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.LocalBringIntoViewSpec
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -29,11 +32,14 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
@@ -50,6 +56,7 @@ import com.dallas.cabletv.data.TrackMemory
 import com.dallas.cabletv.data.newPlayer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /** Everything the movie and show rows need, loaded once by the app and shared with Home. */
@@ -66,28 +73,59 @@ data class VodShelves(
 
 private fun keyOf(item: VodItem) = "${item.source}:${item.id}"
 
-private fun libraryRows(shelves: VodShelves): List<Pair<String, List<VodItem>>> {
+/** Past this much of an episode, it counts as watched. The provider sends no watched flag of its own. */
+private const val WATCHED_FRACTION = 0.9f
+
+/** One row of the library. [key] is unique even when two rows share a label. */
+private class LibraryRow(val key: String, val title: String, val items: List<VodItem>)
+
+/** The card to focus when the library comes back: its row, its key, and where it sat in the row. */
+private data class LibraryFocus(val rowKey: String, val itemKey: String, val index: Int)
+
+private fun libraryRows(shelves: VodShelves): List<LibraryRow> {
     fun grouped(title: String, items: List<VodItem>): List<Pair<String, List<VodItem>>> {
         if (items.isEmpty()) return emptyList()
-        val groups = items.groupBy { it.category.ifBlank { title } }
-        return if (groups.size <= 1) {
-            listOf(title to items)
-        } else {
-            groups.map { (name, list) ->
-                val label = if (name.equals(title, true)) title else "$title · $name"
-                label to list
-            }
+        // Categories that differ only in case or spacing share one row.
+        val groups = items.groupBy { it.category.trim().ifBlank { title }.lowercase() }
+        if (groups.size <= 1) return listOf(title to items)
+        return groups.values.map { list ->
+            val name = list.first().category.trim().ifBlank { title }
+            (if (name.equals(title, true)) title else "$title · $name") to list
         }
     }
-    return listOfNotNull(
+    val labelled = listOfNotNull(
         shelves.continueWatching.takeIf { it.isNotEmpty() }?.let { "Continue watching" to it },
         shelves.recent.takeIf { it.isNotEmpty() }?.let { "Recently added" to it }
     ) + grouped("Movies", shelves.movies) + grouped("Shows", shelves.series)
+    // List keys must be unique, so a label seen before gets a number. Cards in a row are unique too.
+    val used = HashSet<String>()
+    return labelled.map { (label, list) ->
+        var key = label
+        var n = 1
+        while (!used.add(key)) {
+            n++
+            key = "$label ($n)"
+        }
+        LibraryRow(key, label, list.distinctBy { keyOf(it) })
+    }
+}
+
+/** Row and card index for [focus], or the first card when it is gone. Null when there are no rows. */
+private fun focusTarget(rows: List<LibraryRow>, focus: LibraryFocus?): Pair<Int, Int>? {
+    if (rows.isEmpty()) return null
+    if (focus == null) return 0 to 0
+    val r = rows.indexOfFirst { it.key == focus.rowKey }
+    if (r < 0) return 0 to 0
+    val list = rows[r].items
+    val i = list.indexOfFirst { keyOf(it) == focus.itemKey }
+    return r to (if (i >= 0) i else focus.index.coerceIn(0, list.lastIndex))
 }
 
 /**
  * Movies and shows from Jellyfin and the TV provider. Picking a title opens its details page,
  * which plays, resumes, or lists the episodes. Back steps out one level at a time.
+ * [requireUnlock] runs before any title opens or plays: it calls the action when the parental
+ * lock allows it, asking for the PIN first when needed.
  */
 @Composable
 fun OnDemandScreen(
@@ -100,7 +138,8 @@ fun OnDemandScreen(
     onPlaybackEnded: () -> Unit,
     onLeaveDetail: () -> Unit,
     jellyfinToken: String = "",
-    jellyfinUserId: String = ""
+    jellyfinUserId: String = "",
+    requireUnlock: (VodItem, () -> Unit) -> Unit = { _, go -> go() }
 ) {
     val token = jellyfinToken.ifBlank { settings.jellyfinToken }
     val userId = jellyfinUserId.ifBlank { settings.jellyfinUserId }
@@ -118,24 +157,55 @@ fun OnDemandScreen(
     var detail by remember { mutableStateOf<VodItem?>(null) }
     var openedFromElsewhere by remember { mutableStateOf(false) }
     var episodes by remember { mutableStateOf<List<VodItem>?>(null) }
+    // The show [episodes] belongs to, as source:id.
+    var episodesFor by remember { mutableStateOf<String?>(null) }
     var playing by remember { mutableStateOf<VodItem?>(null) }
     var startOver by remember { mutableStateOf(false) }
     var lastPlayedId by remember { mutableStateOf<String?>(null) }
-    var libraryFocusKey by remember { mutableStateOf<String?>(null) }
     var resumeTick by remember { mutableIntStateOf(0) }
 
-    fun open(item: VodItem, fromElsewhere: Boolean) {
-        openedFromElsewhere = fromElsewhere
-        // A half-watched episode from a resume row plays straight away; everything else opens its page.
-        if (item.type == "Episode") {
-            detail = null
-            startOver = false
+    // Kept out here, not inside the library or the details page, so coming back from a page or
+    // from playback finds the same scroll positions, the same card and the same season.
+    var libraryFocus by remember { mutableStateOf<LibraryFocus?>(null) }
+    val libraryList = rememberLazyListState()
+    val rowStates = remember { mutableMapOf<String, LazyListState>() }
+    var detailSeason by remember { mutableStateOf<Int?>(null) }
+    val episodeList = remember(detail?.source, detail?.id) { LazyListState() }
+
+    suspend fun loadEpisodes(source: String, seriesId: String): List<VodItem> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                if (source == "xtream") xtream?.seriesEpisodes(seriesId).orEmpty() else jellyfin?.episodes(seriesId).orEmpty()
+            }.getOrDefault(emptyList())
+        }.distinctBy { it.id }
+
+    fun play(item: VodItem, fromStart: Boolean) {
+        requireUnlock(item) {
+            if (item.type == "Episode") {
+                lastPlayedId = item.id
+                if (item.season != null) detailSeason = item.season
+            }
+            startOver = fromStart
             playing = item
-            return
         }
-        detail = item
-        episodes = null
-        lastPlayedId = null
+    }
+
+    fun open(item: VodItem, fromElsewhere: Boolean) {
+        requireUnlock(item) {
+            openedFromElsewhere = fromElsewhere
+            if (item.type == "Episode") {
+                // A half-watched episode from a resume row plays straight away.
+                detail = null
+                startOver = false
+                playing = item
+            } else {
+                detail = item
+                episodes = null
+                episodesFor = null
+                lastPlayedId = null
+                detailSeason = null
+            }
+        }
     }
 
     LaunchedEffect(pendingVod) {
@@ -145,13 +215,27 @@ fun OnDemandScreen(
     }
 
     // Load a show's episodes when its page opens.
-    LaunchedEffect(detail?.id) {
+    LaunchedEffect(detail?.source, detail?.id) {
         val d = detail ?: return@LaunchedEffect
         if (d.type != "Series") return@LaunchedEffect
-        episodes = withContext(Dispatchers.IO) {
-            runCatching {
-                if (d.source == "xtream") xtream?.seriesEpisodes(d.id).orEmpty() else jellyfin?.episodes(d.id).orEmpty()
-            }.getOrDefault(emptyList())
+        val list = loadEpisodes(d.source, d.id)
+        episodes = list
+        episodesFor = "${d.source}:${d.id}"
+    }
+
+    // An episode opened from a resume row, Home or Search comes without its show's episode list.
+    // It loads in the background, so the next episode can follow.
+    val playingSeries = playing?.takeIf { it.type == "Episode" }?.let { p ->
+        p.seriesId?.takeIf { it.isNotBlank() }?.let { id -> p.source to id }
+    }
+    LaunchedEffect(playingSeries) {
+        val (source, seriesId) = playingSeries ?: return@LaunchedEffect
+        val show = "$source:$seriesId"
+        if (show == episodesFor && episodes != null) return@LaunchedEffect
+        val list = loadEpisodes(source, seriesId)
+        if (list.isNotEmpty()) {
+            episodes = list
+            episodesFor = show
         }
     }
 
@@ -160,25 +244,25 @@ fun OnDemandScreen(
     when {
         nowPlaying != null -> {
             val list = episodes.orEmpty()
-            val at = list.indexOfFirst { it.id == nowPlaying.id }
-            VodPlayer(
-                item = nowPlaying,
-                startOver = startOver,
-                store = userState,
-                jellyfin = if (nowPlaying.source == "jellyfin") jellyfin else null,
-                nextEpisode = if (at >= 0) list.getOrNull(at + 1) else null,
-                onPlayNext = {
-                    lastPlayedId = it.id
-                    startOver = true
-                    playing = it
-                },
-                onExit = {
-                    playing = null
-                    resumeTick++
-                    onPlaybackEnded()
-                    if (openDetail == null && openedFromElsewhere) onLeaveDetail()
-                }
-            )
+            val at = list.indexOfFirst { it.id == nowPlaying.id && it.source == nowPlaying.source }
+            // A fresh player for each title, so its saved place, its Jellyfin report and the
+            // next episode prompt always belong to the title that was playing.
+            key(nowPlaying.source, nowPlaying.id) {
+                VodPlayer(
+                    item = nowPlaying,
+                    startOver = startOver,
+                    store = userState,
+                    jellyfin = if (nowPlaying.source == "jellyfin") jellyfin else null,
+                    nextEpisode = if (at >= 0) list.getOrNull(at + 1) else null,
+                    onPlayNext = { play(it, fromStart = true) },
+                    onExit = {
+                        playing = null
+                        resumeTick++
+                        onPlaybackEnded()
+                        if (openDetail == null && openedFromElsewhere) onLeaveDetail()
+                    }
+                )
+            }
         }
         openDetail != null -> {
             BackHandler {
@@ -188,24 +272,25 @@ fun OnDemandScreen(
             DetailScreen(
                 item = openDetail,
                 xtream = xtream,
-                episodes = episodes,
+                episodes = episodes.takeIf { episodesFor == "${openDetail.source}:${openDetail.id}" },
                 store = userState,
                 resumeTick = resumeTick,
                 focusEpisodeId = lastPlayedId,
-                onPlay = { item, fromStart ->
-                    if (item.type == "Episode") lastPlayedId = item.id
-                    startOver = fromStart
-                    playing = item
-                }
+                season = detailSeason,
+                onSeason = { detailSeason = it },
+                listState = episodeList,
+                onPlay = { item, fromStart -> play(item, fromStart) }
             )
         }
         else -> Library(
             nav = nav,
             shelves = shelves,
             hasSource = settings.hasJellyfin || settings.hasXtream,
-            focusKey = libraryFocusKey,
-            onOpen = { key, item ->
-                libraryFocusKey = key
+            listState = libraryList,
+            rowState = { key -> rowStates.getOrPut(key) { LazyListState() } },
+            focus = libraryFocus,
+            onOpen = { f, item ->
+                libraryFocus = f
                 open(item, fromElsewhere = false)
             }
         )
@@ -218,18 +303,27 @@ private fun Library(
     nav: NavActions,
     shelves: VodShelves,
     hasSource: Boolean,
-    focusKey: String?,
-    onOpen: (String, VodItem) -> Unit
+    listState: LazyListState,
+    rowState: (String) -> LazyListState,
+    focus: LibraryFocus?,
+    onOpen: (LibraryFocus, VodItem) -> Unit
 ) {
-    val rows = libraryRows(shelves)
-    var focused by remember { mutableStateOf(rows.firstOrNull()?.second?.firstOrNull()) }
-    val target = focusKey ?: rows.firstOrNull()?.let { (t, list) -> "$t|${keyOf(list.first())}" }
+    // Grouping thousands of titles runs when the shelves change, not on every focus move.
+    val rows = remember(shelves) { libraryRows(shelves) }
+    var focused by remember { mutableStateOf(rows.firstOrNull()?.items?.firstOrNull()) }
+    val target = remember(rows, focus) { focusTarget(rows, focus) }
     val requester = remember { FocusRequester() }
-    LaunchedEffect(target, shelves.loading) {
-        if (target != null && !shelves.loading) {
-            withFrameNanos { }
-            runCatching { requester.requestFocus() }
-        }
+    val firstCard = remember { FocusRequester() }
+    val hasRows = rows.isNotEmpty()
+    LaunchedEffect(hasRows) {
+        val (r, i) = target ?: return@LaunchedEffect
+        withFrameNanos { }
+        // A card below the fold or far along its row is not composed yet, so scroll to it first.
+        if (listState.layoutInfo.visibleItemsInfo.none { it.index == r }) listState.scrollToItem(r)
+        val row = rowState(rows[r].key)
+        if (row.layoutInfo.visibleItemsInfo.none { it.index == i }) row.scrollToItem(i)
+        withFrameNanos { }
+        if (runCatching { requester.requestFocus() }.isFailure) runCatching { firstCard.requestFocus() }
     }
 
     TabScaffold(Tab.OnDemand, nav, modifier = Modifier.background(Tv.Bg)) { narrow ->
@@ -277,17 +371,20 @@ private fun Library(
                 CompositionLocalProvider(LocalBringIntoViewSpec provides rememberPivotSpec(34.dp)) {
                     LazyColumn(
                         Modifier.fillMaxSize().padding(top = if (narrow) 176.dp else 206.dp),
+                        state = listState,
                         contentPadding = PaddingValues(bottom = 24.dp)
                     ) {
-                        items(rows, key = { it.first }) { (title, list) ->
-                            Shelf(title, side) {
-                                items(list, key = { keyOf(it) }) { item ->
-                                    val key = "$title|${keyOf(item)}"
-                                    val mod = if (key == target) Modifier.focusRequester(requester) else Modifier
-                                    if (title == "Continue watching") {
-                                        ResumeCard(item, onClick = { onOpen(key, item) }, modifier = mod, onFocus = { if (it) focused = item })
+                        itemsIndexed(rows, key = { _, row -> row.key }) { r, row ->
+                            Shelf(row.title, side, state = rowState(row.key)) {
+                                itemsIndexed(row.items, key = { _, item -> keyOf(item) }) { i, item ->
+                                    var mod: Modifier = Modifier
+                                    if (target != null && r == target.first && i == target.second) mod = mod.focusRequester(requester)
+                                    if (r == 0 && i == 0) mod = mod.focusRequester(firstCard)
+                                    val click = { onOpen(LibraryFocus(row.key, keyOf(item), i), item) }
+                                    if (row.title == "Continue watching") {
+                                        ResumeCard(item, onClick = click, modifier = mod, onFocus = { if (it) focused = item })
                                     } else {
-                                        PosterCard(item, onClick = { onOpen(key, item) }, modifier = mod, onFocus = { if (it) focused = item })
+                                        PosterCard(item, onClick = click, modifier = mod, onFocus = { if (it) focused = item })
                                     }
                                 }
                             }
@@ -317,6 +414,9 @@ private fun DetailScreen(
     store: UserStateStore,
     resumeTick: Int,
     focusEpisodeId: String?,
+    season: Int?,
+    onSeason: (Int) -> Unit,
+    listState: LazyListState,
     onPlay: (VodItem, Boolean) -> Unit
 ) {
     var details by remember(item.id) { mutableStateOf(item) }
@@ -336,27 +436,39 @@ private fun DetailScreen(
     }
     val primary = remember { FocusRequester() }
     val episodeFocus = remember { FocusRequester() }
+    val scope = rememberCoroutineScope()
     val isSeries = item.type == "Series"
     val resumeMs = remember(item.id, resumeTick) { if (isSeries) 0L else store.resumePosition(item) }
 
-    // For a show, Resume picks the episode watched most recently, otherwise the first unwatched one.
-    val resumeEpisode = remember(episodes, resumeTick) {
-        val list = episodes.orEmpty()
-        val recent = store.continueWatching().map { keyOf(it.first) }
-        recent.firstNotNullOfOrNull { k -> list.firstOrNull { keyOf(it) == k } }
+    val list = episodes.orEmpty()
+    // This show's episodes with a saved place, most recent first, with how far each got.
+    val saved = remember(episodes, resumeTick) {
+        val byKey = list.associateBy { keyOf(it) }
+        store.continueWatching().mapNotNull { (entry, _) -> byKey[keyOf(entry)]?.let { it to (entry.progress ?: 0f) } }
     }
-    val startEpisode = resumeEpisode ?: episodes.orEmpty().let { list -> list.firstOrNull { !it.played } ?: list.firstOrNull() }
-    val seasons = remember(episodes) { episodes.orEmpty().mapNotNull { it.season }.distinct().sorted() }
-    var season by remember(item.id, seasons) { mutableStateOf(startEpisode?.season ?: seasons.firstOrNull()) }
-    val shown = remember(episodes, season) { episodes.orEmpty().filter { season == null || it.season == season } }
+    val watched = remember(saved) { saved.filter { it.second >= WATCHED_FRACTION }.map { it.first.id }.toSet() }
+    // For a show, Resume picks the episode watched most recently. When that one was watched to the
+    // end, the one after it plays. Otherwise the first unwatched one.
+    val latest = saved.firstOrNull()
+    val resumeEpisode = latest?.takeIf { it.second < WATCHED_FRACTION }?.first
+    val startEpisode = resumeEpisode
+        ?: latest?.first?.let { done -> list.getOrNull(list.indexOfFirst { it.id == done.id } + 1) }
+        ?: list.firstOrNull { !it.played && it.id !in watched }
+        ?: list.firstOrNull()
+    val seasons = remember(episodes) { list.mapNotNull { it.season }.distinct().sorted() }
+    val shownSeason = season?.takeIf { it in seasons } ?: startEpisode?.season ?: seasons.firstOrNull()
+    val shown = remember(episodes, shownSeason) { list.filter { shownSeason == null || it.season == shownSeason } }
 
     LaunchedEffect(item.id, episodes != null) {
         withFrameNanos { }
-        if (focusEpisodeId != null && shown.any { it.id == focusEpisodeId }) {
-            runCatching { episodeFocus.requestFocus() }
-        } else {
-            runCatching { primary.requestFocus() }
+        val at = focusEpisodeId?.let { id -> shown.indexOfFirst { it.id == id } } ?: -1
+        if (at >= 0) {
+            // An episode below the fold is not composed, so scroll to it before asking for focus.
+            if (listState.layoutInfo.visibleItemsInfo.none { it.index == at }) listState.scrollToItem(at)
+            withFrameNanos { }
+            if (runCatching { episodeFocus.requestFocus() }.isSuccess) return@LaunchedEffect
         }
+        runCatching { primary.requestFocus() }
     }
 
     BoxWithConstraints(Modifier.fillMaxSize().background(Tv.Bg)) {
@@ -414,15 +526,28 @@ private fun DetailScreen(
         val episodesList: @Composable ColumnScope.() -> Unit = {
             if (seasons.size > 1) {
                 Row(Modifier.horizontalScroll(rememberScrollState()).padding(vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    seasons.forEach { s -> Chip("Season $s", selected = s == season, onClick = { season = s }) }
+                    seasons.forEach { s ->
+                        Chip("Season $s", selected = s == shownSeason, onClick = {
+                            if (s != shownSeason) {
+                                onSeason(s)
+                                scope.launch { listState.scrollToItem(0) }
+                            }
+                        })
+                    }
                 }
                 Spacer(Modifier.height(8.dp))
             }
-            LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp), contentPadding = PaddingValues(vertical = 2.dp)) {
+            LazyColumn(
+                Modifier.weight(1f),
+                state = listState,
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+                contentPadding = PaddingValues(vertical = 2.dp)
+            ) {
                 items(shown, key = { it.id }) { ep ->
                     EpisodeRow(
                         ep,
                         resumed = resumeEpisode?.id == ep.id,
+                        watched = ep.played || ep.id in watched,
                         modifier = if (ep.id == focusEpisodeId) Modifier.focusRequester(episodeFocus) else Modifier,
                         onClick = { onPlay(ep, resumeEpisode?.id != ep.id) }
                     )
@@ -447,7 +572,7 @@ private fun DetailScreen(
 }
 
 @Composable
-private fun EpisodeRow(ep: VodItem, resumed: Boolean, modifier: Modifier, onClick: () -> Unit) {
+private fun EpisodeRow(ep: VodItem, resumed: Boolean, watched: Boolean, modifier: Modifier, onClick: () -> Unit) {
     Focusable(onClick = onClick, modifier = modifier.fillMaxWidth(), shape = RoundedCornerShape(10.dp)) {
         Row(Modifier.padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
             Box(Modifier.size(112.dp, 63.dp).clip(RoundedCornerShape(7.dp))) {
@@ -473,7 +598,7 @@ private fun EpisodeRow(ep: VodItem, resumed: Boolean, modifier: Modifier, onClic
                 val bits = listOfNotNull(
                     ep.runtimeMinutes?.let { minutesText(it.toLong()) },
                     when {
-                        ep.played -> "Watched"
+                        watched -> "Watched"
                         resumed -> "In progress"
                         else -> null
                     }
@@ -486,10 +611,10 @@ private fun EpisodeRow(ep: VodItem, resumed: Boolean, modifier: Modifier, onClic
 }
 
 /**
- * Full-screen playback with the app's own controls. Any key shows them. OK pauses, left and right
- * skip ten seconds, and Audio and captions picks language, subtitles and picture size. Playback
- * starts where it stopped last time, saves its place, reports to Jellyfin, and plays the next
- * episode by itself.
+ * Full-screen playback with the app's own controls. Any key shows them, and so does a tap on a
+ * phone. OK pauses, left and right skip ten seconds, and Audio and captions picks language,
+ * subtitles and picture size. Playback starts where it stopped last time, saves its place,
+ * reports to Jellyfin, and plays the next episode by itself. One instance plays one title.
  */
 @Composable
 private fun VodPlayer(
@@ -502,6 +627,7 @@ private fun VodPlayer(
     onExit: () -> Unit
 ) {
     val context = LocalContext.current
+    val lifecycle = (context as? ComponentActivity)?.lifecycle
     val player = remember { newPlayer(context) }
     var failed by remember { mutableStateOf(false) }
     var controls by remember { mutableStateOf(true) }
@@ -522,6 +648,7 @@ private fun VodPlayer(
     }
     val root = remember { FocusRequester() }
     val seek = remember { FocusRequester() }
+    val playNow = remember { FocusRequester() }
 
     fun savePosition() {
         val d = player.duration
@@ -541,7 +668,14 @@ private fun VodPlayer(
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (playbackState == Player.STATE_ENDED) {
                     val next = latestNext
-                    if (next != null) pendingNext = next else latestExit()
+                    if (next != null) {
+                        // The countdown takes over the screen, and its buttons take the remote.
+                        tracks = false
+                        controls = false
+                        pendingNext = next
+                    } else {
+                        latestExit()
+                    }
                 }
             }
         }
@@ -557,13 +691,39 @@ private fun VodPlayer(
         }
     }
 
+    // Leaving the app (Home on the remote) pauses, saves the place and reports it. Coming back
+    // shows the controls and stays paused. A pending next episode waits for the viewer instead.
+    DisposableEffect(lifecycle) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_STOP -> {
+                    player.pause()
+                    pendingNext = null
+                    savePosition()
+                    jellyfin?.let { c ->
+                        val at = player.currentPosition
+                        Thread { runCatching { c.reportProgress(item.id, at, true) } }.start()
+                    }
+                }
+                Lifecycle.Event.ON_START -> {
+                    controls = true
+                    lastKey = System.currentTimeMillis()
+                }
+                else -> Unit
+            }
+        }
+        lifecycle?.addObserver(observer)
+        onDispose { lifecycle?.removeObserver(observer) }
+    }
+
     LaunchedEffect(item.streamUrl) {
         failed = false
         val start = if (startOver) 0L else store.resumePosition(item)
         player.trackSelectionParameters = player.trackSelectionParameters.buildUpon().clearOverrides().build()
         player.setMediaItem(MediaItem.fromUri(item.streamUrl), start)
         player.prepare()
-        player.playWhenReady = true
+        // A title that starts while the app is in the background waits, paused.
+        player.playWhenReady = lifecycle?.currentState?.isAtLeast(Lifecycle.State.STARTED) != false
         controls = true
         lastKey = System.currentTimeMillis()
         jellyfin?.let { c -> withContext(Dispatchers.IO) { runCatching { c.reportStart(item.id, start) } } }
@@ -599,24 +759,54 @@ private fun VodPlayer(
         }
     }
 
-    LaunchedEffect(controls, tracks) {
+    // One place decides where focus goes: the countdown, the seek bar, or the picture itself.
+    LaunchedEffect(controls, tracks, pendingNext) {
         withFrameNanos { }
-        runCatching { if (controls && !tracks) seek.requestFocus() else if (!controls) root.requestFocus() }
+        runCatching {
+            when {
+                pendingNext != null -> playNow.requestFocus()
+                tracks -> Unit
+                controls -> seek.requestFocus()
+                else -> root.requestFocus()
+            }
+        }
     }
 
     fun skip(ms: Long) {
+        if (pendingNext != null) return
         val d = player.duration
         val target = (player.currentPosition + ms).coerceAtLeast(0L).let { if (d > 0) it.coerceAtMost(d - 1000) else it }
         player.seekTo(target)
         position = target
+        lastKey = System.currentTimeMillis()
+    }
+
+    fun seekToFraction(fraction: Float) {
+        val d = player.duration
+        if (d <= 0 || pendingNext != null) return
+        val target = (d * fraction.coerceIn(0f, 1f)).toLong().coerceIn(0L, (d - 1000).coerceAtLeast(0L))
+        player.seekTo(target)
+        position = target
+        lastKey = System.currentTimeMillis()
+    }
+
+    fun resume() {
+        // A title that has ended starts again from the beginning.
+        if (player.playbackState == Player.STATE_ENDED) player.seekTo(0)
+        player.play()
     }
 
     fun togglePause() {
-        if (player.isPlaying) player.pause() else player.play()
+        // While the next episode counts down, the one that ended stays ended.
+        if (pendingNext != null) return
+        lastKey = System.currentTimeMillis()
+        if (player.isPlaying) player.pause() else resume()
     }
 
-    BackHandler(enabled = !tracks && controls) { controls = false }
-    BackHandler(enabled = !tracks && !controls) { onExit() }
+    BackHandler(enabled = !tracks && controls && pendingNext == null) { controls = false }
+    BackHandler(enabled = !tracks && !controls && pendingNext == null) { onExit() }
+    // During the countdown, Back leaves the player.
+    BackHandler(enabled = pendingNext != null) { onExit() }
 
     Box(
         Modifier
@@ -625,15 +815,25 @@ private fun VodPlayer(
             .onPreviewKeyEvent { ev ->
                 if (ev.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                 lastKey = System.currentTimeMillis()
-                when (ev.nativeKeyEvent.keyCode) {
+                val code = ev.nativeKeyEvent.keyCode
+                if (pendingNext != null) {
+                    // The countdown's buttons take the arrows and OK. Media keys do nothing, so the
+                    // episode that ended does not start again.
+                    return@onPreviewKeyEvent when (code) {
+                        KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, KeyEvent.KEYCODE_MEDIA_PLAY, KeyEvent.KEYCODE_MEDIA_PAUSE,
+                        KeyEvent.KEYCODE_MEDIA_FAST_FORWARD, KeyEvent.KEYCODE_MEDIA_REWIND -> true
+                        else -> false
+                    }
+                }
+                when (code) {
                     KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> { togglePause(); controls = true; return@onPreviewKeyEvent true }
-                    KeyEvent.KEYCODE_MEDIA_PLAY -> { player.play(); return@onPreviewKeyEvent true }
+                    KeyEvent.KEYCODE_MEDIA_PLAY -> { resume(); return@onPreviewKeyEvent true }
                     KeyEvent.KEYCODE_MEDIA_PAUSE -> { player.pause(); controls = true; return@onPreviewKeyEvent true }
                     KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> { skip(30_000); controls = true; return@onPreviewKeyEvent true }
                     KeyEvent.KEYCODE_MEDIA_REWIND -> { skip(-10_000); controls = true; return@onPreviewKeyEvent true }
                 }
                 if (tracks || controls) return@onPreviewKeyEvent false
-                when (ev.nativeKeyEvent.keyCode) {
+                when (code) {
                     KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> togglePause()
                     KeyEvent.KEYCODE_DPAD_LEFT -> skip(-10_000)
                     KeyEvent.KEYCODE_DPAD_RIGHT -> skip(10_000)
@@ -657,6 +857,20 @@ private fun VodPlayer(
             modifier = Modifier.fillMaxSize()
         )
 
+        // Touch: a tap on the picture shows or hides the controls. Taps on a button go to the button.
+        Box(
+            Modifier
+                .fillMaxSize()
+                .pointerInput(Unit) {
+                    detectTapGestures(onTap = {
+                        if (!tracks && pendingNext == null) {
+                            controls = !controls
+                            lastKey = System.currentTimeMillis()
+                        }
+                    })
+                }
+        )
+
         if (controls && !tracks) {
             Box(Modifier.fillMaxSize().background(Brush.verticalGradient(0f to Color(0xC0000000), 0.26f to Color.Transparent, 0.58f to Color.Transparent, 1f to Color(0xD9000000))))
             Column(Modifier.align(Alignment.TopStart).padding(start = 40.dp, top = 28.dp, end = 40.dp)) {
@@ -675,7 +889,8 @@ private fun VodPlayer(
                     fraction = if (duration > 0) position.toFloat() / duration else 0f,
                     modifier = Modifier.focusRequester(seek),
                     onTogglePause = { togglePause() },
-                    onSkip = { skip(it) }
+                    onSkip = { skip(it) },
+                    onSeekTo = { seekToFraction(it) }
                 )
                 Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp)) {
                     Text(formatPosition(position), style = TvType.Caption, color = Tv.Ink2)
@@ -713,17 +928,24 @@ private fun VodPlayer(
 
         pendingNext?.let { next ->
             Column(
-                Modifier.align(Alignment.Center).clip(RoundedCornerShape(16.dp)).background(Color(0xE6101218)).padding(22.dp),
+                Modifier
+                    .align(Alignment.Center)
+                    .trapFocus()
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(Color(0xE6101218))
+                    .padding(22.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Text("Next: ${next.name}", style = TvType.Title, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Text("Starts in a few seconds", style = TvType.Small, color = Tv.Ink2)
                 Spacer(Modifier.height(12.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    PillButton("Play now", { latestOnNext(next) }, icon = TvIcons.Play)
+                    PillButton("Play now", { latestOnNext(next) }, icon = TvIcons.Play, modifier = Modifier.focusRequester(playNow))
+                    // Cancel stops the countdown only. The player stays, with its controls showing.
                     PillButton("Cancel", {
                         pendingNext = null
-                        latestExit()
+                        controls = true
+                        lastKey = System.currentTimeMillis()
                     })
                 }
             }
@@ -740,10 +962,17 @@ private fun VodPlayer(
     }
 }
 
-/** The playback position. When focused, left and right skip ten seconds and OK pauses. */
+/** The playback position. When focused, left and right skip ten seconds and OK pauses. A tap jumps there. */
 @Composable
-private fun SeekBar(fraction: Float, modifier: Modifier, onTogglePause: () -> Unit, onSkip: (Long) -> Unit) {
+private fun SeekBar(
+    fraction: Float,
+    modifier: Modifier,
+    onTogglePause: () -> Unit,
+    onSkip: (Long) -> Unit,
+    onSeekTo: (Float) -> Unit
+) {
     var focused by remember { mutableStateOf(false) }
+    val latestSeekTo by rememberUpdatedState(onSeekTo)
     Focusable(
         onClick = onTogglePause,
         modifier = modifier
@@ -763,7 +992,15 @@ private fun SeekBar(fraction: Float, modifier: Modifier, onTogglePause: () -> Un
         onFocus = { focused = it },
         contentAlignment = Alignment.CenterStart
     ) {
-        BoxWithConstraints(Modifier.fillMaxWidth().padding(horizontal = 8.dp), contentAlignment = Alignment.CenterStart) {
+        BoxWithConstraints(
+            Modifier
+                .fillMaxSize()
+                .padding(horizontal = 8.dp)
+                .pointerInput(Unit) {
+                    detectTapGestures { offset -> if (size.width > 0) latestSeekTo(offset.x / size.width) }
+                },
+            contentAlignment = Alignment.CenterStart
+        ) {
             val w = maxWidth
             ProgressBar(fraction, Modifier.fillMaxWidth(), color = Tv.Accent, height = if (focused) 6.dp else 4.dp)
             if (focused) {

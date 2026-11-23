@@ -1,11 +1,39 @@
 package com.dallas.cabletv.data
 
-import android.util.Base64
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
+
+/** A string field, or null when the key is missing, JSON null, blank, or the text "null". Android's optString gives "null" for a JSON null. */
+internal fun JSONObject.str(key: String): String? {
+    if (!has(key) || isNull(key)) return null
+    val v = opt(key)?.toString()?.trim() ?: return null
+    return v.takeIf { it.isNotEmpty() && !it.equals("null", ignoreCase = true) }
+}
+
+/**
+ * Panels may send titles as base64. Decodes only when the text looks like base64 and the
+ * bytes are valid UTF-8 text, so a plain title such as "News" is returned unchanged.
+ */
+internal fun decodeMaybeBase64(s: String): String {
+    val t = s.trim()
+    val compact = t.filterNot { it.isWhitespace() }
+    if (compact.length < 4 || compact.length % 4 != 0) return s
+    if (!compact.all { it.isLetterOrDigit() && it.code < 128 || it == '+' || it == '/' || it == '=' }) return s
+    return try {
+        val bytes = java.util.Base64.getDecoder().decode(compact)
+        val text = Charsets.UTF_8.newDecoder()
+            .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+            .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+            .decode(java.nio.ByteBuffer.wrap(bytes))
+            .toString()
+        if (text.any { it.isISOControl() && !it.isWhitespace() }) s else text
+    } catch (e: Exception) {
+        s
+    }
+}
 
 /**
  * Talks to an Xtream Codes style IPTV panel.
@@ -23,15 +51,14 @@ class XtreamClient(server: String, user: String, pass: String) {
         .build()
 
     private val probeHttp = http.newBuilder()
-        .connectTimeout(8, TimeUnit.SECONDS)
-        .readTimeout(8, TimeUnit.SECONDS)
+        .connectTimeout(4, TimeUnit.SECONDS)
+        .readTimeout(4, TimeUnit.SECONDS)
         .build()
 
     private val portalLock = Any()
     private var portalCache: PortalInfo? = null
     private var catchupVariant: CatchupVariant? = null
-    private var catchupMissKey: String? = null
-    private var catchupMissAt: Long = 0L
+    private val catchupMisses = HashMap<String, Long>()
 
     private fun creds(): String = "username=${enc(user)}&password=${enc(pass)}"
 
@@ -68,23 +95,23 @@ class XtreamClient(server: String, user: String, pass: String) {
         val cats = JSONArray(api("get_live_categories"))
         for (i in 0 until cats.length()) {
             val c = cats.getJSONObject(i)
-            categories[c.optString("category_id")] = c.optString("category_name")
+            categories[c.str("category_id") ?: ""] = c.str("category_name") ?: ""
         }
 
         val arr = JSONArray(api("get_live_streams"))
         return (0 until arr.length()).map { i ->
             val o = arr.getJSONObject(i)
-            val id = o.optString("stream_id")
+            val id = o.str("stream_id") ?: ""
             val (primary, fallback) = liveStreamUrls(base, user, pass, id, info.formats)
             val (catchup, days) = catchupOffered(jsonValue(o, "tv_archive"), jsonValue(o, "tv_archive_duration"))
             LiveChannel(
                 id = id,
                 number = o.optInt("num", i + 1),
-                name = o.optString("name"),
-                logo = o.optString("stream_icon").takeIf { it.isNotBlank() },
-                group = categories[o.optString("category_id")] ?: "Other",
+                name = o.str("name") ?: "",
+                logo = o.str("stream_icon"),
+                group = categories[o.str("category_id") ?: ""] ?: "Other",
                 streamUrl = primary,
-                epgId = o.optString("epg_channel_id").takeIf { it.isNotBlank() },
+                epgId = o.str("epg_channel_id"),
                 catchup = catchup,
                 archiveDays = days,
                 fallbackStreamUrl = fallback
@@ -98,22 +125,22 @@ class XtreamClient(server: String, user: String, pass: String) {
         val arr = JSONArray(api("get_vod_streams"))
         return (0 until arr.length()).map { i ->
             val o = arr.getJSONObject(i)
-            val id = o.optString("stream_id")
+            val id = o.str("stream_id") ?: ""
             VodItem(
                 id = id,
-                name = o.optString("name"),
+                name = o.str("name") ?: "",
                 year = null,
                 overview = null,
-                posterUrl = o.optString("stream_icon"),
+                posterUrl = o.str("stream_icon") ?: "",
                 streamUrl = contentStreamUrl(
                     base, user, pass, "movie", id,
-                    o.optString("container_extension"),
-                    o.optString("direct_source")
+                    o.str("container_extension"),
+                    o.str("direct_source")
                 ),
                 type = "Movie",
                 source = "xtream",
                 addedAt = recentlyAddedEpochSeconds(jsonLong(o, "added"), jsonLong(o, "last_modified"), series = false),
-                category = categories[o.optString("category_id")] ?: "Movies"
+                category = categories[o.str("category_id") ?: ""] ?: "Movies"
             )
         }.sortedByDescending { it.addedAt }.take(limit)
     }
@@ -125,15 +152,15 @@ class XtreamClient(server: String, user: String, pass: String) {
         val movieData = json.optJSONObject("movie_data")
         VodItem(
             id = streamId,
-            name = info.optString("name"),
-            year = info.optString("releasedate").take(4).toIntOrNull() ?: info.optString("year").toIntOrNull(),
-            overview = info.optString("plot").takeIf { it.isNotBlank() } ?: info.optString("description").takeIf { it.isNotBlank() },
-            posterUrl = info.optString("movie_image"),
+            name = info.str("name") ?: "",
+            year = info.str("releasedate")?.take(4)?.toIntOrNull() ?: info.str("year")?.toIntOrNull(),
+            overview = info.str("plot") ?: info.str("description"),
+            posterUrl = info.str("movie_image") ?: "",
             streamUrl = "",
             type = "Movie",
             source = "xtream",
-            backdropUrl = info.optString("backdrop_path").takeIf { it.startsWith("http") }
-                ?: movieData?.optString("stream_icon")?.takeIf { it.startsWith("http") },
+            backdropUrl = info.str("backdrop_path")?.takeIf { it.startsWith("http") }
+                ?: movieData?.str("stream_icon")?.takeIf { it.startsWith("http") },
             runtimeMinutes = info.optInt("duration_secs", 0).takeIf { it > 0 }?.div(60)
         )
     } catch (e: Exception) {
@@ -147,16 +174,16 @@ class XtreamClient(server: String, user: String, pass: String) {
         return (0 until arr.length()).map { i ->
             val o = arr.getJSONObject(i)
             VodItem(
-                id = o.optString("series_id"),
-                name = o.optString("name"),
-                year = o.optString("releaseDate").take(4).toIntOrNull(),
-                overview = o.optString("plot").takeIf { it.isNotBlank() },
-                posterUrl = o.optString("cover"),
+                id = o.str("series_id") ?: "",
+                name = o.str("name") ?: "",
+                year = o.str("releaseDate")?.take(4)?.toIntOrNull(),
+                overview = o.str("plot"),
+                posterUrl = o.str("cover") ?: "",
                 streamUrl = "",
                 type = "Series",
                 source = "xtream",
                 addedAt = recentlyAddedEpochSeconds(jsonLong(o, "added"), jsonLong(o, "last_modified"), series = true),
-                category = categories[o.optString("category_id")] ?: "Shows"
+                category = categories[o.str("category_id") ?: ""] ?: "Shows"
             )
         }.sortedByDescending { it.addedAt }.take(limit)
     }
@@ -166,7 +193,7 @@ class XtreamClient(server: String, user: String, pass: String) {
         buildMap {
             for (i in 0 until arr.length()) {
                 val o = arr.getJSONObject(i)
-                put(o.optString("category_id"), o.optString("category_name"))
+                put(o.str("category_id") ?: "", o.str("category_name") ?: "")
             }
         }
     } catch (e: Exception) {
@@ -176,40 +203,62 @@ class XtreamClient(server: String, user: String, pass: String) {
     /** Episodes of one series, in season and episode order. */
     fun seriesEpisodes(seriesId: String): List<VodItem> {
         val info = JSONObject(api("get_series_info", "series_id=$seriesId"))
-        val bySeason = info.optJSONObject("episodes") ?: return emptyList()
-        val showName = info.optJSONObject("info")?.optString("name")?.takeIf { it.isNotBlank() }
+        val raw = info.opt("episodes")
+        val showName = info.optJSONObject("info")?.str("name")
         val keyed = mutableListOf<Triple<Int, Int, VodItem>>()
-        val seasons = bySeason.keys()
-        while (seasons.hasNext()) {
-            val seasonKey = seasons.next()
-            val list = bySeason.optJSONArray(seasonKey) ?: continue
-            val season = seasonKey.toIntOrNull() ?: 0
+
+        fun add(e: JSONObject, season: Int) {
+            val id = e.str("id") ?: return
+            val number = e.optInt("episode_num", 0)
+            val epInfo = e.optJSONObject("info")
+            val item = VodItem(
+                id = id,
+                name = e.str("title") ?: "Episode $number",
+                year = null,
+                overview = epInfo?.str("plot"),
+                posterUrl = epInfo?.str("movie_image") ?: "",
+                streamUrl = contentStreamUrl(
+                    base, user, pass, "series", id,
+                    e.str("container_extension"),
+                    e.str("direct_source")
+                ),
+                type = "Episode",
+                source = "xtream",
+                season = season,
+                episode = number,
+                seriesName = showName,
+                runtimeMinutes = epInfo?.optInt("duration_secs", 0)?.takeIf { it > 0 }?.let { it / 60 },
+                seriesId = seriesId
+            )
+            keyed += Triple(season, number, item)
+        }
+
+        fun addList(list: JSONArray, season: Int?, fallback: Int = 0) {
             for (i in 0 until list.length()) {
-                val e = list.getJSONObject(i)
-                val id = e.optString("id")
-                val number = e.optInt("episode_num", 0)
-                val title = e.optString("title")
-                val epInfo = e.optJSONObject("info")
-                val item = VodItem(
-                    id = id,
-                    name = title.ifBlank { "Episode $number" },
-                    year = null,
-                    overview = epInfo?.optString("plot")?.takeIf { it.isNotBlank() },
-                    posterUrl = epInfo?.optString("movie_image").orEmpty(),
-                    streamUrl = contentStreamUrl(
-                        base, user, pass, "series", id,
-                        e.optString("container_extension"),
-                        e.optString("direct_source")
-                    ),
-                    type = "Episode",
-                    source = "xtream",
-                    season = season,
-                    episode = number,
-                    seriesName = showName,
-                    runtimeMinutes = epInfo?.optInt("duration_secs", 0)?.takeIf { it > 0 }?.let { it / 60 }
-                )
-                keyed += Triple(season, number, item)
+                val e = list.optJSONObject(i) ?: continue
+                add(e, season ?: e.optInt("season", fallback))
             }
+        }
+
+        when (raw) {
+            is JSONObject -> {
+                val seasons = raw.keys()
+                while (seasons.hasNext()) {
+                    val seasonKey = seasons.next()
+                    val list = raw.optJSONArray(seasonKey) ?: continue
+                    addList(list, seasonKey.toIntOrNull())
+                }
+            }
+            is JSONArray -> {
+                for (i in 0 until raw.length()) {
+                    when (val item = raw.opt(i)) {
+                        // An array of season arrays: the position is the season number minus one.
+                        is JSONArray -> addList(item, null, i + 1)
+                        is JSONObject -> add(item, item.optInt("season", 0))
+                    }
+                }
+            }
+            else -> return emptyList()
         }
         return keyed
             .sortedWith(compareBy<Triple<Int, Int, VodItem>>({ it.first }, { it.second }))
@@ -219,14 +268,14 @@ class XtreamClient(server: String, user: String, pass: String) {
     /**
      * Replay address for a programme that already aired.
      * The working catch-up shape is probed once and remembered. A miss is remembered
-     * for a minute for that programme, then the plain timeshift address is used.
+     * for five minutes for that channel, then the plain timeshift address is used.
      */
     fun resolveTimeshiftUrl(streamId: String, startMs: Long, stopMs: Long): String {
         val info = portalForStreams()
         synchronized(portalLock) {
             catchupVariant?.let { return buildCatchup(it, info.timezone, streamId, startMs, stopMs) }
-            val key = "$streamId@$startMs"
-            if (catchupMissKey == key && System.currentTimeMillis() - catchupMissAt < 60_000L) {
+            val missAt = catchupMisses[streamId]
+            if (missAt != null && System.currentTimeMillis() - missAt < 300_000L) {
                 return buildCatchup(CatchupVariant.REST_TS, info.timezone, streamId, startMs, stopMs)
             }
         }
@@ -239,8 +288,7 @@ class XtreamClient(server: String, user: String, pass: String) {
             if (chosen != null) {
                 catchupVariant = chosen
             } else {
-                catchupMissKey = "$streamId@$startMs"
-                catchupMissAt = System.currentTimeMillis()
+                catchupMisses[streamId] = System.currentTimeMillis()
             }
         }
         return buildCatchup(chosen ?: CatchupVariant.REST_TS, info.timezone, streamId, startMs, stopMs)
@@ -253,10 +301,10 @@ class XtreamClient(server: String, user: String, pass: String) {
         val programs = (0 until listings.length()).map { i ->
             val o = listings.getJSONObject(i)
             Program(
-                title = decodeB64(o.optString("title")),
+                title = decodeB64(o.str("title") ?: ""),
                 start = o.optLong("start_timestamp") * 1000L,
                 end = o.optLong("stop_timestamp") * 1000L,
-                desc = decodeB64(o.optString("description")).trim()
+                desc = decodeB64(o.str("description") ?: "").trim()
             )
         }
 
@@ -296,7 +344,8 @@ class XtreamClient(server: String, user: String, pass: String) {
                 }
             }
         }
-        val info = readPortal() ?: PortalInfo(PortalStatus.ACTIVE, emptyList(), null)
+        // When the panel did not answer, use a guess for this call only and ask again next time.
+        val info = readPortal() ?: return PortalInfo(PortalStatus.ACTIVE, emptyList(), null)
         when (info.status) {
             PortalStatus.EXPIRED -> error("Provider subscription has expired")
             PortalStatus.INACTIVE -> error("Live TV login was rejected")
@@ -330,7 +379,7 @@ class XtreamClient(server: String, user: String, pass: String) {
         val json = JSONObject(api(action))
         val userInfo = json.optJSONObject("user_info")
         val status = userInfo?.let {
-            resolvePortalStatus(jsonValue(it, "auth"), it.optString("status"), jsonValue(it, "exp_date"))
+            resolvePortalStatus(jsonValue(it, "auth"), it.str("status"), jsonValue(it, "exp_date"))
         }
         if (userInfo == null || status == null || status == PortalStatus.UNAVAILABLE) {
             null
@@ -340,8 +389,8 @@ class XtreamClient(server: String, user: String, pass: String) {
                 status = status,
                 formats = formatsOf(userInfo),
                 timezone = resolveServerTimezone(
-                    server?.optString("timezone"),
-                    server?.optString("time_now"),
+                    server?.str("timezone"),
+                    server?.str("time_now"),
                     server?.let { jsonValue(it, "timestamp_now") }
                 ),
                 expiresAt = expirationEpochMillis(jsonValue(userInfo, "exp_date")) ?: 0L
@@ -370,7 +419,9 @@ class XtreamClient(server: String, user: String, pass: String) {
     private fun formatsOf(userInfo: JSONObject): List<String> {
         val raw = jsonValue(userInfo, "allowed_output_formats")
         return when (raw) {
-            is JSONArray -> (0 until raw.length()).mapNotNull { raw.optString(it).trim().takeIf { s -> s.isNotEmpty() } }
+            is JSONArray -> (0 until raw.length()).mapNotNull { idx ->
+                if (raw.isNull(idx)) null else raw.optString(idx).trim().takeIf { s -> s.isNotEmpty() && !s.equals("null", true) }
+            }
             is String -> raw.split(',').map { it.trim() }.filter { it.isNotEmpty() }
             else -> emptyList()
         }
@@ -389,11 +440,7 @@ class XtreamClient(server: String, user: String, pass: String) {
 
     private fun enc(value: String): String = java.net.URLEncoder.encode(value, "UTF-8").replace("+", "%20")
 
-    private fun decodeB64(s: String): String = try {
-        String(Base64.decode(s, Base64.DEFAULT), Charsets.UTF_8)
-    } catch (e: IllegalArgumentException) {
-        s
-    }
+    private fun decodeB64(s: String): String = decodeMaybeBase64(s)
 
     /** When the subscription ends, or 0 when the panel did not say. */
     fun subscriptionExpiryMs(): Long = readPortal()?.expiresAt ?: 0L

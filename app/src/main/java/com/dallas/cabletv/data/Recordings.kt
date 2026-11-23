@@ -32,53 +32,79 @@ class RecordingStore(private val root: File) {
 
     fun directory(): File = dir
 
-    fun list(): List<Recording> {
-        if (!index.exists()) return emptyList()
-        val arr = JSONArray(index.readText())
-        return (0 until arr.length()).mapNotNull { i ->
-            val o = arr.optJSONObject(i) ?: return@mapNotNull null
+    fun list(): List<Recording> = synchronized(LOCK) {
+        readRows(index).mapNotNull { o ->
             Recording(o.optString("id"), o.optString("title"), o.optString("channel"), o.optString("file"), o.optLong("started"), o.optLong("ended"))
         }.sortedByDescending { it.started }
     }
 
-    fun add(recording: Recording) {
+    fun add(recording: Recording) = synchronized(LOCK) {
         val all = list().filter { it.id != recording.id } + recording
         write(index, all.map { it.toJson() })
     }
 
-    fun delete(id: String) {
-        val item = list().firstOrNull { it.id == id } ?: return
+    fun delete(id: String) = synchronized(LOCK) {
+        val all = list()
+        val item = all.firstOrNull { it.id == id } ?: return@synchronized
         File(dir, item.fileName).delete()
-        write(index, list().filter { it.id != id }.map { it.toJson() })
+        write(index, all.filter { it.id != id }.map { it.toJson() })
     }
 
     fun file(recording: Recording): File = File(dir, recording.fileName)
 
-    fun schedule(): List<ScheduledRecording> {
-        if (!scheduleFile.exists()) return emptyList()
-        val arr = JSONArray(scheduleFile.readText())
-        return (0 until arr.length()).mapNotNull { i ->
-            val o = arr.optJSONObject(i) ?: return@mapNotNull null
+    /** Scheduled recordings that have not ended yet. */
+    fun schedule(nowMs: Long = System.currentTimeMillis()): List<ScheduledRecording> = synchronized(LOCK) {
+        readRows(scheduleFile).map { o ->
             ScheduledRecording(
                 o.optString("id"), o.optString("channelId"), o.optString("channel"),
                 o.optString("title"), o.optString("url"), o.optLong("start"), o.optLong("end")
             )
-        }
+        }.filter { it.end >= nowMs }
     }
 
-    fun addSchedule(item: ScheduledRecording) {
+    fun addSchedule(item: ScheduledRecording) = synchronized(LOCK) {
         val all = schedule().filter { it.id != item.id } + item
         write(scheduleFile, all.map { it.toJson() })
     }
 
-    fun removeSchedule(id: String) {
+    fun removeSchedule(id: String) = synchronized(LOCK) {
         write(scheduleFile, schedule().filter { it.id != id }.map { it.toJson() })
     }
 
+    /** Deletes .ts files that no index entry points to, except [activeFile]. Left behind by a crash. */
+    fun deleteOrphans(activeFile: String?) = synchronized(LOCK) {
+        val known = list().map { it.fileName }.toSet()
+        dir.listFiles()?.forEach { f ->
+            if (f.isFile && f.name.endsWith(".ts") && f.name !in known && f.name != activeFile) f.delete()
+        }
+    }
+
+    /** Reads a JSON list of objects. A file that cannot be parsed is renamed to .bad and read as empty. */
+    private fun readRows(file: File): List<JSONObject> {
+        if (!file.exists()) return emptyList()
+        return try {
+            val arr = JSONArray(file.readText())
+            (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }
+        } catch (e: Exception) {
+            runCatching {
+                val bad = File(file.parentFile, file.name + ".bad")
+                bad.delete()
+                file.renameTo(bad)
+            }
+            emptyList()
+        }
+    }
+
+    /** Writes to a temp file first, then renames it over the real one. */
     private fun write(file: File, rows: List<JSONObject>) {
         val arr = JSONArray()
         rows.forEach { arr.put(it) }
-        file.writeText(arr.toString())
+        val tmp = File(file.parentFile, file.name + ".tmp")
+        tmp.writeText(arr.toString())
+        if (!tmp.renameTo(file)) {
+            file.delete()
+            tmp.renameTo(file)
+        }
     }
 
     private fun Recording.toJson() = JSONObject()
@@ -88,6 +114,11 @@ class RecordingStore(private val root: File) {
     private fun ScheduledRecording.toJson() = JSONObject()
         .put("id", id).put("channelId", channelId).put("channel", channelName)
         .put("title", title).put("url", url).put("start", start).put("end", end)
+
+    private companion object {
+        /** One lock for every store, because the worker thread and the UI thread both write. */
+        val LOCK = Any()
+    }
 }
 
 /** A scheduled showing that should be recording at [nowMs] and is not already done. */

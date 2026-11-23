@@ -42,6 +42,7 @@ import com.dallas.cabletv.data.LiveChannel
 import com.dallas.cabletv.data.Program
 import com.dallas.cabletv.data.guideSelection
 import kotlinx.coroutines.delay
+import java.util.TimeZone
 
 private const val SLOT = 30 * 60_000L
 private const val HOUR = 60 * 60_000L
@@ -57,6 +58,9 @@ private data class GuideFocus(val row: Int, val start: Long?)
 /** Stands in for a channel with no guide data, so every row still has one cell to land on. */
 private val NO_INFO = Program("No guide information", 0L, Long.MAX_VALUE / 4)
 
+/** The menu OK opens on a programme: a reminder or recording for a later show, or live or from the start for the show on now. */
+private data class ProgramChoice(val channel: LiveChannel, val program: Program, val onNow: Boolean)
+
 private fun groupOf(ch: LiveChannel) = ch.group.ifBlank { "Other" }
 
 private fun rowsFor(group: String, channels: List<LiveChannel>, favorites: Set<String>, recents: List<String>): List<LiveChannel> =
@@ -66,6 +70,10 @@ private fun rowsFor(group: String, channels: List<LiveChannel>, favorites: Set<S
         GROUP_RECENT -> recents.mapNotNull { id -> channels.firstOrNull { it.id == id } }
         else -> channels.filter { groupOf(it) == group }
     }
+
+/** The channel with this number. When two share it, the one in the category on screen wins. */
+private fun channelForNumber(typed: String, channels: List<LiveChannel>, rows: List<LiveChannel>): LiveChannel? =
+    rows.firstOrNull { it.number.toString() == typed } ?: channels.firstOrNull { it.number.toString() == typed }
 
 /**
  * The program guide: channels down the side, half hours across the top, and a line for now.
@@ -96,23 +104,27 @@ fun GuideScreen(
 ) {
     val groups = remember(channels) { groupsOf(channels) }
     LaunchedEffect(groups) {
+        // While channels are still loading there are no groups yet, so a category the viewer picked is kept.
+        if (channels.isEmpty()) return@LaunchedEffect
         if (group != GROUP_ALL && group != GROUP_FAVORITES && group != GROUP_RECENT && group !in groups) onGroupChange(GROUP_ALL)
     }
     val rows = remember(channels, group, favorites, recents) { rowsFor(group, channels, favorites, recents) }
     @Suppress("UNUSED_VARIABLE") val epgVersion = guide.version
     // Entries that end before they start turn up in real feeds. They are skipped so cells never get a negative width.
     fun programsOf(ch: LiveChannel): List<Program> = guide.schedule(ch).filter { it.end > it.start }.ifEmpty { listOf(NO_INFO) }
+    fun cellsOf(ch: LiveChannel): List<GuideCell> = guideCells(programsOf(ch))
 
     val now = rememberNow(30_000L)
-    val firstWindow = now / SLOT * SLOT
+    // Half hours on the local clock, so a zone 45 minutes off the hour still reads :00 and :30.
+    val firstWindow = localSlotStart(now, TimeZone.getDefault().getOffset(now).toLong())
     val earliest = firstWindow - EpgCache.BEHIND_MS
     val lastWindow = firstWindow + EpgCache.AHEAD_MS
     var windowStart by remember { mutableLongStateOf(firstWindow) }
     var anchor by remember { mutableLongStateOf(now) }
 
     fun cellAt(ch: LiveChannel, t: Long, winEnd: Long): Long? {
-        val list = programsOf(ch)
-        return (list.firstOrNull { t >= it.start && t < it.end } ?: list.firstOrNull { it.start in t until winEnd })?.start
+        val cells = cellsOf(ch)
+        return cells.getOrNull(cellIndexAt(cells, t, windowStart, winEnd))?.start
     }
 
     val startRow = remember(rows) { rows.indexOfFirst { it.id == currentId }.coerceAtLeast(0) }
@@ -123,7 +135,7 @@ fun GuideScreen(
     var focusTick by remember { mutableIntStateOf(1) }
     var showCategories by remember { mutableStateOf(false) }
     var menuFor by remember { mutableStateOf<LiveChannel?>(null) }
-    var programMenu by remember { mutableStateOf<Pair<LiveChannel, Program>?>(null) }
+    var programMenu by remember { mutableStateOf<ProgramChoice?>(null) }
     var digits by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
     val target = remember { FocusRequester() }
@@ -135,6 +147,9 @@ fun GuideScreen(
     var restoreTick by remember { mutableIntStateOf(0) }
     val categoryButton = remember { FocusRequester() }
     val refreshButton = remember { FocusRequester() }
+    // True while focus waits on the category button because there were no rows to highlight.
+    var parkedOnCategory by remember { mutableStateOf(false) }
+    var hadRows by remember { mutableStateOf(rows.isNotEmpty()) }
 
     BackHandler(enabled = showCategories) {
         showCategories = false
@@ -147,7 +162,18 @@ fun GuideScreen(
 
     // Moves real focus to the highlighted cell, scrolling its row into view first.
     LaunchedEffect(focusTick) {
-        if (rows.isEmpty()) return@LaunchedEffect
+        if (rows.isEmpty()) {
+            // Nothing to highlight, so focus waits on the category button instead of being lost.
+            if (showCategories || menuFor != null || programMenu != null) return@LaunchedEffect
+            repeat(3) {
+                withFrameNanos { }
+                if (runCatching { categoryButton.requestFocus() }.isSuccess) {
+                    parkedOnCategory = true
+                    return@LaunchedEffect
+                }
+            }
+            return@LaunchedEffect
+        }
         val info = listState.layoutInfo
         val visible = info.visibleItemsInfo
         if (visible.isNotEmpty()) {
@@ -167,11 +193,31 @@ fun GuideScreen(
         }
     }
 
+    // Channels can arrive after the guide opens, or a category can run out of channels.
+    LaunchedEffect(rows.isEmpty()) {
+        if (rows.isEmpty()) {
+            hadRows = false
+            if (gridOwnsFocus) focusTick++
+            return@LaunchedEffect
+        }
+        if (hadRows) return@LaunchedEffect
+        hadRows = true
+        // The first rows to arrive put the highlight on the channel playing.
+        val r = rows.indexOfFirst { it.id == currentId }.coerceAtLeast(0)
+        val t = System.currentTimeMillis()
+        anchor = maxOf(t, windowStart)
+        focus = GuideFocus(r, cellAt(rows[r], anchor, anchor + 2 * HOUR))
+        if (gridOwnsFocus || parkedOnCategory) {
+            parkedOnCategory = false
+            focusTick++
+        }
+    }
+
     LaunchedEffect(digits) {
         if (digits.isEmpty()) return@LaunchedEffect
         delay(1400)
         val typed = digits
-        val ch = channels.firstOrNull { it.number.toString() == typed }
+        val ch = channelForNumber(typed, channels, rows)
         digits = ""
         if (ch == null) {
             showToast("There is no channel $typed")
@@ -188,13 +234,21 @@ fun GuideScreen(
         focusTick++
     }
 
+    // Number keys work anywhere on the screen, the category and refresh buttons included.
+    val numberKeys = Modifier.onPreviewKeyEvent { ev ->
+        if (ev.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+        val d = digitOf(ev.nativeKeyEvent.keyCode) ?: return@onPreviewKeyEvent false
+        if (digits.length < 4) digits += d.toString()
+        true
+    }
+
     BoxWithConstraints(Modifier.fillMaxSize()) {
     val outerNarrow = maxWidth < 600.dp
     TabScaffold(
         Tab.Guide,
         nav,
-        modifier = Modifier.background(Tv.Bg),
-        backEnabled = !showCategories && menuFor == null,
+        modifier = Modifier.background(Tv.Bg).then(numberKeys),
+        backEnabled = !showCategories && menuFor == null && programMenu == null,
         onNavFocus = { if (it) gridOwnsFocus = false }
     ) { narrow ->
         BoxWithConstraints(Modifier.fillMaxSize().padding(top = 52.dp)) {
@@ -217,7 +271,7 @@ fun GuideScreen(
                 val s = focus.start
                 when {
                     ch == null || s == null -> focus
-                    programsOf(ch).any { it.start == s && it.end > windowStart && it.start < windowEnd } -> focus
+                    cellsOf(ch).any { it.start == s && it.end > windowStart && it.start < windowEnd } -> focus
                     else -> GuideFocus(focus.row, cellAt(ch, maxOf(anchor, windowStart), windowEnd))
                 }
             }
@@ -228,7 +282,7 @@ fun GuideScreen(
                 }
             }
             LaunchedEffect(restoreTick) {
-                if (restoreTick > 0 && gridOwnsFocus && !showCategories && menuFor == null) {
+                if (restoreTick > 0 && gridOwnsFocus && !showCategories && menuFor == null && programMenu == null) {
                     repeat(3) {
                         withFrameNanos { }
                         if (runCatching { target.requestFocus() }.isSuccess) return@LaunchedEffect
@@ -237,6 +291,7 @@ fun GuideScreen(
             }
 
             // Works out the new highlight. handleKey below then moves real focus to it.
+            // Right and Left follow the row's programmes in order, so every one can be reached.
             fun moveIn(code: Int): Boolean {
                 val ch = rows.getOrNull(focus.row) ?: return false
                 val f = focus
@@ -272,21 +327,20 @@ fun GuideScreen(
                             anchor = t
                             focus = GuideFocus(f.row, cellAt(ch, t, windowEnd) ?: return true)
                         } else {
-                            val list = programsOf(ch)
-                            val p = list.firstOrNull { it.start == f.start } ?: return true
-                            if (p.end > windowEnd) {
-                                // A long show runs past the edge, so the grid moves on half an hour.
-                                if (windowStart < lastWindow) {
-                                    windowStart += SLOT
-                                    anchor = maxOf(p.start, windowStart)
-                                }
+                            val cells = cellsOf(ch)
+                            val i = cells.indexOfFirst { it.start == f.start }
+                            // "No guide information" has nothing after it.
+                            if (i < 0 || cells[i].program === NO_INFO) return true
+                            val next = stepRight(cells, i, windowStart, slots * SLOT, lastWindow)
+                            if (next == null) {
+                                // The last show runs past the edge: move the grid on so the rest of it comes into view.
+                                if (cells[i].end > windowStart + slots * SLOT && windowStart < lastWindow) windowStart += SLOT
                                 return true
                             }
-                            val next = list.firstOrNull { it.start >= p.end } ?: return true
-                            if (next.start >= lastWindow + slots * SLOT) return true
-                            while (next.start >= windowStart + slots * SLOT) windowStart += SLOT
-                            anchor = next.start
-                            focus = GuideFocus(f.row, next.start)
+                            val nextStart = next.start ?: return true
+                            windowStart = next.windowStart
+                            anchor = nextStart
+                            focus = GuideFocus(f.row, nextStart)
                         }
                     }
                     KeyEvent.KEYCODE_DPAD_LEFT -> {
@@ -295,23 +349,16 @@ fun GuideScreen(
                             showCategories = true
                             return true
                         }
-                        val list = programsOf(ch)
-                        val p = list.firstOrNull { it.start == f.start } ?: return true
-                        if (p.start <= windowStart) {
-                            if (windowStart > earliest) {
-                                windowStart -= SLOT
-                                anchor = maxOf(p.start, windowStart)
-                            } else {
-                                focus = GuideFocus(f.row, null)
-                            }
-                            return true
-                        }
-                        val prev = list.lastOrNull { it.end <= p.start }
-                        if (prev == null || prev.end <= windowStart) {
+                        val cells = cellsOf(ch)
+                        val i = cells.indexOfFirst { it.start == f.start }
+                        // "No guide information" goes straight to the channel name.
+                        if (i < 0 || cells[i].program === NO_INFO) {
                             focus = GuideFocus(f.row, null)
                             return true
                         }
-                        anchor = maxOf(prev.start, windowStart)
+                        val prev = stepLeft(cells, i, windowStart, earliest)
+                        windowStart = prev.windowStart
+                        prev.start?.let { anchor = maxOf(it, windowStart) }
                         focus = GuideFocus(f.row, prev.start)
                     }
                     else -> return false
@@ -390,7 +437,7 @@ fun GuideScreen(
                             gridOwnsFocus = false
                             showCategories = true
                         },
-                        onFocus = { if (it) gridOwnsFocus = false },
+                        onFocus = { if (it) gridOwnsFocus = false else parkedOnCategory = false },
                         modifier = Modifier
                             .width(chanW)
                             .height(28.dp)
@@ -465,7 +512,7 @@ fun GuideScreen(
                         rows.isEmpty() -> EmptyState(
                             title = if (group == GROUP_FAVORITES) "No favorites yet" else "Nothing here yet",
                             body = if (group == GROUP_FAVORITES) {
-                                "Press OK on a channel name to add it, or use Add to favorites while watching."
+                                "Pick All channels, press OK on a channel name, then choose Add to favorites."
                             } else {
                                 "Channels you watch show up here."
                             },
@@ -478,18 +525,13 @@ fun GuideScreen(
                                 .padding(horizontal = side)
                                 .onPreviewKeyEvent { ev ->
                                     if (ev.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
-                                    val code = ev.nativeKeyEvent.keyCode
-                                    if (code in KeyEvent.KEYCODE_0..KeyEvent.KEYCODE_9) {
-                                        if (digits.length < 4) digits += (code - KeyEvent.KEYCODE_0).toString()
-                                        return@onPreviewKeyEvent true
-                                    }
-                                    handleKey(code)
+                                    handleKey(ev.nativeKeyEvent.keyCode)
                                 }
                         ) {
                             itemsIndexed(rows, key = { _, c -> c.id }) { i, ch ->
                                 GuideRow(
                                     ch = ch,
-                                    programs = programsOf(ch),
+                                    cells = cellsOf(ch),
                                     rowIndex = i,
                                     focus = shown,
                                     target = target,
@@ -509,10 +551,11 @@ fun GuideScreen(
                                     },
                                     onProgram = { p ->
                                         focus = GuideFocus(i, p.start)
-                                        when (guideSelection(p.start, p.end, now, p === NO_INFO, ch.catchup)) {
+                                        when (guideSelection(p.start, p.end, System.currentTimeMillis(), p === NO_INFO, ch.catchup)) {
                                             GuideSelection.WatchLive -> onWatch(ch)
+                                            GuideSelection.LiveOrStart -> programMenu = ProgramChoice(ch, p, onNow = true)
                                             GuideSelection.Replay -> onReplay(ch, p)
-                                            GuideSelection.Later -> programMenu = ch to p
+                                            GuideSelection.Later -> programMenu = ProgramChoice(ch, p, onNow = false)
                                             GuideSelection.Unavailable -> showToast("${p.title} is not available to replay")
                                         }
                                     },
@@ -529,7 +572,7 @@ fun GuideScreen(
             }
 
             if (digits.isNotEmpty()) {
-                val match = channels.firstOrNull { it.number.toString() == digits }
+                val match = channelForNumber(digits, channels, rows)
                 Column(
                     Modifier.align(Alignment.TopEnd).padding(end = side, top = 8.dp)
                         .clip(RoundedCornerShape(12.dp)).background(Tv.Surface3).padding(horizontal = 16.dp, vertical = 8.dp),
@@ -559,6 +602,8 @@ fun GuideScreen(
                     onGroupChange(g)
                     showCategories = false
                     val list = rowsFor(g, channels, favorites, recents)
+                    // The picked category puts the highlight on its first row, so the "rows arrived" step leaves it there.
+                    hadRows = list.isNotEmpty()
                     anchor = maxOf(now, windowStart)
                     focus = GuideFocus(0, list.firstOrNull()?.let { cellAt(it, anchor, windowEnd(windowStart, outerNarrow)) })
                     focusTick++
@@ -570,19 +615,41 @@ fun GuideScreen(
             )
         }
 
-        programMenu?.let { (ch, program) ->
+        programMenu?.let { choice ->
+            val ch = choice.channel
+            val program = choice.program
+            fun close() {
+                programMenu = null
+                focusTick++
+            }
+            val actions: List<Pair<String, () -> Unit>> = if (choice.onNow) {
+                listOf(
+                    "Watch now" to {
+                        programMenu = null
+                        onWatch(ch)
+                    },
+                    "Watch from the start" to {
+                        programMenu = null
+                        onReplay(ch, program)
+                    }
+                )
+            } else {
+                listOf(
+                    "Remind me" to {
+                        onRemind(ch, program)
+                        close()
+                    },
+                    "Record" to {
+                        onRecord(ch, program)
+                        close()
+                    }
+                )
+            }
             ProgrammeMenu(
                 channel = ch,
                 program = program,
-                onRemind = {
-                    onRemind(ch, program)
-                    programMenu = null
-                },
-                onRecord = {
-                    onRecord(ch, program)
-                    programMenu = null
-                },
-                onClose = { programMenu = null },
+                actions = actions,
+                onClose = { close() },
                 modifier = Modifier.align(Alignment.Center)
             )
         }
@@ -642,7 +709,7 @@ private fun GuideDetails(ch: LiveChannel, p: Program?, now: Long, narrow: Boolea
 @Composable
 private fun GuideRow(
     ch: LiveChannel,
-    programs: List<Program>,
+    cells: List<GuideCell>,
     rowIndex: Int,
     focus: GuideFocus,
     target: FocusRequester,
@@ -701,7 +768,7 @@ private fun GuideRow(
             // Cells are keyed by their place in the row, not by show. When listings arrive and replace
             // "No guide information", or the grid moves on, the focused cell stays and shows the new
             // programme instead of disappearing from under the remote.
-            val visible = programs.filter { it.end > windowStart && it.start < windowEnd }
+            val visible = cells.filter { it.end > windowStart && it.start < windowEnd }
             if (visible.isEmpty()) {
                 Text(
                     "No guide information",
@@ -712,11 +779,13 @@ private fun GuideRow(
                     modifier = Modifier.align(Alignment.CenterStart).padding(horizontal = 12.dp)
                 )
             }
-            visible.forEachIndexed { place, p ->
+            visible.forEachIndexed { place, cell ->
                 run {
                     key(place) {
-                        val left = slotW * ((maxOf(p.start, windowStart) - windowStart).toFloat() / SLOT)
-                        val right = slotW * ((minOf(p.end, windowEnd) - windowStart).toFloat() / SLOT)
+                        val p = cell.program
+                        // A cell ends where the next programme starts, so overlapping listings sit side by side.
+                        val left = slotW * ((maxOf(cell.start, windowStart) - windowStart).toFloat() / SLOT)
+                        val right = slotW * ((minOf(cell.end, windowEnd) - windowStart).toFloat() / SLOT)
                         val isTarget = focus.row == rowIndex && focus.start == p.start
                         if (isTarget) HoldsTarget(targetHolders)
                         val wide = right - left > 46.dp
@@ -782,6 +851,69 @@ internal fun nowLineMaxDp(rows: Int, rowDp: Float = ROW_DP, density: Float): Flo
 
 private const val ROW_DP = 50f
 private const val MAX_CONSTRAINT_PX = 262_142f
+
+/**
+ * A programme as the guide draws it. Feeds often start a show a few minutes before the previous one
+ * ends, so a cell stops where the next programme starts and no cell covers another.
+ */
+internal class GuideCell(val program: Program, val end: Long) {
+    val start: Long get() = program.start
+}
+
+/** One cell per start time, oldest first. Every cell has some width, so every programme can be highlighted. */
+internal fun guideCells(programs: List<Program>): List<GuideCell> {
+    val list = programs.filter { it.end > it.start }.distinctBy { it.start }.sortedBy { it.start }
+    return list.mapIndexed { i, p -> GuideCell(p, minOf(p.end, list.getOrNull(i + 1)?.start ?: p.end)) }
+}
+
+/**
+ * The cell to highlight at time [t]: the one on at [t], else the first starting before [winEnd],
+ * else the nearest one already in the window. -1 when the window shows nothing for the row.
+ */
+internal fun cellIndexAt(cells: List<GuideCell>, t: Long, winStart: Long, winEnd: Long): Int {
+    val on = cells.indexOfFirst { t >= it.start && t < it.end }
+    if (on >= 0) return on
+    val soon = cells.indexOfFirst { it.start >= t && it.start < winEnd }
+    if (soon >= 0) return soon
+    return cells.indexOfLast { it.end > winStart && it.start < winEnd && it.start < t }
+}
+
+/** Where Right or Left leaves the highlight: a programme's start, or null for the channel name, and the window's start. */
+internal data class GuideStep(val start: Long?, val windowStart: Long)
+
+/**
+ * Right from cell [index]: the next programme in the row, with the window moved on just far enough
+ * to show where it starts. Null when nothing comes later inside the guide.
+ */
+internal fun stepRight(cells: List<GuideCell>, index: Int, windowStart: Long, span: Long, lastWindow: Long): GuideStep? {
+    val next = cells.getOrNull(index + 1) ?: return null
+    if (next.start >= lastWindow + span) return null
+    var w = windowStart
+    while (next.start >= w + span && w < lastWindow) w += SLOT
+    return GuideStep(next.start, w)
+}
+
+/**
+ * Left from cell [index]: the previous programme in the row, with the window moved back to show where
+ * it starts, or the channel name when nothing earlier is inside the guide.
+ */
+internal fun stepLeft(cells: List<GuideCell>, index: Int, windowStart: Long, earliest: Long): GuideStep {
+    val prev = cells.getOrNull(index - 1)
+    if (prev == null || prev.end <= earliest) return GuideStep(null, windowStart)
+    var w = windowStart
+    while (prev.start < w && w > earliest) w -= SLOT
+    return GuideStep(prev.start, w)
+}
+
+/** The start of the half hour on the local clock at or before [t]. [offsetMs] is the zone's offset from UTC. */
+internal fun localSlotStart(t: Long, offsetMs: Long): Long = Math.floorDiv(t + offsetMs, SLOT) * SLOT - offsetMs
+
+/** The digit a number key types, from the top row or the number pad, or null for any other key. */
+internal fun digitOf(keyCode: Int): Int? = when (keyCode) {
+    in KeyEvent.KEYCODE_0..KeyEvent.KEYCODE_9 -> keyCode - KeyEvent.KEYCODE_0
+    in KeyEvent.KEYCODE_NUMPAD_0..KeyEvent.KEYCODE_NUMPAD_9 -> keyCode - KeyEvent.KEYCODE_NUMPAD_0
+    else -> null
+}
 
 /** The channels in a category, in list order. */
 fun channelsIn(group: String, channels: List<LiveChannel>, favorites: Set<String>, recents: List<String>): List<LiveChannel> =
@@ -885,17 +1017,20 @@ private fun ChannelMenu(
     }
 }
 
+/**
+ * Opens with OK on a programme. A later show offers a reminder or a recording. The show on now,
+ * on a channel with an archive, offers live or from the start.
+ */
 @Composable
 private fun ProgrammeMenu(
     channel: LiveChannel,
     program: Program,
-    onRemind: () -> Unit,
-    onRecord: () -> Unit,
+    actions: List<Pair<String, () -> Unit>>,
     onClose: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val first = remember { FocusRequester() }
-    LaunchedEffect(Unit) {
+    LaunchedEffect(channel.id, program.start) {
         withFrameNanos { }
         runCatching { first.requestFocus() }
     }
@@ -906,10 +1041,15 @@ private fun ProgrammeMenu(
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             Text(program.title, style = TvType.Section, maxLines = 2, overflow = TextOverflow.Ellipsis)
-            Text("${channel.name} · ${formatTime(program.start)}", style = TvType.Caption, color = Tv.Ink3)
-            PillButton("Remind me", onRemind, modifier = Modifier.fillMaxWidth().focusRequester(first))
-            PillButton("Record", onRecord, modifier = Modifier.fillMaxWidth())
-            PillButton("Close", onClose, modifier = Modifier.fillMaxWidth())
+            Text("${channel.name} · ${formatRange(program)}", style = TvType.Caption, color = Tv.Ink3)
+            actions.forEachIndexed { k, (label, action) ->
+                PillButton(
+                    label,
+                    action,
+                    modifier = Modifier.fillMaxWidth().then(if (k == 0) Modifier.focusRequester(first) else Modifier)
+                )
+            }
+            PillButton("Close", onClose, modifier = Modifier.fillMaxWidth().then(if (actions.isEmpty()) Modifier.focusRequester(first) else Modifier))
         }
     }
 }

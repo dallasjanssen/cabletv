@@ -1,8 +1,10 @@
 package com.dallas.cabletv.data
 
 import android.content.Context
+import android.content.SharedPreferences
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
+import java.security.KeyStore
 import java.security.MessageDigest
 import java.security.SecureRandom
 
@@ -12,9 +14,33 @@ import java.security.SecureRandom
  */
 class SettingsStore(context: Context) {
 
-    private val prefs = EncryptedSharedPreferences.create(
+    /** True when the saved settings could not be opened and were wiped, so the app starts clean. */
+    val wasReset: Boolean
+
+    private val prefs: SharedPreferences
+
+    init {
+        val appContext = context.applicationContext
+        var reset = false
+        prefs = try {
+            openPrefs(appContext)
+        } catch (e: Exception) {
+            // A corrupt keyset or a lost Keystore key. Start over rather than crash at launch.
+            reset = true
+            runCatching { appContext.deleteSharedPreferences(PREFS_NAME) }
+            runCatching {
+                val store = KeyStore.getInstance("AndroidKeyStore")
+                store.load(null)
+                store.deleteEntry(MasterKey.DEFAULT_MASTER_KEY_ALIAS)
+            }
+            openPrefs(appContext)
+        }
+        wasReset = reset
+    }
+
+    private fun openPrefs(context: Context): SharedPreferences = EncryptedSharedPreferences.create(
         context,
-        "cabletv_secure_prefs",
+        PREFS_NAME,
         MasterKey.Builder(context).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build(),
         EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
         EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
@@ -78,6 +104,14 @@ class SettingsStore(context: Context) {
         prefs.edit().putString(K_LAST_CHANNEL, id).apply()
     }
 
+    /** The channel last watched under one profile. Falls back to the old shared value. */
+    fun lastChannelId(profileId: String): String? =
+        prefs.getString(lastChannelKey(profileId), null)?.takeIf { it.isNotBlank() } ?: lastChannelId()
+
+    fun saveLastChannelId(profileId: String, id: String) {
+        prefs.edit().putString(lastChannelKey(profileId), id).apply()
+    }
+
     fun hasPin(): Boolean = prefs.contains(K_PIN)
 
     /** Stores a new PIN as a salted hash. Passing an empty string removes the lock. */
@@ -104,6 +138,7 @@ class SettingsStore(context: Context) {
     }
 
     private companion object {
+        const val PREFS_NAME = "cabletv_secure_prefs"
         const val K_LAST_CHANNEL = "last_channel_id"
         const val K_XS = "xtream_server"
         const val K_XU = "xtream_user"
@@ -122,6 +157,7 @@ class SettingsStore(context: Context) {
         const val K_PIN = "parental_pin"
 
         private fun jfTokenKey(profileId: String) = "jf_token_$profileId"
+        private fun lastChannelKey(profileId: String) = "last_channel_$profileId"
         private fun jfUserKey(profileId: String) = "jf_user_$profileId"
     }
 }

@@ -60,7 +60,9 @@ data class VodItem(
     /** How much has been watched, from 0 to 1, when known. */
     val progress: Float? = null,
     /** Provider or library category, used to browse and to apply the parental lock. */
-    val category: String = ""
+    val category: String = "",
+    /** The parent series id of an episode. */
+    val seriesId: String? = null
 )
 
 data class Settings(
