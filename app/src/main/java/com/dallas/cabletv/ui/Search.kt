@@ -21,6 +21,8 @@ import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.key.utf16CodePoint
 import androidx.compose.ui.unit.dp
 import com.dallas.cabletv.data.EpgCache
+import com.dallas.cabletv.data.epgIdsMatch
+import com.dallas.cabletv.data.normalizeEpgKey
 import com.dallas.cabletv.data.GuideSelection
 import com.dallas.cabletv.data.JellyfinClient
 import com.dallas.cabletv.data.LiveChannel
@@ -94,7 +96,7 @@ fun SearchScreen(
             emptyList()
         } else {
             EpgCache.programmesMatching(q).mapNotNull { (epgId, program) ->
-                val ch = channels.firstOrNull { it.epgId == epgId } ?: return@mapNotNull null
+                val ch = channels.firstOrNull { epgIdsMatch(it.epgId, epgId) || normalizeEpgKey(it.name) == normalizeEpgKey(epgId) } ?: return@mapNotNull null
                 if (ch in matchChannels && isOnNow(program)) null else ch to program
             }
         }

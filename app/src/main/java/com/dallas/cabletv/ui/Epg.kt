@@ -54,23 +54,28 @@ class GuideData(private val scope: CoroutineScope) {
     /** What is on now and next, or null while it loads or when there is no guide for the channel. */
     fun nowNext(ch: LiveChannel): NowNext? {
         @Suppress("UNUSED_VARIABLE") val v = version
-        EpgCache.nowNext(ch.epgId)?.let { return it }
-        return shortListing(ch)
+        val fromGuide = EpgCache.nowNext(ch.epgId, ch.name)
+        if (fromGuide?.now != null) return fromGuide
+        return shortListing(ch) ?: fromGuide
     }
 
     /** What is on now from data already downloaded. Never asks the provider, so it is safe for long lists. */
     fun peekNow(ch: LiveChannel): Program? {
         @Suppress("UNUSED_VARIABLE") val v = version
-        return EpgCache.nowNext(ch.epgId)?.now ?: short[ch.id]?.second?.now
+        return EpgCache.nowNext(ch.epgId, ch.name)?.now ?: short[ch.id]?.second?.now
     }
 
     /** Every known programme for a channel, oldest first. */
     fun schedule(ch: LiveChannel): List<Program> {
         @Suppress("UNUSED_VARIABLE") val v = version
-        val full = EpgCache.schedule(ch.epgId)
-        if (full.isNotEmpty()) return full
-        val nn = shortListing(ch) ?: return emptyList()
-        return listOfNotNull(nn.now, nn.next)
+        val full = EpgCache.schedule(ch.epgId, ch.name)
+        val now = System.currentTimeMillis()
+        if (full.any { now >= it.start && now < it.end }) return full
+        // The downloaded grid can miss the current hour. The provider's short listing fills that hole.
+        val nn = shortListing(ch) ?: return full
+        val extra = listOfNotNull(nn.now, nn.next).filter { p -> p.end > p.start && full.none { it.start == p.start } }
+        if (extra.isEmpty()) return full
+        return (full + extra).sortedBy { it.start }
     }
 
     private fun shortListing(ch: LiveChannel): NowNext? {
@@ -85,8 +90,10 @@ class GuideData(private val scope: CoroutineScope) {
     private fun request(ch: LiveChannel) {
         val xtream = epg
         val portal = stalker
-        if (ch.origin != "stalker" && xtream == null) return
+        // A playlist channel's id is not an Xtream stream id, so only the matching login is asked.
+        if (ch.origin == "playlist") return
         if (ch.origin == "stalker" && portal == null) return
+        if (ch.origin != "stalker" && xtream == null) return
         if (!pending.add(ch.id)) return
         scope.launch {
             val result = withContext(Dispatchers.IO) {

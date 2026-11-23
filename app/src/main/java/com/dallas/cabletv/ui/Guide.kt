@@ -701,7 +701,18 @@ private fun GuideRow(
             // Cells are keyed by their place in the row, not by show. When listings arrive and replace
             // "No guide information", or the grid moves on, the focused cell stays and shows the new
             // programme instead of disappearing from under the remote.
-            programs.filter { it.end > windowStart && it.start < windowEnd }.forEachIndexed { place, p ->
+            val visible = programs.filter { it.end > windowStart && it.start < windowEnd }
+            if (visible.isEmpty()) {
+                Text(
+                    "No guide information",
+                    style = TvType.Small,
+                    color = Tv.Ink3,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.align(Alignment.CenterStart).padding(horizontal = 12.dp)
+                )
+            }
+            visible.forEachIndexed { place, p ->
                 run {
                     key(place) {
                         val left = slotW * ((maxOf(p.start, windowStart) - windowStart).toFloat() / SLOT)

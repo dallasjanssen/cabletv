@@ -952,7 +952,7 @@ private fun ReplayPanel(channel: LiveChannel, now: Program?, onPick: (Program) -
     val past = remember(channel.id, channel.archiveDays) {
         val day = 24L * 3_600_000L
         val days = if (channel.archiveDays > 0) channel.archiveDays.coerceAtMost(2) else 2
-        EpgCache.pastPrograms(channel.epgId, days * day)
+        EpgCache.pastPrograms(channel.epgId, days * day, channel.name)
     }
     val items = listOfNotNull(now) + past
     val first = remember { FocusRequester() }
