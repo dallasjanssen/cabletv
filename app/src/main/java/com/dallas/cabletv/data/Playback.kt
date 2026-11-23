@@ -54,7 +54,8 @@ fun newPlayer(context: Context, compact: Boolean = false): ExoPlayer {
 
 /**
  * The last audio language and caption choice, kept on the device so the next channel
- * and the next movie start the same way. Captions use an empty string for Off.
+ * and the next movie start the same way. Captions use an empty string for Off and
+ * [CAPTIONS_ON] when the chosen track has no language code.
  * Nothing here is secret, so it stays out of the encrypted settings.
  */
 object TrackMemory {
@@ -68,14 +69,7 @@ object TrackMemory {
         val captions = if (prefs.contains(CAPTIONS)) prefs.getString(CAPTIONS, "") else null
         player.trackSelectionParameters = player.trackSelectionParameters.buildUpon().apply {
             if (!audio.isNullOrBlank()) setPreferredAudioLanguage(audio)
-            when {
-                captions == null -> Unit
-                captions.isBlank() -> setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
-                else -> {
-                    setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
-                    setPreferredTextLanguage(captions)
-                }
-            }
+            applyCaptionChoice(captions)
         }.build()
     }
 
@@ -88,14 +82,47 @@ object TrackMemory {
             .build()
     }
 
-    /** Remembers captions. A null or blank language turns them off. */
-    fun saveCaptions(context: Context, player: Player, language: String?) {
-        val stored = language.orEmpty()
+    /**
+     * Remembers captions. [enabled] false is Off. A language keeps that language next time.
+     * A track with no language code still turns captions on.
+     */
+    fun saveCaptions(context: Context, player: Player, enabled: Boolean, language: String?) {
+        val stored = storedCaptionChoice(enabled, language)
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(CAPTIONS, stored).apply()
-        val builder = player.trackSelectionParameters.buildUpon()
-        if (stored.isBlank()) builder.setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
-        else builder.setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false).setPreferredTextLanguage(stored)
-        player.trackSelectionParameters = builder.build()
+        player.trackSelectionParameters = player.trackSelectionParameters.buildUpon().apply {
+            applyCaptionChoice(stored)
+        }.build()
+    }
+}
+
+/** Stored caption choice. Blank is Off. [CAPTIONS_ON] is a track that has no language code. */
+internal const val CAPTIONS_ON = "*"
+
+/** What to store after the viewer picks a caption row. */
+internal fun storedCaptionChoice(enabled: Boolean, language: String?): String {
+    if (!enabled) return ""
+    val code = language?.trim()?.takeIf { it.isNotEmpty() && !it.equals("und", ignoreCase = true) }
+    return code ?: CAPTIONS_ON
+}
+
+private fun androidx.media3.common.TrackSelectionParameters.Builder.applyCaptionChoice(stored: String?) {
+    when {
+        stored == null -> Unit
+        stored.isBlank() -> {
+            setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
+            clearOverridesOfType(C.TRACK_TYPE_TEXT)
+            setSelectUndeterminedTextLanguage(false)
+        }
+        stored == CAPTIONS_ON -> {
+            setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+            setPreferredTextLanguages()
+            setSelectUndeterminedTextLanguage(true)
+        }
+        else -> {
+            setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+            setPreferredTextLanguage(stored)
+            setSelectUndeterminedTextLanguage(false)
+        }
     }
 }
 

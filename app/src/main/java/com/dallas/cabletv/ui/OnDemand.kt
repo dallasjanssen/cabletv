@@ -920,7 +920,7 @@ private fun VodPlayer(
                 resizeMode = resizeMode,
                 onResize = { resizeMode = it },
                 onAudioLanguage = { TrackMemory.saveAudio(context, player, it) },
-                onCaptionsLanguage = { TrackMemory.saveCaptions(context, player, it) },
+                onCaptions = { enabled, language -> TrackMemory.saveCaptions(context, player, enabled, language) },
                 onClose = { tracks = false },
                 modifier = Modifier.align(Alignment.CenterEnd)
             )

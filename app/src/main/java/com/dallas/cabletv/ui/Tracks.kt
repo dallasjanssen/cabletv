@@ -55,13 +55,22 @@ fun TrackPanel(
     onClose: () -> Unit,
     modifier: Modifier = Modifier,
     onAudioLanguage: (String?) -> Unit = {},
-    onCaptionsLanguage: (String?) -> Unit = {}
+    onCaptions: (enabled: Boolean, language: String?) -> Unit = { _, _ -> }
 ) {
     BackHandler { onClose() }
     var tick by remember { mutableIntStateOf(0) }
+    DisposableEffect(player) {
+        val listener = object : Player.Listener {
+            override fun onTracksChanged(tracks: Tracks) { tick++ }
+            override fun onTrackSelectionParametersChanged(parameters: androidx.media3.common.TrackSelectionParameters) { tick++ }
+        }
+        player.addListener(listener)
+        onDispose { player.removeListener(listener) }
+    }
     val audio = remember(tick) { choicesOf(player, C.TRACK_TYPE_AUDIO) }
     val captions = remember(tick) { choicesOf(player, C.TRACK_TYPE_TEXT) }
-    val captionsOff = remember(tick) { player.trackSelectionParameters.disabledTrackTypes.contains(C.TRACK_TYPE_TEXT) || captions.none { it.selected } }
+    val textDisabled = player.trackSelectionParameters.disabledTrackTypes.contains(C.TRACK_TYPE_TEXT)
+    val captionsOff = textDisabled || captions.none { it.selected }
     val first = remember { FocusRequester() }
     LaunchedEffect(Unit) {
         withFrameNanos { }
@@ -69,12 +78,12 @@ fun TrackPanel(
     }
 
     fun pick(type: Int, choice: TrackChoice) {
+        val format = choice.group.getTrackFormat(choice.index)
         player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
             .setTrackTypeDisabled(type, false)
-            .setOverrideForType(TrackSelectionOverride(choice.group.mediaTrackGroup, choice.index))
+            .setOverrideForType(TrackSelectionOverride(choice.group.mediaTrackGroup, listOf(choice.index)))
             .build()
-        val language = choice.group.getTrackFormat(choice.index).language
-        if (type == C.TRACK_TYPE_AUDIO) onAudioLanguage(language) else onCaptionsLanguage(language)
+        if (type == C.TRACK_TYPE_AUDIO) onAudioLanguage(format.language) else onCaptions(true, format.language)
         tick++
     }
 
@@ -91,10 +100,7 @@ fun TrackPanel(
             item { SectionLabel("Captions", Modifier.padding(start = 12.dp, top = 14.dp, bottom = 6.dp)) }
             item {
                 ChoiceRow("Off", captionsOff) {
-                    player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
-                        .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
-                        .build()
-                    onCaptionsLanguage(null)
+                    onCaptions(false, null)
                     tick++
                 }
             }
