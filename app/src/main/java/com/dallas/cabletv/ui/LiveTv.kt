@@ -796,6 +796,10 @@ private fun CategoryChip(label: String, selected: Boolean, onClick: () -> Unit) 
     }
 }
 
+/**
+ * One guide row. Wide screens (TVs) show the name, the programme and the next one side by
+ * side. Narrow screens (phones) stack them, so nothing is squeezed out.
+ */
 @Composable
 private fun GuideRow(
     ch: LiveChannel,
@@ -815,6 +819,121 @@ private fun GuideRow(
         if (result != null) cache[ch.id] = result
     }
 
+    BoxWithConstraints(Modifier.fillMaxWidth()) {
+        if (maxWidth >= 600.dp) {
+            GuideRowWide(ch, cache, epg, gate, favorite, focusRequester, onClick, onFavorite)
+        } else {
+            GuideRowNarrow(ch, cache, epg, favorite, focusRequester, onClick, onFavorite)
+        }
+    }
+}
+
+@Composable
+private fun GuideRowNarrow(
+    ch: LiveChannel,
+    cache: MutableMap<String, NowNext>,
+    epg: XtreamClient?,
+    favorite: Boolean,
+    focusRequester: FocusRequester?,
+    onClick: () -> Unit,
+    onFavorite: () -> Unit
+) {
+    val nn = EpgCache.nowNext(ch.epgId) ?: cache[ch.id]
+    val now = nn?.now
+    val next = nn?.next
+    val mainModifier = if (focusRequester != null) {
+        Modifier.fillMaxWidth().focusRequester(focusRequester)
+    } else {
+        Modifier.fillMaxWidth()
+    }
+
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        FocusSurface(
+            onClick = onClick,
+            modifier = mainModifier,
+            shape = RoundedCornerShape(12.dp),
+            focusScale = 1f
+        ) {
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .background(Cable.Surface)
+                    .padding(horizontal = 16.dp, vertical = 14.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = ch.number.toString(),
+                        style = MaterialTheme.typography.titleMedium,
+                        color = Cable.Accent
+                    )
+                    Spacer(Modifier.width(12.dp))
+                    Text(
+                        text = if (favorite) "* ${ch.name}" else ch.name,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = Cable.Ink,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+                if (now != null) {
+                    Text(
+                        text = now.title,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Cable.Led,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    ProgressLine(progressOf(now), Modifier.fillMaxWidth().padding(top = 2.dp))
+                } else {
+                    Text(
+                        text = if (epg == null) "No guide source" else "No guide data",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Cable.Ink3
+                    )
+                }
+                if (next != null) {
+                    Text(
+                        text = "NEXT ${formatTime(next.start)}  ${next.title}",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Cable.Ink2,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+        }
+
+        // The favorite button is its own small target under the row, so it never pushes the name off screen.
+        FocusSurface(
+            onClick = onFavorite,
+            shape = RoundedCornerShape(12.dp),
+            focusScale = 1f
+        ) {
+            Text(
+                text = if (favorite) "* FAVORITE" else "ADD FAVORITE",
+                style = MaterialTheme.typography.labelLarge,
+                color = if (favorite) Cable.Led else Cable.Ink2,
+                modifier = Modifier
+                    .background(Cable.Surface)
+                    .padding(horizontal = 18.dp, vertical = 10.dp)
+            )
+        }
+    }
+}
+
+@Composable
+private fun GuideRowWide(
+    ch: LiveChannel,
+    cache: MutableMap<String, NowNext>,
+    epg: XtreamClient?,
+    gate: Semaphore,
+    favorite: Boolean,
+    focusRequester: FocusRequester?,
+    onClick: () -> Unit,
+    onFavorite: () -> Unit
+) {
     val nn = EpgCache.nowNext(ch.epgId) ?: cache[ch.id]
     val now = nn?.now
     val next = nn?.next

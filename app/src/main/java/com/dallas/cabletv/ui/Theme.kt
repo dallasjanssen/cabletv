@@ -152,7 +152,7 @@ fun CableHeader(title: String, onBack: (() -> Unit)? = null) {
         Text(
             text = title,
             color = Cable.Led,
-            style = MaterialTheme.typography.headlineMedium,
+            style = MaterialTheme.typography.titleLarge,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f)
