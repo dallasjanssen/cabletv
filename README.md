@@ -68,7 +68,7 @@ Replace the IP with your TV's address. Accept the debugging prompt on the TV the
 
 - Jellyfin playback uses direct streams. If the TV cannot decode a file's codec, that title will fail. Transcoding can be added later.
 - Channels with no listings in the XMLTV feed fall back to the provider's now and next listing.
-- A playlist can name its guide with `url-tvg`. A provider that gives you a separate EPG address goes in Settings, Live TV, Guide URL. Refresh guide, on the Guide screen and in Settings, Live TV, downloads those listings again. The app also downloads them about once an hour. Xtream, a playlist and a Stalker portal can all be saved at once. The guide matches channels by their id, the same id the playlist calls `tvg-id`.
+- A playlist can name its guide with `url-tvg`. A provider that gives you a separate EPG address goes in Settings, Live TV, Guide URL. Refresh guide, on the Guide screen and in Settings, Live TV, downloads those listings again. The app also downloads them about once an hour. A gzip file is read as well as plain XML. Xtream, a playlist and a Stalker portal can all be saved at once. The guide matches a channel by its id, the same id the playlist calls `tvg-id`, ignoring case and punctuation. When that id has nothing on now, the channel name is tried against the guide's display name, and an Xtream login also uses the provider's now and next.
 - Recordings are one at a time. A future recording starts only while the app is still open. Pausing live TV only reaches what the player has already buffered, about three minutes.
 - Two channels at once uses two provider connections. A login that allows one stream will refuse one of them.
 
