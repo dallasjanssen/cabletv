@@ -32,6 +32,7 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -422,7 +423,7 @@ fun GuideScreen(
                                 .padding(start = side + chanW + 8.dp + slotW * nowX - 1.dp)
                                 .width(2.dp)
                                 .fillMaxHeight()
-                                .heightIn(max = 50.dp * rows.size)
+                                .heightIn(max = nowLineMaxDp(rows.size, density = LocalDensity.current.density).dp)
                                 .background(Tv.Accent)
                         )
                     }
@@ -630,7 +631,7 @@ private fun GuideRow(
     onFocused: (Long?) -> Unit,
     targetHolders: IntArray
 ) {
-    Row(Modifier.fillMaxWidth().height(50.dp), verticalAlignment = Alignment.CenterVertically) {
+    Row(Modifier.fillMaxWidth().height(ROW_DP.dp), verticalAlignment = Alignment.CenterVertically) {
         val isTargetChannel = focus.row == rowIndex && focus.start == null
         if (isTargetChannel) HoldsTarget(targetHolders)
         Focusable(
@@ -726,6 +727,21 @@ private fun HoldsTarget(holders: IntArray) {
 fun groupsOf(channels: List<LiveChannel>): List<String> = channels.map(::groupOf).distinct().sorted()
 
 fun categoryItems(groups: List<String>): List<String> = (listOf(GROUP_FAVORITES, GROUP_RECENT, GROUP_ALL) + groups).distinct()
+
+/**
+ * Tallest the guide's now-line may be, in dp. It stops at the last channel row.
+ * Compose packs a size into a fixed number of bits and refuses anything past 262142 px,
+ * so a lineup of several thousand channels cannot ask for 50 dp times every row.
+ */
+internal fun nowLineMaxDp(rows: Int, rowDp: Float = ROW_DP, density: Float): Float {
+    if (rows <= 0 || density <= 0f) return 0f
+    val wantedPx = rowDp * rows * density
+    val px = if (wantedPx.isFinite() && wantedPx <= MAX_CONSTRAINT_PX) wantedPx else MAX_CONSTRAINT_PX
+    return px / density
+}
+
+private const val ROW_DP = 50f
+private const val MAX_CONSTRAINT_PX = 262_142f
 
 /** The channels in a category, in list order. */
 fun channelsIn(group: String, channels: List<LiveChannel>, favorites: Set<String>, recents: List<String>): List<LiveChannel> =
