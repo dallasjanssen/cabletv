@@ -86,7 +86,9 @@ data class Settings(
     /** MAC address for the Stalker portal. */
     val stalkerMac: String = "",
     /** Provider expiry, unix milliseconds. Zero when the login did not say. */
-    val subscriptionExpiryMs: Long = 0L
+    val subscriptionExpiryMs: Long = 0L,
+    /** Home Assistant webhook that hears what is playing. Empty when it is not set up. */
+    val homeAssistantWebhook: String = ""
 ) {
     /** The hidden filters, trimmed and upper-cased. */
     val hiddenTerms: List<String>

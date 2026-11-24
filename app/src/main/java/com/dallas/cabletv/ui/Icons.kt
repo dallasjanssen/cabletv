@@ -67,4 +67,5 @@ object TvIcons {
     val Check = outline("check", "M5 12.5l4.5 4.5L19 7.5")
     val Plus = outline("plus", "M12 5v14M5 12h14")
     val Back = outline("back", "M15 6l-6 6 6 6")
+    val Home = outline("home", "M3.5 11L12 4l8.5 7", "M5.5 9.5V20h13V9.5", "M10 20v-5.5h4V20")
 }

@@ -60,7 +60,8 @@ class SettingsStore(context: Context) {
         lockedFilters = prefs.getString(K_LOCKED, "").orEmpty(),
         stalkerUrl = prefs.getString(K_STALKER_URL, "").orEmpty(),
         stalkerMac = prefs.getString(K_STALKER_MAC, "").orEmpty(),
-        subscriptionExpiryMs = prefs.getLong(K_EXPIRY, 0L)
+        subscriptionExpiryMs = prefs.getLong(K_EXPIRY, 0L),
+        homeAssistantWebhook = prefs.getString(K_HA_WEBHOOK, "").orEmpty()
     )
 
     /** A Jellyfin token that belongs to one profile. Null when that profile uses the household login. */
@@ -94,6 +95,7 @@ class SettingsStore(context: Context) {
             .putString(K_STALKER_URL, s.stalkerUrl)
             .putString(K_STALKER_MAC, s.stalkerMac)
             .putLong(K_EXPIRY, s.subscriptionExpiryMs)
+            .putString(K_HA_WEBHOOK, s.homeAssistantWebhook)
             .apply()
     }
 
@@ -189,6 +191,7 @@ class SettingsStore(context: Context) {
         const val K_STALKER_URL = "stalker_url"
         const val K_STALKER_MAC = "stalker_mac"
         const val K_EXPIRY = "subscription_expiry"
+        const val K_HA_WEBHOOK = "home_assistant_webhook"
         const val K_PIN = "parental_pin"
         private const val RESERVED_PREFIX = "__androidx_security_crypto_"
 
