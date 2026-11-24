@@ -988,11 +988,15 @@ private fun HomeAssistantPane(settings: Settings, drafts: Drafts, onSave: (Setti
             message = "Enter the webhook URL first."
             return
         }
-        val body = HomeAssistantReporter.snapshot()
+        val bodies = HomeAssistantReporter.snapshot()
         busy = true
         message = "Sending"
         scope.launch {
-            val result = withContext(Dispatchers.IO) { HomeAssistantReporter.sendNow(url, body) }
+            // What is on screen, then the favorites. The first answer that is not a success is the one shown.
+            val result = withContext(Dispatchers.IO) {
+                val results = bodies.map { HomeAssistantReporter.sendNow(url, it) }
+                results.firstOrNull { r -> (r.getOrNull() ?: 0) !in 200..299 } ?: results.first()
+            }
             busy = false
             message = result.fold(
                 onSuccess = { code ->

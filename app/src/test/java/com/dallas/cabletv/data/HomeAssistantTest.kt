@@ -83,8 +83,41 @@ class HomeAssistantTest {
     @Test
     fun idleSaysOnlyWhichTv() {
         val json = JSONObject(nowPlayingJson("Bedroom TV", HA_IDLE, liveNowPlaying(espn, show)))
-        assertEquals(setOf("device", "state"), json.keys().asSequence().toSet())
+        assertEquals(setOf("event", "device", "state"), json.keys().asSequence().toSet())
+        assertEquals("now_playing", json.getString("event"))
         assertEquals("idle", json.getString("state"))
+    }
+
+    @Test
+    fun favoritesAreTheVisibleChannelsSortedByNumber() {
+        fun ch(id: String, number: Int, name: String) =
+            LiveChannel(id = id, number = number, name = name, logo = null, group = "", streamUrl = "u", epgId = null)
+        val channels = listOf(
+            ch("a", 206, "ESPN"),
+            ch("b", 0, "Local News"),
+            ch("c", 12, "NBC"),
+            ch("d", 300, "espn"),
+            ch("e", 50, "HBO")
+        )
+        val list = favoriteChannels(channels, setOf("a", "b", "c", "d", "zzz"))
+        assertEquals(
+            listOf(FavoriteChannel("NBC", 12), FavoriteChannel("ESPN", 206), FavoriteChannel("Local News", 0)),
+            list
+        )
+        assertEquals(emptyList<FavoriteChannel>(), favoriteChannels(channels, emptySet()))
+    }
+
+    @Test
+    fun favoritesMessage() {
+        val json = JSONObject(favoritesJson("Bedroom TV", listOf(FavoriteChannel("NBC", 12), FavoriteChannel("Local News", 0))))
+        assertEquals("favorites", json.getString("event"))
+        assertEquals("Bedroom TV", json.getString("device"))
+        val items = json.getJSONArray("favorites")
+        assertEquals(2, items.length())
+        assertEquals("NBC", items.getJSONObject(0).getString("name"))
+        assertEquals(12, items.getJSONObject(0).getInt("number"))
+        assertFalse(items.getJSONObject(1).has("number"))
+        assertEquals(0, JSONObject(favoritesJson("TV", emptyList())).getJSONArray("favorites").length())
     }
 
     @Test
