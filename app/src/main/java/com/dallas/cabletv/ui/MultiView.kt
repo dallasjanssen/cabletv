@@ -23,12 +23,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
-import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import com.dallas.cabletv.data.LiveChannel
+import com.dallas.cabletv.data.liveMediaItem
 import com.dallas.cabletv.data.newPlayer
 import kotlinx.coroutines.delay
 
@@ -80,7 +80,7 @@ private class Tile(context: Context) {
         url = target
         failed = false
         runCatching {
-            exo.setMediaItem(MediaItem.fromUri(target))
+            exo.setMediaItem(liveMediaItem(target))
             exo.prepare()
             exo.playWhenReady = true
         }.onFailure {

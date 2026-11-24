@@ -43,11 +43,11 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.C
-import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.Timeline
 import androidx.media3.exoplayer.ExoPlayer
+import com.dallas.cabletv.data.liveMediaItem
 import com.dallas.cabletv.data.TrackMemory
 import com.dallas.cabletv.data.newPlayer
 import com.dallas.cabletv.data.playbackHttpStatus
@@ -165,7 +165,7 @@ class LivePlayer(context: Context) {
         handler.postDelayed({
             val target = url
             runCatching {
-                if (reload && target != null) exo.setMediaItem(MediaItem.fromUri(target))
+                if (reload && target != null) exo.setMediaItem(liveMediaItem(target))
                 exo.prepare()
                 exo.playWhenReady = true
             }.onFailure {
@@ -201,7 +201,7 @@ class LivePlayer(context: Context) {
         // A track picked on the previous channel must not stick. The saved language still applies.
         runCatching {
             exo.trackSelectionParameters = exo.trackSelectionParameters.buildUpon().clearOverrides().build()
-            exo.setMediaItem(MediaItem.fromUri(target))
+            exo.setMediaItem(liveMediaItem(target))
             exo.prepare()
             exo.playWhenReady = true
         }.onFailure {
@@ -226,7 +226,7 @@ class LivePlayer(context: Context) {
         }
         behindLive = false
         runCatching {
-            exo.setMediaItem(MediaItem.fromUri(target))
+            exo.setMediaItem(liveMediaItem(target))
             exo.prepare()
             exo.playWhenReady = true
         }.onFailure {
