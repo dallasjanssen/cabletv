@@ -82,7 +82,7 @@ The app opens these links, and starts if it is closed:
 
 A locked channel still asks for the PIN. A channel that is hidden or not in the list shows a message instead.
 
-From Home Assistant, use the Android TV Remote integration for the Google TV box. This script turns the TV on and changes the channel:
+From Home Assistant, use the Android TV Remote integration for the Google TV box. This script turns the TV on if needed and changes the channel:
 
 ```yaml
 alias: Watch channel
@@ -105,13 +105,8 @@ sequence:
   - action: remote.turn_on
     target:
       entity_id: "{{ tv }}"
-  - delay:
-      seconds: 2
-  - action: remote.turn_on
-    target:
-      entity_id: "{{ tv }}"
     data:
-      activity: "cabletv://channel/{{ channel | urlencode }}"
+      activity: "cabletv://channel/{{ channel | string | trim | urlencode }}"
 ```
 
 From a computer: `adb shell am start -a android.intent.action.VIEW -d "cabletv://channel/12"`

@@ -525,8 +525,8 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
     }
     val showingLive = liveActive && foreground && playUrl != null && current != null
     LaunchedEffect(showingLive, current?.id, replay, live.playing) {
-        val ch = current
-        if (!showingLive || ch == null) {
+        val ch = current?.takeIf { showingLive }
+        if (ch == null) {
             nowPlaying.show(null)
             HomeAssistantReporter.clear("live")
             return@LaunchedEffect
