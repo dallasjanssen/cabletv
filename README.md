@@ -20,6 +20,7 @@ The screens are laid out for Android TV's 960 by 540 grid, with one typeface (Fi
 - **Two channels**: two pictures side by side. Left and right pick a picture, and only that one plays sound. Up and down change its channel. Locked channels are skipped.
 - **Settings**: phone setup, live TV (including a Guide URL and subscription expiry), Jellyfin, channel list, profiles, parental lock, recordings, Home Assistant, backup and restore, and updates. The phone setup page can edit live/library logins, channel customizations, the Home Assistant webhook, and download or upload a backup file. Hidden channels belong to the profile. Locked groups need the PIN before they play; movie and show categories can be locked too. After five wrong PINs, the PIN pad waits 30 seconds. Each section saves by itself, and leaving with unsaved typing says so. A running recording can be stopped in Recordings.
 - **First launch**: with nothing set up, the app opens on a QR code. Focus starts on New code.
+- **On a phone**: the app opens on My TVs, a remote and settings companion for your TVs. See Phone companion below.
 
 ## Remote and keyboard controls
 
@@ -159,6 +160,18 @@ template:
 ```
 
 The TV's webhook URL is then `http://<home assistant address>:8123/api/webhook/cable-tv-living-room`.
+
+## Phone companion
+
+On a phone, Cable TV opens on **My TVs** instead of live TV. A `cabletv:` link still opens the TV app straight away, and **Watch on this phone** opens it too.
+
+- **Pairing**: open Cable TV on the TV, then on the phone tap the TV under the ones found on your network. The TV shows **Pair a phone** with a 6-digit code to type on the phone. The TV lists paired phones in Settings, Set up with your phone, with Remove. A TV that discovery does not find can be added by address (port 8766).
+- **Remote**: what is playing, the D-pad and OK, Back, Guide, Info, Last, channel up and down, play/pause, a number pad and your favorites. It works while Cable TV is on the TV screen.
+- **Power and volume**: **Set up power and volume** pairs the phone with the TV's own Android TV remote, using a 6-character code the TV shows. Then power, volume and Home work, the keys work in any app, and **Open Cable TV** starts the app when it is closed.
+- **Settings**: the TV's live TV login, guide link, Jellyfin sign in, channel list and Home Assistant webhook, typed on the phone. The phone asks for the TV's PIN when it has one.
+- **Sync**: copies logins, channel customizations, favorites and the parental lock from one TV to another, with a box for each. The webhook, last channel, recents, resume points and paired phones stay with each TV.
+
+The connection is encrypted. Pairing ties the phone and the TV to each other's certificate, so neither talks to anything else in its place, and logins only travel over that paired connection. The protocol is in [docs/companion-protocol.md](docs/companion-protocol.md), and how it was built and checked is in [docs/companion-build-log.md](docs/companion-build-log.md).
 
 ## Security notes
 
