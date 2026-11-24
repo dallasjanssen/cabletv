@@ -62,6 +62,11 @@ class UserStateStore(context: Context, profileId: String = ProfileStore.DEFAULT_
         return added
     }
 
+    /** Replaces the favorites with [ids]. Used when sync copies another TV's favorites. */
+    fun replaceFavorites(ids: Set<String>) {
+        prefs.edit().putStringSet(K_FAV, HashSet(ids)).apply()
+    }
+
     /** Channel IDs, most recently watched first. */
     fun recents(): List<String> {
         return try {
@@ -170,6 +175,11 @@ class UserStateStore(context: Context, profileId: String = ProfileStore.DEFAULT_
 
     fun setHiddenFilters(value: String) {
         prefs.edit().putString(K_HIDDEN, value).apply()
+    }
+
+    /** Goes back to the shared hidden list, so this profile follows the household settings again. */
+    fun clearHiddenFilters() {
+        prefs.edit().remove(K_HIDDEN).apply()
     }
 
     fun reminders(): List<Reminder> {

@@ -58,6 +58,7 @@ import com.dallas.cabletv.data.RecordingStore
 import com.dallas.cabletv.data.RecordingService
 import com.dallas.cabletv.data.StalkerClient
 import com.dallas.cabletv.data.XtreamClient
+import com.dallas.cabletv.data.companion.server.PairedPhone
 import com.dallas.cabletv.data.ChannelFilter
 import com.dallas.cabletv.data.Recording
 import com.dallas.cabletv.data.channelFilters
@@ -183,6 +184,22 @@ private class Drafts(s: Settings) {
     var jp by mutableStateOf("")
     var ha by mutableStateOf(s.homeAssistantWebhook)
 
+    /**
+     * Brings fields that have no typed changes up to date when the saved settings changed from
+     * somewhere else, such as a paired phone. A field the person is typing in is left alone.
+     */
+    fun follow(old: Settings, new: Settings) {
+        if (xs == old.xtreamServer) xs = new.xtreamServer
+        if (xu == old.xtreamUser) xu = new.xtreamUser
+        if (xp == old.xtreamPass) xp = new.xtreamPass
+        if (m3u == old.m3uUrl) m3u = new.m3uUrl
+        if (epg == old.epgUrl) epg = new.epgUrl
+        if (su == old.stalkerUrl) su = new.stalkerUrl
+        if (sm == old.stalkerMac) sm = new.stalkerMac
+        if (js == old.jellyfinServer) js = new.jellyfinServer
+        if (ha == old.homeAssistantWebhook) ha = new.homeAssistantWebhook
+    }
+
     /** True when a Live TV, Jellyfin or Home Assistant field holds something that was not saved. */
     fun unsaved(s: Settings): Boolean =
         xs.trim() != s.xtreamServer || xu.trim() != s.xtreamUser || xp.trim() != s.xtreamPass ||
@@ -230,7 +247,10 @@ fun SettingsScreen(
     guideRefreshing: Boolean,
     onRefreshGuide: () -> Unit,
     vodCategories: List<String> = emptyList(),
-    jellyfinSignedIn: Boolean = settings.hasJellyfin
+    jellyfinSignedIn: Boolean = settings.hasJellyfin,
+    /** The phones paired with this TV, or null on a device that does not pair phones. */
+    pairedPhones: List<PairedPhone>? = null,
+    onRemovePhone: (String) -> Unit = {}
 ) {
     val context = LocalContext.current
     var pane by rememberSaveable { mutableStateOf(startPane) }
@@ -247,6 +267,15 @@ fun SettingsScreen(
     var suppressUnsavedNotice by remember { mutableStateOf(false) }
     val latest by rememberUpdatedState(settings)
     val latestToast by rememberUpdatedState(showToast)
+
+    // A change made from a paired phone shows in the fields here, so leaving does not say it was lost.
+    var seenSettings by remember { mutableStateOf(settings) }
+    LaunchedEffect(settings) {
+        if (settings != seenSettings) {
+            drafts.follow(seenSettings, settings)
+            seenSettings = settings
+        }
+    }
 
     // Leaving Settings with typed changes that were never saved says so, instead of losing them quietly.
     DisposableEffect(Unit) {
@@ -467,7 +496,9 @@ fun SettingsScreen(
                     message = phoneMessage,
                     currentValues = { phoneValues() },
                     backupJson = onBackupExportJson,
-                    onReceived = { fromPhone(it) }
+                    onReceived = { fromPhone(it) },
+                    pairedPhones = pairedPhones,
+                    onRemovePhone = onRemovePhone
                 )
                 SettingsPane.Live -> LivePane(settings, channelCount, drafts, liveBusy, liveMessage, guideRefreshing, onRefreshGuide, onSave = { saveLive() }, onSignOut = {
                     onSave(settings.copy(xtreamServer = "", xtreamUser = "", xtreamPass = "", m3uUrl = "", epgUrl = "", stalkerUrl = "", stalkerMac = "", subscriptionExpiryMs = 0L))
@@ -599,7 +630,9 @@ private fun PhonePane(
     message: String?,
     currentValues: () -> Map<String, String>,
     backupJson: () -> String,
-    onReceived: (Map<String, String>) -> Unit
+    onReceived: (Map<String, String>) -> Unit,
+    pairedPhones: List<PairedPhone>?,
+    onRemovePhone: (String) -> Unit
 ) {
     PaneTitle(
         "Set up with your phone",
@@ -607,6 +640,64 @@ private fun PhonePane(
     )
     PhoneSignInPanel(autoStart = false, onReceived = onReceived, currentValues = currentValues, backupJson = backupJson)
     Message(message)
+    if (pairedPhones != null) PairedPhonesSection(pairedPhones, onRemovePhone)
+}
+
+/**
+ * The phones that can control this TV, each with a Remove button. Removing one takes effect at
+ * once: its open connections close and it has to pair again. The highlight moves to the next
+ * phone, since the row it was on is gone.
+ */
+@Composable
+private fun PairedPhonesSection(phones: List<PairedPhone>, onRemove: (String) -> Unit) {
+    Spacer(Modifier.height(24.dp))
+    Text("Paired phones", style = TvType.Headline)
+    Spacer(Modifier.height(8.dp))
+    if (phones.isEmpty()) {
+        Text(
+            "No phones paired yet. Open Cable TV on your phone to pair it.",
+            style = TvType.Small,
+            color = Tv.Ink2,
+            modifier = Modifier.widthIn(max = 560.dp)
+        )
+        return
+    }
+    val rowFocus = remember { mutableMapOf<String, FocusRequester>() }
+    var focusAfterRemove by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(focusAfterRemove) {
+        val id = focusAfterRemove ?: return@LaunchedEffect
+        withFrameNanos { }
+        runCatching { rowFocus[id]?.requestFocus() }
+        focusAfterRemove = null
+    }
+    val dateFormat = remember { DateTimeFormatter.ofPattern("d MMM yyyy").withZone(ZoneId.systemDefault()) }
+    Column(Modifier.widthIn(max = 560.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        phones.forEachIndexed { i, phone ->
+            key(phone.fingerprint) {
+                val requester = rowFocus.getOrPut(phone.fingerprint) { FocusRequester() }
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(Tv.Surface)
+                        .padding(start = 14.dp, end = 8.dp, top = 6.dp, bottom = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(phone.name.ifBlank { "Phone" }, style = TvType.BodyStrong, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        if (phone.pairedAt > 0L) {
+                            Text("Paired ${dateFormat.format(Instant.ofEpochMilli(phone.pairedAt))}", style = TvType.Caption, color = Tv.Ink3)
+                        }
+                    }
+                    PillButton("Remove", {
+                        focusAfterRemove = (phones.getOrNull(i + 1) ?: phones.getOrNull(i - 1))?.fingerprint
+                        onRemove(phone.fingerprint)
+                    }, modifier = Modifier.focusRequester(requester))
+                }
+            }
+        }
+    }
 }
 
 @Composable

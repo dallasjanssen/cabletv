@@ -5,6 +5,8 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings as AndroidSettings
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaType
@@ -91,6 +93,9 @@ fun vodNowPlaying(item: VodItem): NowPlayingInfo {
 const val HA_PLAYING = "playing"
 const val HA_PAUSED = "paused"
 const val HA_IDLE = "idle"
+
+/** What the reporter currently says is playing. The phone companion watches this, so it hears what Home Assistant hears. */
+data class NowPlayingSnapshot(val state: String, val info: NowPlayingInfo?)
 
 /** What a webhook message is about, in its "event" field. */
 const val HA_EVENT_NOW_PLAYING = "now_playing"
@@ -202,6 +207,11 @@ object HomeAssistantReporter {
     private var owner: String? = null
     private var state = HA_IDLE
     private var info: NowPlayingInfo? = null
+    private val snapshotFlow = MutableStateFlow(NowPlayingSnapshot(HA_IDLE, null))
+
+    /** What is playing now, as a flow others can watch from any thread. It changes only when the message would. */
+    val nowPlaying: StateFlow<NowPlayingSnapshot> get() = snapshotFlow
+
     /** Null until the channel list has loaded, so an empty list is never sent by mistake. */
     private var favorites: List<FavoriteChannel>? = null
 
@@ -223,6 +233,7 @@ object HomeAssistantReporter {
         owner = who
         state = newState
         info = newInfo
+        snapshotFlow.value = NowPlayingSnapshot(newState, newInfo)
         schedule(nowPlayingBox, currentBody(), SETTLE_MS)
     }
 
@@ -237,6 +248,7 @@ object HomeAssistantReporter {
         owner = null
         state = HA_IDLE
         info = null
+        snapshotFlow.value = NowPlayingSnapshot(HA_IDLE, null)
         schedule(nowPlayingBox, currentBody(), 0L)
     }
 

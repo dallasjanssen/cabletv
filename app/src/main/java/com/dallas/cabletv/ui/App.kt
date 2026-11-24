@@ -1,8 +1,12 @@
 package com.dallas.cabletv.ui
 
 import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
 import android.content.Intent
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings as AndroidSettings
 import androidx.activity.ComponentActivity
@@ -69,12 +73,24 @@ import com.dallas.cabletv.data.RecordingService
 import com.dallas.cabletv.data.RecordingStore
 import com.dallas.cabletv.data.Reminder
 import com.dallas.cabletv.data.ScheduledRecording
+import com.dallas.cabletv.data.Settings
 import com.dallas.cabletv.data.SettingsStore
 import com.dallas.cabletv.data.StalkerClient
 import com.dallas.cabletv.data.StreamCredentials
 import com.dallas.cabletv.data.UserStateStore
 import com.dallas.cabletv.data.VodItem
 import com.dallas.cabletv.data.XtreamClient
+import com.dallas.cabletv.data.companion.isTelevision
+import com.dallas.cabletv.data.companion.server.AppCompanionBackend
+import com.dallas.cabletv.data.companion.server.CompanionHooks
+import com.dallas.cabletv.data.companion.server.CompanionPrefs
+import com.dallas.cabletv.data.companion.server.CompanionServer
+import com.dallas.cabletv.data.companion.server.MainThread
+import com.dallas.cabletv.data.companion.server.MessageRouter
+import com.dallas.cabletv.data.companion.server.PairedPhone
+import com.dallas.cabletv.data.companion.server.PairingManager
+import com.dallas.cabletv.data.companion.server.PinGate
+import com.dallas.cabletv.data.companion.server.SettingsUpdater
 import com.dallas.cabletv.data.displayName
 import com.dallas.cabletv.data.dueReminders
 import com.dallas.cabletv.data.dueSchedule
@@ -84,6 +100,7 @@ import com.dallas.cabletv.data.m3uCatchupUrl
 import com.dallas.cabletv.data.reminderKey
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -114,6 +131,31 @@ private fun Tab.toScreen(): Screen = when (this) {
     Tab.Search -> Screen.Search
     Tab.Settings -> Screen.Settings
 }
+
+/** The screen's name in the phone companion protocol. */
+private fun Screen.companionName(): String = when (this) {
+    Screen.Live -> "live"
+    Screen.Home -> "home"
+    Screen.Guide -> "guide"
+    Screen.OnDemand -> "on_demand"
+    Screen.Search -> "search"
+    Screen.Settings -> "settings"
+    Screen.Welcome -> "welcome"
+    Screen.Multi -> "multi"
+}
+
+/** The activity behind this context, which is the context itself or one it wraps. */
+private fun Context.findActivity(): Activity? {
+    var c: Context? = this
+    while (c is ContextWrapper) {
+        if (c is Activity) return c
+        c = c.baseContext
+    }
+    return null
+}
+
+/** Hidden filter text as upper-case terms, the form the channel filter uses. */
+private fun hiddenTermsOf(raw: String): List<String> = raw.split(',').map { it.trim().uppercase() }.filter { it.isNotEmpty() }
 
 /**
  * The whole app. [link] is a cabletv:// link waiting to be acted on, such as one sent by Home
@@ -885,17 +927,23 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
 
     // ------------------------------------------------------------ Links
     // A cabletv:// link from Home Assistant or another app. It waits for the channel list, then tunes
-    // the same way the guide does, so a locked channel still asks for the PIN.
-    LaunchedEffect(link, loadedChannels, channelsLoading, channelError, settings.hasLiveSource) {
-        val text = link ?: return@LaunchedEffect
+    // the same way the guide does, so a locked channel still asks for the PIN. A link sent from a
+    // paired phone is held here and handled the same way. The link from outside the app goes first.
+    var companionLink by remember { mutableStateOf<String?>(null) }
+    val pendingLink = link ?: companionLink
+    LaunchedEffect(pendingLink, loadedChannels, channelsLoading, channelError, settings.hasLiveSource) {
+        val text = pendingLink ?: return@LaunchedEffect
+        fun onHandled() {
+            if (link != null) onLinkHandled() else companionLink = null
+        }
         val request = parseChannelLink(text)
         if (request == null || !settings.hasLiveSource) {
-            onLinkHandled()
+            onHandled()
             return@LaunchedEffect
         }
         if (request == ChannelLink.Live) {
             go(Screen.Live)
-            onLinkHandled()
+            onHandled()
             return@LaunchedEffect
         }
         if (channelsLoading || (loadedChannels.isEmpty() && channelError == null)) return@LaunchedEffect
@@ -909,8 +957,130 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
                 go(Screen.Live)
             }
         }
-        onLinkHandled()
+        onHandled()
     }
+
+    // Saves a Jellyfin sign in or sign out for the active profile. Only the Jellyfin fields come from
+    // [updated]. The rest is taken from what is saved now, so a live login saved a moment earlier
+    // from the same form is kept.
+    fun saveJellyfin(updated: Settings) {
+        val merged = settings.copy(
+            jellyfinServer = updated.jellyfinServer,
+            jellyfinToken = updated.jellyfinToken,
+            jellyfinUserId = updated.jellyfinUserId
+        )
+        if (merged.jellyfinToken.isBlank()) {
+            store.clearProfileJellyfin(profileId)
+            jfOverride = null
+            if (profileId == ProfileStore.DEFAULT_ID) {
+                store.save(merged)
+                settings = merged
+            }
+        } else if (profileId == ProfileStore.DEFAULT_ID) {
+            store.clearProfileJellyfin(profileId)
+            jfOverride = null
+            store.save(merged)
+            settings = merged
+        } else {
+            if (settings.jellyfinServer != merged.jellyfinServer) {
+                val serverOnly = settings.copy(jellyfinServer = merged.jellyfinServer)
+                store.save(serverOnly)
+                settings = serverOnly
+            }
+            store.saveProfileJellyfin(profileId, merged.jellyfinToken, merged.jellyfinUserId)
+            jfOverride = merged.jellyfinToken to merged.jellyfinUserId
+        }
+    }
+
+    // ------------------------------------------------------------ Phone companion
+    // On a TV, paired phones can press keys, open channels, see what is playing and change settings
+    // while the app is on screen. The server starts and stops with the app. It does not run on a phone.
+    val isTv = remember { isTelevision(context) }
+    val companionPrefs = remember { if (isTv) CompanionPrefs(context) else null }
+    val companionHooks = remember { CompanionHooks() }
+    val pairing = remember { PairingManager() }
+    val companionServer = remember(companionPrefs) {
+        val prefs = companionPrefs ?: return@remember null
+        val mainHandler = Handler(Looper.getMainLooper())
+        val backend = AppCompanionBackend(
+            context = context,
+            hooks = companionHooks,
+            prefs = prefs,
+            settingsStore = store,
+            profileStore = profileStore,
+            updater = SettingsUpdater(
+                checkLive = { current, server, user, pass, m3u, stalkerUrl, stalkerMac, epgUrl ->
+                    checkLiveLogin(current, server, user, pass, m3u, stalkerUrl, stalkerMac, epgUrl)
+                },
+                signIn = { current, server, user, pass -> signInJellyfin(current, server, user, pass) }
+            ),
+            main = MainThread(post = { mainHandler.post(it) }, isMain = { Looper.myLooper() == Looper.getMainLooper() }),
+            activity = { context.findActivity() }
+        )
+        val pins = PinGate(hasPin = { store.hasPin() }, matches = { store.checkPin(it) })
+        CompanionServer(context, MessageRouter(backend, pairing, pins), backend, pairing, companionHooks)
+    }
+    // What the phone reaches into. Set again on every composition, so each lambda sees the current state.
+    SideEffect {
+        companionHooks.screen.value = screen.companionName()
+        companionHooks.settings = { settings }
+        companionHooks.applySettings = { updated ->
+            store.save(updated)
+            settings = updated
+        }
+        companionHooks.saveJellyfin = { saveJellyfin(it) }
+        companionHooks.signOutJellyfin = { saveJellyfin(settings.copy(jellyfinToken = "", jellyfinUserId = "")) }
+        companionHooks.hiddenFilters = { hiddenTerms.joinToString(",") }
+        companionHooks.setHiddenFilters = { value ->
+            userState.setHiddenFilters(value)
+            hiddenTerms = hiddenTermsOf(value)
+        }
+        companionHooks.jellyfinSignedIn = { jellyfinSignedIn }
+        companionHooks.channels = { channels }
+        companionHooks.refresh = {
+            profiles = profileStore.profiles()
+            pinSet = store.hasPin()
+            favorites = userState.favorites()
+            hiddenTerms = hiddenTermsOf(userState.hiddenFilters() ?: settings.hiddenFilters)
+        }
+        companionHooks.openLink = { companionLink = it }
+        companionHooks.showToast = showToast
+    }
+    DisposableEffect(lifecycle, companionServer) {
+        val server = companionServer
+        if (server == null) {
+            onDispose { }
+        } else {
+            val observer = LifecycleEventObserver { _, event ->
+                when (event) {
+                    Lifecycle.Event.ON_START -> server.start()
+                    Lifecycle.Event.ON_STOP -> server.stop()
+                    else -> Unit
+                }
+            }
+            // Adding the observer tells it the app has already started, which starts the server.
+            if (lifecycle == null) server.start() else lifecycle.addObserver(observer)
+            onDispose {
+                lifecycle?.removeObserver(observer)
+                server.release()
+            }
+        }
+    }
+    // The pairing code closes by itself when its two minutes are up.
+    val pairingOffer by pairing.offer.collectAsState()
+    LaunchedEffect(pairingOffer) {
+        val offer = pairingOffer ?: return@LaunchedEffect
+        while (true) {
+            val left = offer.expiresAt - System.currentTimeMillis()
+            if (left <= 0) {
+                pairing.expireIfDue()
+                break
+            }
+            delay(left)
+        }
+    }
+    val pairedPhonesFlow = remember(companionPrefs) { companionPrefs?.pairedPhones ?: MutableStateFlow(emptyList<PairedPhone>()) }
+    val pairedPhones by pairedPhonesFlow.collectAsState()
 
     val nav = NavActions(
         select = { tab -> go(tab.toScreen()) },
@@ -963,16 +1133,19 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
     }
 
     // ------------------------------------------------------------ Overlays
+    // A phone asking to pair shows its code over whatever is showing. It waits while the PIN pad or the
+    // profile picker is up, and the update offer and reminders make way for it.
+    val pairingShown = pairingOffer?.takeIf { pinPurpose == PinPurpose.NONE && !showProfiles }
     // A new build is offered over whatever is showing. It waits while the PIN pad or the profile picker is up.
-    val updateShown = updatePrompt?.takeIf { pinPurpose == PinPurpose.NONE && !showProfiles }
+    val updateShown = updatePrompt?.takeIf { pinPurpose == PinPurpose.NONE && !showProfiles && pairingShown == null }
     // A reminder shows over the live picture, Home and the guide. It waits while the PIN pad or the
     // update offer is up, and does not take the remote from a movie, search typing or Settings.
     val reminderShown = dueReminder?.takeIf {
-        pinPurpose == PinPurpose.NONE && !showProfiles && updateShown == null &&
+        pinPurpose == PinPurpose.NONE && !showProfiles && updateShown == null && pairingShown == null &&
             screen in setOf(Screen.Live, Screen.Home, Screen.Guide)
     }
     // Live TV takes focus back when these close, so the next key press works.
-    val overlayOpen = pinPurpose != PinPurpose.NONE || reminderShown != null || updateShown != null
+    val overlayOpen = pinPurpose != PinPurpose.NONE || reminderShown != null || updateShown != null || pairingShown != null
 
     // The other screens get focus back too. When an overlay closes and nothing on the screen has
     // focus, the item that had it before is focused again, or the screen's first item.
@@ -1226,46 +1399,22 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
                     hiddenFilters = hiddenTerms.joinToString(","),
                     onHiddenFilters = { value ->
                         userState.setHiddenFilters(value)
-                        hiddenTerms = value.split(',').map { it.trim().uppercase() }.filter { it.isNotEmpty() }
+                        hiddenTerms = hiddenTermsOf(value)
                     },
                     guideRefreshing = guideRefreshing,
                     onRefreshGuide = { refreshGuide() },
-                    onJellyfinSave = { updated ->
-                        // Only the Jellyfin fields come from the pane. The rest is taken from what is saved
-                        // now, so a live login saved a moment earlier from the same form is kept.
-                        val merged = settings.copy(
-                            jellyfinServer = updated.jellyfinServer,
-                            jellyfinToken = updated.jellyfinToken,
-                            jellyfinUserId = updated.jellyfinUserId
-                        )
-                        if (merged.jellyfinToken.isBlank()) {
-                            store.clearProfileJellyfin(profileId)
-                            jfOverride = null
-                            if (profileId == ProfileStore.DEFAULT_ID) {
-                                store.save(merged)
-                                settings = merged
-                            }
-                        } else if (profileId == ProfileStore.DEFAULT_ID) {
-                            store.clearProfileJellyfin(profileId)
-                            jfOverride = null
-                            store.save(merged)
-                            settings = merged
-                        } else {
-                            if (settings.jellyfinServer != merged.jellyfinServer) {
-                                val serverOnly = settings.copy(jellyfinServer = merged.jellyfinServer)
-                                store.save(serverOnly)
-                                settings = serverOnly
-                            }
-                            store.saveProfileJellyfin(profileId, merged.jellyfinToken, merged.jellyfinUserId)
-                            jfOverride = merged.jellyfinToken to merged.jellyfinUserId
-                        }
-                    },
+                    onJellyfinSave = { saveJellyfin(it) },
                     onBackupExportJson = { backupStore.backupJson() },
                     onBackupRestoreJson = { json -> backupStore.restoreBackup(json) },
                     onBackupExport = { uri -> backupStore.writeBackup(uri) },
                     onBackupRestore = { uri -> backupStore.restoreBackup(uri) },
                     vodCategories = vodCategories,
-                    jellyfinSignedIn = jellyfinSignedIn
+                    jellyfinSignedIn = jellyfinSignedIn,
+                    pairedPhones = if (isTv) pairedPhones else null,
+                    onRemovePhone = { fingerprint ->
+                        companionPrefs?.removePaired(fingerprint)
+                        companionServer?.closeConnections(fingerprint)
+                    }
                 )
             }
         }
@@ -1376,6 +1525,10 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
                 },
                 modifier = Modifier.zIndex(5f)
             )
+        }
+
+        pairingShown?.let { offer ->
+            PairingPrompt(offer = offer, onCancel = { pairing.cancel() }, modifier = Modifier.zIndex(6f))
         }
 
         reminderShown?.let { reminder ->
