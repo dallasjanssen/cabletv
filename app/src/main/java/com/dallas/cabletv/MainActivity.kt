@@ -11,26 +11,45 @@ import androidx.compose.runtime.setValue
 import com.dallas.cabletv.data.CHANNEL_LINK_SCHEME
 import com.dallas.cabletv.data.CrashLog
 import com.dallas.cabletv.data.SettingsStore
+import com.dallas.cabletv.data.companion.isTelevision
 import com.dallas.cabletv.ui.CableApp
 import com.dallas.cabletv.ui.TvTheme
+import com.dallas.cabletv.ui.companion.CompanionApp
 
 class MainActivity : ComponentActivity() {
     /** A cabletv:// link waiting for the channel list, such as one sent by Home Assistant. */
     private var link by mutableStateOf<String?>(null)
 
+    /**
+     * True when the Cable TV app is showing. A TV always shows it. A phone shows the companion
+     * (My TVs) unless it was opened by a cabletv: link or the person chose Watch on this phone.
+     */
+    private var showCable by mutableStateOf(true)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         CrashLog.install(this)
-        // A cable box never sleeps while you are watching.
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-
         // Rebuilding the screen, for example after a restore, does not play the opening link again.
         if (savedInstanceState == null) link = channelLink(intent)
+        val phone = !isTelevision(this)
+        showCable = when {
+            !phone -> true
+            savedInstanceState != null -> savedInstanceState.getBoolean(STATE_SHOW_CABLE, false)
+            else -> link != null
+        }
+        keepAwakeWhileWatching()
 
         val store = SettingsStore(this)
         setContent {
             TvTheme {
-                CableApp(store, link = link, onLinkHandled = { link = null })
+                if (showCable) {
+                    CableApp(store, link = link, onLinkHandled = { link = null })
+                } else {
+                    CompanionApp(onWatchOnPhone = {
+                        showCable = true
+                        keepAwakeWhileWatching()
+                    })
+                }
             }
         }
     }
@@ -38,7 +57,25 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        channelLink(intent)?.let { link = it }
+        channelLink(intent)?.let {
+            link = it
+            showCable = true
+            keepAwakeWhileWatching()
+        }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putBoolean(STATE_SHOW_CABLE, showCable)
+    }
+
+    /** A cable box never sleeps while you are watching. The companion screens let the phone sleep. */
+    private fun keepAwakeWhileWatching() {
+        if (showCable) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
     }
 
     /** The link in [intent], or null when it is not one of ours or was reopened from recent apps. */
@@ -46,5 +83,9 @@ class MainActivity : ComponentActivity() {
         if (intent?.action != Intent.ACTION_VIEW) return null
         if (intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY != 0) return null
         return intent.dataString?.takeIf { it.startsWith("$CHANNEL_LINK_SCHEME:", ignoreCase = true) }
+    }
+
+    private companion object {
+        const val STATE_SHOW_CABLE = "show_cable"
     }
 }

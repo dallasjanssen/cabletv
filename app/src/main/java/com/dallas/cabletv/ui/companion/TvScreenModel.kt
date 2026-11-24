@@ -1,0 +1,272 @@
+package com.dallas.cabletv.ui.companion
+
+import com.dallas.cabletv.data.atvremote.AtvRemoteException
+import com.dallas.cabletv.data.companion.client.AtvController
+import com.dallas.cabletv.data.companion.client.AtvPairingFlow
+import com.dallas.cabletv.data.companion.client.CompanionException
+import com.dallas.cabletv.data.companion.client.CompanionRequests
+import com.dallas.cabletv.data.companion.client.Favorite
+import com.dallas.cabletv.data.companion.client.KeyRoute
+import com.dallas.cabletv.data.companion.client.PairedTv
+import com.dallas.cabletv.data.companion.client.PinCancelledException
+import com.dallas.cabletv.data.companion.client.RemoteKey
+import com.dallas.cabletv.data.companion.client.SavedReply
+import com.dallas.cabletv.data.companion.client.SessionStatus
+import com.dallas.cabletv.data.companion.client.TvSession
+import com.dallas.cabletv.data.companion.client.TvSettings
+import com.dallas.cabletv.data.companion.client.routeKey
+import com.dallas.cabletv.data.companion.client.withPin
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
+import org.json.JSONObject
+
+/** Settings as the Settings tab sees them. */
+sealed interface SettingsLoad {
+    data object Idle : SettingsLoad
+    data object Loading : SettingsLoad
+    data class Loaded(val settings: TvSettings) : SettingsLoad
+    data class Failed(val message: String) : SettingsLoad
+}
+
+/** What one section's Save button last did. */
+data class SectionResult(val busy: Boolean = false, val messages: List<String> = emptyList(), val error: String? = null)
+
+/** The dialog for pairing the Android TV remote (power and volume). */
+sealed interface AtvPairUi {
+    data object Connecting : AtvPairUi
+    data class EnterCode(val error: String? = null, val busy: Boolean = false) : AtvPairUi
+    data class Failed(val message: String) : AtvPairUi
+}
+
+/**
+ * Everything one TV's screen needs while it is open: the connection to the TV, the Android TV
+ * remote, favorites, settings and the remote's key presses. [start] opens the connections and
+ * [stop] closes them when the screen goes away.
+ */
+class TvScreenModel(private val tvId: String, private val app: CompanionModel) {
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val initial: PairedTv = app.store.find(tvId) ?: error("Unknown TV")
+
+    private val session = TvSession(initial, app.connector, app.phoneName, app.appBuild, scope)
+    private val atv = AtvController(scope) { app.store.setAtvPaired(tvId, false) }
+
+    val status: StateFlow<SessionStatus> = session.status
+    val state = session.state
+    val atvState = atv.state
+
+    private val _favorites = MutableStateFlow<List<Favorite>?>(null)
+    val favorites: StateFlow<List<Favorite>?> = _favorites
+
+    private val _message = MutableStateFlow<String?>(null)
+
+    /** The last problem with a key press or a channel, until the next one works. */
+    val message: StateFlow<String?> = _message
+
+    private val _atvPairUi = MutableStateFlow<AtvPairUi?>(null)
+    val atvPairUi: StateFlow<AtvPairUi?> = _atvPairUi
+    private var atvPairing: AtvPairingFlow? = null
+    private var atvPairJob: Job? = null
+
+    private val _settings = MutableStateFlow<SettingsLoad>(SettingsLoad.Idle)
+    val settings: StateFlow<SettingsLoad> = _settings
+    private val _sections = MutableStateFlow<Map<String, SectionResult>>(emptyMap())
+    val sections: StateFlow<Map<String, SectionResult>> = _sections
+
+    /** The TV as stored now, which has the newest address and the Android TV remote flag. */
+    private fun tvNow(): PairedTv = app.store.find(tvId) ?: initial
+
+    fun start() {
+        session.start()
+        scope.launch {
+            status.collect { s ->
+                if (s is SessionStatus.Online) {
+                    loadFavorites()
+                    _message.value = null
+                }
+            }
+        }
+        scope.launch {
+            // Connect the Android TV remote while the person has set it up for this TV.
+            app.tvs.collect { list ->
+                val tv = list.firstOrNull { it.id == tvId } ?: return@collect
+                if (tv.atvPaired) atv.start(tv.host) else atv.stop()
+            }
+        }
+    }
+
+    fun stop() {
+        atvPairing?.close()
+        session.stop()
+        atv.stop()
+        scope.cancel()
+    }
+
+    // Remote
+
+    /** Sends a key by the route the spec gives: the Android TV remote when connected, else the app. */
+    fun press(key: RemoteKey) {
+        when (val route = routeKey(key, atvState.value.connected)) {
+            is KeyRoute.Atv -> atv.sendKey(route.code)
+            is KeyRoute.Cable -> call { session.request(CompanionRequests.key(route.name)) }
+            KeyRoute.Unavailable -> Unit
+        }
+    }
+
+    /** Opens a favorite channel. Through the app when it is open, otherwise through the Android TV remote. */
+    fun openChannel(favorite: Favorite) {
+        val link = CompanionRequests.channelLink(favorite.id)
+        if (status.value is SessionStatus.Online) {
+            call { session.request(CompanionRequests.open(link)) }
+        } else if (atvState.value.connected) {
+            atv.openLink(link)
+        }
+    }
+
+    /** Starts Cable TV on the TV through the Android TV remote. */
+    fun openCableTv() {
+        atv.openLink(CompanionRequests.LIVE_LINK)
+    }
+
+    private fun call(block: suspend () -> Any?) {
+        scope.launch {
+            try {
+                block()
+                _message.value = null
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _message.value = app.errorText(e)
+            }
+        }
+    }
+
+    private fun loadFavorites() {
+        scope.launch {
+            try {
+                _favorites.value = Favorite.listFrom(session.request(CompanionRequests.getFavorites()))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // The list stays as it was. Pressing a favorite shows the problem if it matters.
+            }
+        }
+    }
+
+    // Android TV remote pairing
+
+    fun startAtvPairing() {
+        atvPairJob?.cancel()
+        atvPairing?.close()
+        val flow = AtvPairingFlow(tvNow().host)
+        atvPairing = flow
+        _atvPairUi.value = AtvPairUi.Connecting
+        atvPairJob = scope.launch {
+            try {
+                flow.start(app.phoneName)
+                _atvPairUi.value = AtvPairUi.EnterCode()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                flow.close()
+                _atvPairUi.value = AtvPairUi.Failed(atvPairText(e))
+            }
+        }
+    }
+
+    fun submitAtvCode(code: String) {
+        val flow = atvPairing ?: return
+        _atvPairUi.value = AtvPairUi.EnterCode(busy = true)
+        atvPairJob = scope.launch {
+            try {
+                flow.finish(code)
+                app.store.setAtvPaired(tvId, true)
+                _atvPairUi.value = null
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: AtvRemoteException) {
+                if (e.reason == AtvRemoteException.Reason.BAD_CODE) {
+                    _atvPairUi.value = AtvPairUi.EnterCode(error = atvPairText(e))
+                } else {
+                    flow.close()
+                    _atvPairUi.value = AtvPairUi.Failed(atvPairText(e))
+                }
+            } catch (e: Exception) {
+                flow.close()
+                _atvPairUi.value = AtvPairUi.Failed(atvPairText(e))
+            }
+        }
+    }
+
+    fun cancelAtvPairing() {
+        atvPairJob?.cancel()
+        atvPairing?.close()
+        atvPairing = null
+        _atvPairUi.value = null
+    }
+
+    private fun atvPairText(e: Exception): String {
+        val name = tvNow().name
+        return when ((e as? AtvRemoteException)?.reason) {
+            AtvRemoteException.Reason.BAD_CODE -> "That code did not match. Check the TV and try again."
+            AtvRemoteException.Reason.UNREACHABLE -> "Can't reach $name. Is the TV on?"
+            else -> "Pairing the TV's remote did not finish. Try again."
+        }
+    }
+
+    // Settings
+
+    fun loadSettings() {
+        if (_settings.value == SettingsLoad.Loading) return
+        _settings.value = SettingsLoad.Loading
+        scope.launch {
+            _settings.value = try {
+                val reply = withPin(tvId, app.pins, { app.askPin(tvNow().name, it) }) { pin ->
+                    session.request(CompanionRequests.getSettings(pin))
+                }
+                val json = reply.optJSONObject("settings") ?: throw CompanionException(
+                    CompanionException.Kind.PROTOCOL, "The TV sent no settings."
+                )
+                SettingsLoad.Loaded(TvSettings.fromJson(json))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: PinCancelledException) {
+                SettingsLoad.Failed("Settings need the TV's PIN.")
+            } catch (e: Exception) {
+                SettingsLoad.Failed(app.errorText(e).orEmpty())
+            }
+        }
+    }
+
+    /** Saves one section. [change] is the `settings` object from SettingsChanges. */
+    fun save(section: String, change: JSONObject) {
+        setSection(section, SectionResult(busy = true))
+        scope.launch {
+            try {
+                val reply = withPin(tvId, app.pins, { app.askPin(tvNow().name, it) }) { pin ->
+                    session.request(CompanionRequests.putSettings(pin, change))
+                }
+                val saved = SavedReply.fromJson(reply)
+                saved.settings?.let { _settings.value = SettingsLoad.Loaded(it) }
+                val messages = saved.messages.ifEmpty { listOf("Saved.") }
+                setSection(section, SectionResult(messages = messages))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: PinCancelledException) {
+                setSection(section, SectionResult(error = "Nothing was saved. The TV needs its PIN."))
+            } catch (e: Exception) {
+                setSection(section, SectionResult(error = app.errorText(e)))
+            }
+        }
+    }
+
+    private fun setSection(section: String, result: SectionResult) {
+        _sections.value = _sections.value + (section to result)
+    }
+}
