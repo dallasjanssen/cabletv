@@ -186,7 +186,7 @@ The connection is encrypted. Pairing ties the phone and the TV to each other's c
 - Channels with no listings in the XMLTV feed fall back to the provider's now and next listing.
 - A playlist can name its guide with `url-tvg`. A provider that gives you a separate EPG address goes in Settings, Live TV, Guide URL. Refresh guide, on the Guide screen and in Settings, Live TV, downloads those listings again. The app also downloads them about once an hour. The listings are kept on the device, so after the app has been closed the guide shows them straight away; when they are less than an hour old the app waits before downloading again. A gzip file is read as well as plain XML. Xtream, a playlist and a Stalker portal can all be saved at once. The guide matches a channel by its id, the same id the playlist calls `tvg-id`, ignoring case and punctuation. When that id has nothing on now, the channel name is tried against the guide's display name, and an Xtream login also uses the provider's now and next.
 - Recordings can be stopped from the notification and from Settings, Recordings. The phone sign-in code expires after 10 minutes and locks after 10 wrong codes. Press New code to get another.
-- Recordings are one at a time. A future recording starts only while the app is still open. Pausing live TV only reaches what the player has already buffered, about three minutes.
+- Recordings are one at a time. A future recording starts only while the app is still open. Pausing live TV only reaches what the player has already buffered: up to three minutes, and less on TVs with little memory.
 - Two channels at once uses two provider connections. A login that allows one stream will refuse one of them.
 
 ## Credits

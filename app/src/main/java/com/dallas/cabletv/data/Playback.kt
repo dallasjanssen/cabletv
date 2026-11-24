@@ -12,6 +12,7 @@ import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.HttpDataSource
 import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.drm.DrmSessionManagerProvider
 import androidx.media3.exoplayer.hls.HlsMediaSource
@@ -25,8 +26,26 @@ import androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory
 import okhttp3.OkHttpClient
 import java.util.concurrent.TimeUnit
 
-/** How far back a live channel can be paused or rewound from what is already buffered. */
+/** The most a live channel can be paused or rewound from what is already buffered. */
 const val LIVE_BUFFER_MS = 3 * 60_000
+
+/** The shortest rewind kept, even on a device with little memory. */
+private const val MIN_REWIND_MS = 45_000
+
+/** A busy HD channel, about 8 Mbps, used to turn a memory budget into seconds of rewind. */
+private const val HD_BYTES_PER_SECOND = 1_000_000L
+
+/**
+ * How much rewind this device can hold. The player keeps its buffer in the app's memory, and the
+ * rewind buffer is limited by time, not size, so three minutes of HD could use most of a TV box's
+ * memory and cause stutters or a crash. A quarter of the app's memory is set aside for it, which
+ * keeps the full three minutes on roomy devices and about a minute on tight ones.
+ */
+private fun rewindBufferMs(): Int {
+    val budgetBytes = Runtime.getRuntime().maxMemory() / 4
+    val ms = budgetBytes * 1000 / HD_BYTES_PER_SECOND
+    return ms.coerceIn(MIN_REWIND_MS.toLong(), LIVE_BUFFER_MS.toLong()).toInt()
+}
 
 /**
  * One OkHttp client for every player, so tiles and the main picture share connections.
@@ -133,7 +152,7 @@ fun newPlayer(context: Context, compact: Boolean = false): ExoPlayer {
         // The first 15 seconds still load past the cap, so the rewind buffer can never stall playback.
         DefaultLoadControl.Builder()
             .setBufferDurationsMs(15_000, LIVE_BUFFER_MS, 1_500, 5_000)
-            .setBackBuffer(LIVE_BUFFER_MS, true)
+            .setBackBuffer(rewindBufferMs(), true)
             .setTargetBufferBytes(64 * 1024 * 1024)
             .setPrioritizeTimeOverSizeThresholds(true)
             .build()
@@ -142,8 +161,10 @@ fun newPlayer(context: Context, compact: Boolean = false): ExoPlayer {
         .setUsage(C.USAGE_MEDIA)
         .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
         .build()
+    // If the preferred hardware decoder fails to start, try the next one instead of failing the channel.
+    val renderers = DefaultRenderersFactory(context).setEnableDecoderFallback(true)
     fun build(loadControl: DefaultLoadControl): ExoPlayer =
-        ExoPlayer.Builder(context)
+        ExoPlayer.Builder(context, renderers)
             .setLoadControl(loadControl)
             .setMediaSourceFactory(sources)
             .setAudioAttributes(audio, !compact)
