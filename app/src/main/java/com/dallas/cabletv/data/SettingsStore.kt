@@ -127,6 +127,14 @@ class SettingsStore(context: Context) {
         prefs.edit().putString(K_PIN, "$saltHex:${hash(saltHex, pin)}").apply()
     }
 
+    /** The stored PIN as salt and hash text, or empty when there is no PIN. For syncing the lock to another TV. */
+    fun pinRecord(): String = prefs.getString(K_PIN, null).orEmpty()
+
+    /** Stores a PIN record taken from another TV as it is, so the PIN never travels as typed. Empty removes the lock. */
+    fun setPinRecord(record: String) {
+        if (record.isEmpty()) prefs.edit().remove(K_PIN).apply() else prefs.edit().putString(K_PIN, record).apply()
+    }
+
     /** True when the PIN matches the stored one. Always false when no PIN is set. */
     fun checkPin(pin: String): Boolean {
         val stored = prefs.getString(K_PIN, null) ?: return false
