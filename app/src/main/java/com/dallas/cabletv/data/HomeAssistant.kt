@@ -12,6 +12,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
 import java.time.Instant
@@ -91,12 +92,48 @@ const val HA_PLAYING = "playing"
 const val HA_PAUSED = "paused"
 const val HA_IDLE = "idle"
 
+/** What a webhook message is about, in its "event" field. */
+const val HA_EVENT_NOW_PLAYING = "now_playing"
+const val HA_EVENT_FAVORITES = "favorites"
+
+/** A favorite channel as Home Assistant lists it. [number] is zero when the channel has none. */
+data class FavoriteChannel(val name: String, val number: Int)
+
+/**
+ * The favorites to send: the channels in [channels] whose id is in [favoriteIds], so hidden channels
+ * stay out. Names are what Home Assistant tunes by, so a name that appears twice is sent once.
+ * Sorted by channel number, with unnumbered channels last, then by name.
+ */
+fun favoriteChannels(channels: List<LiveChannel>, favoriteIds: Set<String>): List<FavoriteChannel> =
+    channels.asSequence()
+        .filter { it.id in favoriteIds && it.name.isNotBlank() }
+        .map { FavoriteChannel(it.name.trim(), it.number.coerceAtLeast(0)) }
+        .distinctBy { it.name.lowercase() }
+        .sortedWith(compareBy<FavoriteChannel>({ it.number <= 0 }, { it.number }, { it.name.lowercase() }))
+        .toList()
+
+/** The favorites message. Home Assistant keeps one list per TV and combines them. */
+fun favoritesJson(device: String, favorites: List<FavoriteChannel>): String {
+    val list = JSONArray()
+    favorites.forEach { f ->
+        val item = JSONObject().put("name", f.name)
+        if (f.number > 0) item.put("number", f.number)
+        list.put(item)
+    }
+    return JSONObject()
+        .put("event", HA_EVENT_FAVORITES)
+        .put("device", device)
+        .put("favorites", list)
+        .toString()
+}
+
 /**
  * The message sent to the Home Assistant webhook. Fields with nothing to say are left out, and
  * times are UTC in ISO 8601, which Home Assistant reads with as_datetime.
  */
 fun nowPlayingJson(device: String, state: String, info: NowPlayingInfo?): String {
     val json = JSONObject()
+    json.put("event", HA_EVENT_NOW_PLAYING)
     json.put("device", device)
     json.put("state", state)
     if (info != null && state != HA_IDLE) {
@@ -135,10 +172,11 @@ fun tvDeviceName(context: Context): String =
         ?: Build.MODEL.orEmpty().ifBlank { "Android TV" }
 
 /**
- * Tells a Home Assistant webhook what is playing. Live TV and movies each report as their own
- * [owner], so one going quiet does not hide the other. Changes are sent after a short pause, so
- * flipping through channels sends only the one you stop on, and nothing is sent twice in a row.
- * Going idle is sent straight away, because the app may be closing. Only used on the main thread.
+ * Tells a Home Assistant webhook what is playing, and which channels are favorites. Live TV and
+ * movies each report as their own [owner], so one going quiet does not hide the other. Changes are
+ * sent after a short pause, so flipping through channels sends only the one you stop on, and
+ * nothing is sent twice in a row. Going idle is sent straight away, because the app may be closing.
+ * Only used on the main thread.
  */
 object HomeAssistantReporter {
     private const val SETTLE_MS = 1_500L
@@ -150,13 +188,22 @@ object HomeAssistantReporter {
         .build()
     private val handler = Handler(Looper.getMainLooper())
 
+    /** One kind of message, with its own wait and its own memory of what was last sent. */
+    private class Outbox {
+        var lastSent: String? = null
+        var pending: Runnable? = null
+    }
+
+    private val nowPlayingBox = Outbox()
+    private val favoritesBox = Outbox()
+
     private var url = ""
     private var device = ""
     private var owner: String? = null
     private var state = HA_IDLE
     private var info: NowPlayingInfo? = null
-    private var lastSent: String? = null
-    private var pending: Runnable? = null
+    /** Null until the channel list has loaded, so an empty list is never sent by mistake. */
+    private var favorites: List<FavoriteChannel>? = null
 
     private fun currentBody(): String = nowPlayingJson(device, state, info)
 
@@ -164,9 +211,11 @@ object HomeAssistantReporter {
         if (webhookUrl == url && deviceName == device) return
         url = webhookUrl
         device = deviceName
-        // A new address gets the current state, even if the old one already had it.
-        lastSent = null
-        schedule(currentBody(), SETTLE_MS)
+        // A new address gets the current state and favorites, even if the old one already had them.
+        nowPlayingBox.lastSent = null
+        favoritesBox.lastSent = null
+        schedule(nowPlayingBox, currentBody(), SETTLE_MS)
+        favorites?.let { schedule(favoritesBox, favoritesJson(device, it), SETTLE_MS) }
     }
 
     /** What [who] is showing now. */
@@ -174,7 +223,7 @@ object HomeAssistantReporter {
         owner = who
         state = newState
         info = newInfo
-        schedule(currentBody(), SETTLE_MS)
+        schedule(nowPlayingBox, currentBody(), SETTLE_MS)
     }
 
     /** [who] stopped showing anything. Ignored when the other one has taken over since. */
@@ -188,37 +237,43 @@ object HomeAssistantReporter {
         owner = null
         state = HA_IDLE
         info = null
-        schedule(currentBody(), 0L)
+        schedule(nowPlayingBox, currentBody(), 0L)
+    }
+
+    /** The favorite channels on this TV. Sent at start and whenever they change. */
+    fun reportFavorites(list: List<FavoriteChannel>) {
+        favorites = list
+        schedule(favoritesBox, favoritesJson(device, list), SETTLE_MS)
     }
 
     /**
-     * Sends what is on screen now to [webhookUrl] and waits for the answer. For the test button, so
-     * call it off the main thread. Home Assistant answers 200 even for a webhook id it does not
-     * know, so this shows that it is reachable, not that an automation is listening.
+     * Sends [body] to [webhookUrl] and waits for the answer. For the test button, so call it off the
+     * main thread. Home Assistant answers 200 even for a webhook id it does not know, so this shows
+     * that it is reachable, not that an automation is listening.
      */
     fun sendNow(webhookUrl: String, body: String): Result<Int> = runCatching {
         http.newCall(request(webhookUrl, body)).execute().use { it.code }
     }
 
-    /** The message [sendNow] should send: what is on screen now. Read it on the main thread. */
-    fun snapshot(): String = currentBody()
+    /** The messages the test button sends: what is on screen now, then the favorites. Read on the main thread. */
+    fun snapshot(): List<String> = listOfNotNull(currentBody(), favorites?.let { favoritesJson(device, it) })
 
-    private fun schedule(body: String, delayMs: Long) {
-        pending?.let(handler::removeCallbacks)
-        pending = null
-        if (url.isBlank() || body == lastSent) return
+    private fun schedule(box: Outbox, body: String, delayMs: Long) {
+        box.pending?.let(handler::removeCallbacks)
+        box.pending = null
+        if (url.isBlank() || body == box.lastSent) return
         val task = Runnable {
-            pending = null
-            send(body)
+            box.pending = null
+            send(box, body)
         }
-        pending = task
+        box.pending = task
         if (delayMs <= 0L) task.run() else handler.postDelayed(task, delayMs)
     }
 
-    private fun send(body: String) {
+    private fun send(box: Outbox, body: String) {
         val target = url
         if (target.isBlank()) return
-        lastSent = body
+        box.lastSent = body
         val call = runCatching { http.newCall(request(target, body)) }.getOrElse {
             // A malformed address. Nothing more is tried until it changes.
             return
@@ -226,7 +281,7 @@ object HomeAssistantReporter {
         call.enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
                 // Home Assistant was not reachable. The next report tries again.
-                handler.post { if (lastSent == body) lastSent = null }
+                handler.post { if (box.lastSent == body) box.lastSent = null }
             }
 
             override fun onResponse(call: Call, response: Response) {

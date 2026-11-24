@@ -118,12 +118,19 @@ Make a webhook in Home Assistant, then paste its URL in Settings, Home Assistant
 The TV sends a JSON message when the channel, show or pause state changes, and when it leaves the screen:
 
 ```json
-{"device": "Living Room TV", "state": "playing", "kind": "live", "title": "SportsCenter",
+{"event": "now_playing", "device": "Living Room TV", "state": "playing", "kind": "live", "title": "SportsCenter",
  "channel": "ESPN", "channel_number": 206, "channel_id": "1234",
  "start": "2026-11-24T18:00:00Z", "end": "2026-11-24T19:00:00Z", "image": "http://..."}
 ```
 
-`state` is `playing`, `paused` or `idle`. `kind` is `live`, `replay`, `movie` or `episode`. Movies and episodes send `series`, `season`, `episode` and `year` instead of the channel fields. `device` is the TV's name from its own settings, under About, Device name. Fields with nothing to say are left out, and `idle` sends only `device` and `state`.
+`state` is `playing`, `paused` or `idle`. `kind` is `live`, `replay`, `movie` or `episode`. Movies and episodes send `series`, `season`, `episode` and `year` instead of the channel fields. `device` is the TV's name from its own settings, under About, Device name. Fields with nothing to say are left out, and `idle` sends only `event`, `device` and `state`.
+
+Once the channels load, and whenever a favorite changes, the TV also sends its favorites: those of every profile on that TV, leaving out hidden channels, sorted by channel number. Home Assistant can keep one list per TV and combine them.
+
+```json
+{"event": "favorites", "device": "Living Room TV",
+ "favorites": [{"name": "NBC", "number": 12}, {"name": "ESPN", "number": 206}]}
+```
 
 This sensor, in `configuration.yaml`, keeps the latest message for one TV:
 

@@ -50,6 +50,7 @@ import com.dallas.cabletv.data.HA_PAUSED
 import com.dallas.cabletv.data.HA_PLAYING
 import com.dallas.cabletv.data.HomeAssistantReporter
 import com.dallas.cabletv.data.describeChannelLink
+import com.dallas.cabletv.data.favoriteChannels
 import com.dallas.cabletv.data.findLinkedChannel
 import com.dallas.cabletv.data.liveNowPlaying
 import com.dallas.cabletv.data.normalizeWebhookUrl
@@ -542,6 +543,15 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
     }
     LaunchedEffect(settings.homeAssistantWebhook) {
         HomeAssistantReporter.configure(settings.homeAssistantWebhook, tvDeviceName(context))
+    }
+    // Home Assistant lists the favorites of every profile on this TV, and combines them with the
+    // other TVs' favorites. Sent once the channels load and again whenever a favorite changes.
+    LaunchedEffect(channels, favorites, profiles, channelsLoading) {
+        if (channelsLoading || channels.isEmpty()) return@LaunchedEffect
+        val ids = withContext(Dispatchers.IO) {
+            profiles.flatMap { p -> runCatching { UserStateStore(context, p.id).favorites() }.getOrDefault(emptySet()) }.toSet()
+        }
+        HomeAssistantReporter.reportFavorites(favoriteChannels(channels, ids))
     }
 
     fun startReplay(ch: LiveChannel, program: Program) {
