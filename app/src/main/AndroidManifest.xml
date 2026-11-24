@@ -38,14 +38,23 @@
             android:exported="false"
             android:foregroundServiceType="mediaPlayback" />
 
+        <!-- One copy only, so a link that arrives while the app is open changes the channel in it. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTask"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
                 <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+            <!-- cabletv://channel/12 and the like, opened by Home Assistant, adb or another app. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="cabletv" />
             </intent-filter>
         </activity>
 

@@ -3,6 +3,7 @@ package com.dallas.cabletv.ui
 import android.app.Activity
 import android.content.Intent
 import android.net.Uri
+import android.os.SystemClock
 import android.provider.Settings as AndroidSettings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -11,6 +12,7 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -28,6 +30,7 @@ import androidx.compose.ui.focus.focusRestorer
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.style.TextOverflow
@@ -39,9 +42,19 @@ import androidx.lifecycle.LifecycleEventObserver
 import com.dallas.cabletv.BuildConfig
 import com.dallas.cabletv.data.AppUpdater
 import com.dallas.cabletv.data.BackupStore
+import com.dallas.cabletv.data.ChannelLink
 import com.dallas.cabletv.data.ChannelSource
 import com.dallas.cabletv.data.CrashLog
 import com.dallas.cabletv.data.EpgCache
+import com.dallas.cabletv.data.HA_PAUSED
+import com.dallas.cabletv.data.HA_PLAYING
+import com.dallas.cabletv.data.HomeAssistantReporter
+import com.dallas.cabletv.data.describeChannelLink
+import com.dallas.cabletv.data.findLinkedChannel
+import com.dallas.cabletv.data.liveNowPlaying
+import com.dallas.cabletv.data.normalizeWebhookUrl
+import com.dallas.cabletv.data.parseChannelLink
+import com.dallas.cabletv.data.tvDeviceName
 import com.dallas.cabletv.data.epgAddresses
 import com.dallas.cabletv.data.friendlyError
 import com.dallas.cabletv.data.guideCacheKey
@@ -79,6 +92,12 @@ import kotlin.math.roundToInt
 /** How often the guide is downloaded again while the app is open. */
 private const val GUIDE_REFRESH_MS = 60 * 60 * 1000L
 
+/** Opening the app looks for a new build at most this often. */
+private const val UPDATE_RECHECK_MS = 60 * 60 * 1000L
+
+/** How often what is playing is told to Android and Home Assistant again, so a new show is picked up. */
+private const val NOW_PLAYING_REFRESH_MS = 20_000L
+
 enum class Screen { Live, Home, Guide, OnDemand, Search, Settings, Welcome, Multi }
 
 /** Which PIN pad, if any, is on screen. */
@@ -95,9 +114,13 @@ private fun Tab.toScreen(): Screen = when (this) {
     Tab.Settings -> Screen.Settings
 }
 
+/**
+ * The whole app. [link] is a cabletv:// link waiting to be acted on, such as one sent by Home
+ * Assistant. It is held until the channel list has loaded, then [onLinkHandled] clears it.
+ */
 @OptIn(ExperimentalComposeUiApi::class)
 @Composable
-fun CableApp(store: SettingsStore) {
+fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Unit = {}) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var settings by remember { mutableStateOf(store.load()) }
@@ -339,6 +362,10 @@ fun CableApp(store: SettingsStore) {
     // ------------------------------------------------------------ Live player
     val live = remember { LivePlayer(context) }
     DisposableEffect(Unit) { onDispose { live.release() } }
+    // Tells Google Home, the Google TV Now Playing panel and the Assistant what is on. Released
+    // before the player, because effects are disposed in reverse order.
+    val nowPlaying = remember { NowPlayingSession(context, "live", live.exo) }
+    DisposableEffect(Unit) { onDispose { nowPlaying.release() } }
     DisposableEffect(lifecycle) {
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
@@ -346,6 +373,9 @@ fun CableApp(store: SettingsStore) {
                 Lifecycle.Event.ON_STOP -> {
                     foreground = false
                     live.stop()
+                    // Screens do not redraw while the app is off screen, so this is done here and not in an effect.
+                    nowPlaying.show(null)
+                    HomeAssistantReporter.clearAll()
                 }
                 else -> Unit
             }
@@ -355,6 +385,8 @@ fun CableApp(store: SettingsStore) {
     }
     var replayUrl by remember { mutableStateOf<String?>(null) }
     var replayChannelId by remember { mutableStateOf<String?>(null) }
+    // The show being replayed, so Google Home and Home Assistant name it. Only read while a replay plays.
+    var replayProgram by remember { mutableStateOf<Program?>(null) }
     // A replay belongs to its channel. If the list moves to another channel, the replay is dropped.
     val replay = replayUrl?.takeIf { replayChannelId == current?.id }
     var previewBounds by remember { mutableStateOf<Rect?>(null) }
@@ -484,6 +516,34 @@ fun CableApp(store: SettingsStore) {
         if (ch == null || ch.id == now) showToast("No previous channel") else tuneTo(ch)
     }
 
+    // ------------------------------------------------------------ Now playing
+    // Google Home, the Google TV Now Playing panel and Home Assistant hear about the channel while it
+    // plays, behind Home and in the guide too. Next and previous on a phone or the Assistant change channel.
+    SideEffect {
+        nowPlaying.onNext = { stepChannel(1) }
+        nowPlaying.onPrevious = { stepChannel(-1) }
+    }
+    val showingLive = liveActive && foreground && playUrl != null && current != null
+    LaunchedEffect(showingLive, current?.id, replay, live.playing) {
+        val ch = current
+        if (!showingLive || ch == null) {
+            nowPlaying.show(null)
+            HomeAssistantReporter.clear("live")
+            return@LaunchedEffect
+        }
+        val replayed = replayProgram.takeIf { replay != null }
+        // Again every so often, so the next show is picked up when it starts.
+        while (true) {
+            val info = liveNowPlaying(ch, guide.peekNow(ch), replayed)
+            nowPlaying.show(info)
+            HomeAssistantReporter.report("live", if (live.playing) HA_PLAYING else HA_PAUSED, info)
+            delay(NOW_PLAYING_REFRESH_MS)
+        }
+    }
+    LaunchedEffect(settings.homeAssistantWebhook) {
+        HomeAssistantReporter.configure(settings.homeAssistantWebhook, tvDeviceName(context))
+    }
+
     fun startReplay(ch: LiveChannel, program: Program) {
         if (!ch.catchup || ch.origin == "stalker") {
             showToast("${program.title} is not available to replay")
@@ -497,6 +557,7 @@ fun CableApp(store: SettingsStore) {
             if (current?.id != ch.id) tuneTo(ch)
             replayUrl = url
             replayChannelId = ch.id
+            replayProgram = program
             open(Screen.Live)
             showToast("Playing ${program.title} from the start")
         }
@@ -517,6 +578,7 @@ fun CableApp(store: SettingsStore) {
                 currentId == ch.id -> {
                     replayUrl = url
                     replayChannelId = ch.id
+                    replayProgram = program
                     showToast("Playing ${program.title} from the start")
                 }
             }
@@ -650,8 +712,11 @@ fun CableApp(store: SettingsStore) {
     var update by remember { mutableStateOf<AppUpdater.Release?>(null) }
     var updateMessage by remember { mutableStateOf<String?>(null) }
     var updateBusy by remember { mutableStateOf(false) }
+    // A build found when the app opened, offered on screen until Install or Later.
+    var updatePrompt by remember { mutableStateOf<AppUpdater.Release?>(null) }
 
-    // Asks GitHub for a newer build. A manual check always reports back, an automatic one stays quiet.
+    // Asks GitHub for a newer build. A manual check always reports back. An automatic one stays
+    // quiet unless it finds a build, which it offers on screen.
     fun checkForUpdate(manual: Boolean) {
         // A debug build is signed with another key, so Android would refuse a release over it.
         if (BuildConfig.DEBUG) {
@@ -665,7 +730,7 @@ fun CableApp(store: SettingsStore) {
             result
                 .onSuccess { found ->
                     update = found
-                    if (found != null && !manual) showToast("Build ${found.versionCode} is ready. Install it from Settings, Updates.")
+                    if (found != null && !manual) updatePrompt = found
                     updateMessage = when {
                         found != null -> null
                         manual -> "You have the latest build."
@@ -677,7 +742,8 @@ fun CableApp(store: SettingsStore) {
     }
 
     // Downloads the build and opens the system installer. Android asks the person to confirm.
-    fun installUpdate(release: AppUpdater.Release) {
+    // [onOpened] runs once the installer is on screen.
+    fun installUpdate(release: AppUpdater.Release, onOpened: () -> Unit = {}) {
         if (!context.packageManager.canRequestPackageInstalls()) {
             updateMessage = try {
                 context.startActivity(
@@ -699,6 +765,7 @@ fun CableApp(store: SettingsStore) {
                 .onSuccess { apk ->
                     updateMessage = null
                     runCatching { AppUpdater.install(context, apk) }
+                        .onSuccess { onOpened() }
                         .onFailure { updateMessage = it.message ?: "The installer did not open." }
                 }
                 .onFailure { updateMessage = "The download did not finish. ${friendlyError(it)}" }
@@ -739,7 +806,22 @@ fun CableApp(store: SettingsStore) {
         }
     }
 
-    LaunchedEffect(Unit) { checkForUpdate(manual = false) }
+    // Each time the app comes on screen, at most once an hour, it looks for a new build. The first
+    // check runs at launch, because the observer is told the app has already started.
+    var updateCheckedAt by remember { mutableLongStateOf(0L) }
+    DisposableEffect(lifecycle) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_START) {
+                val now = SystemClock.elapsedRealtime()
+                if (updateCheckedAt == 0L || now - updateCheckedAt >= UPDATE_RECHECK_MS) {
+                    updateCheckedAt = now
+                    checkForUpdate(manual = false)
+                }
+            }
+        }
+        if (lifecycle == null) checkForUpdate(manual = false) else lifecycle.addObserver(observer)
+        onDispose { lifecycle?.removeObserver(observer) }
+    }
 
     // ------------------------------------------------------------ Parental lock
     var settingsUnlocked by remember { mutableStateOf(false) }
@@ -791,6 +873,35 @@ fun CableApp(store: SettingsStore) {
     }
     open = ::go
 
+    // ------------------------------------------------------------ Links
+    // A cabletv:// link from Home Assistant or another app. It waits for the channel list, then tunes
+    // the same way the guide does, so a locked channel still asks for the PIN.
+    LaunchedEffect(link, loadedChannels, channelsLoading, channelError, settings.hasLiveSource) {
+        val text = link ?: return@LaunchedEffect
+        val request = parseChannelLink(text)
+        if (request == null || !settings.hasLiveSource) {
+            onLinkHandled()
+            return@LaunchedEffect
+        }
+        if (request == ChannelLink.Live) {
+            go(Screen.Live)
+            onLinkHandled()
+            return@LaunchedEffect
+        }
+        if (channelsLoading || (loadedChannels.isEmpty() && channelError == null)) return@LaunchedEffect
+        val ch = findLinkedChannel(channels, request)
+        when {
+            // The list did not load. Live TV shows why, with Try again.
+            loadedChannels.isEmpty() -> go(Screen.Live)
+            ch == null -> showToast("${describeChannelLink(request)} is not in your channel list")
+            else -> {
+                tuneTo(ch)
+                go(Screen.Live)
+            }
+        }
+        onLinkHandled()
+    }
+
     val nav = NavActions(
         select = { tab -> go(tab.toScreen()) },
         back = {
@@ -826,6 +937,7 @@ fun CableApp(store: SettingsStore) {
                     .onSuccess { s = it }
                     .onFailure { problems += "Jellyfin: ${it.message ?: "sign in failed"}." }
             }
+            fields["ha"]?.takeIf { it.isNotBlank() }?.let { s = s.copy(homeAssistantWebhook = normalizeWebhookUrl(it)) }
             welcomeBusy = false
             if (s != settings) {
                 store.save(s)
@@ -841,13 +953,16 @@ fun CableApp(store: SettingsStore) {
     }
 
     // ------------------------------------------------------------ Overlays
-    // A reminder shows over the live picture, Home and the guide. It waits while the PIN pad is up,
-    // and does not take the remote from a movie, search typing or Settings.
+    // A new build is offered over whatever is showing. It waits while the PIN pad or the profile picker is up.
+    val updateShown = updatePrompt?.takeIf { pinPurpose == PinPurpose.NONE && !showProfiles }
+    // A reminder shows over the live picture, Home and the guide. It waits while the PIN pad or the
+    // update offer is up, and does not take the remote from a movie, search typing or Settings.
     val reminderShown = dueReminder?.takeIf {
-        pinPurpose == PinPurpose.NONE && !showProfiles && screen in setOf(Screen.Live, Screen.Home, Screen.Guide)
+        pinPurpose == PinPurpose.NONE && !showProfiles && updateShown == null &&
+            screen in setOf(Screen.Live, Screen.Home, Screen.Guide)
     }
     // Live TV takes focus back when these close, so the next key press works.
-    val overlayOpen = pinPurpose != PinPurpose.NONE || reminderShown != null
+    val overlayOpen = pinPurpose != PinPurpose.NONE || reminderShown != null || updateShown != null
 
     // The other screens get focus back too. When an overlay closes and nothing on the screen has
     // focus, the item that had it before is focused again, or the screen's first item.
@@ -1239,6 +1354,20 @@ fun CableApp(store: SettingsStore) {
             }
         }
 
+        updateShown?.let { release ->
+            UpdatePrompt(
+                release = release,
+                message = updateMessage,
+                busy = updateBusy,
+                onInstall = { installUpdate(release) { updatePrompt = null } },
+                onLater = {
+                    updatePrompt = null
+                    updateMessage = null
+                },
+                modifier = Modifier.zIndex(5f)
+            )
+        }
+
         reminderShown?.let { reminder ->
             ReminderPopup(
                 reminder = reminder,
@@ -1313,6 +1442,72 @@ private fun ReminderPopup(reminder: Reminder, onWatch: () -> Unit, onDismiss: ()
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             PillButton("Watch", onWatch, modifier = Modifier.focusRequester(watch))
             PillButton("Dismiss", { dismiss() })
+        }
+    }
+}
+
+/**
+ * A new build was found when the app opened. Install now downloads it and opens Android's
+ * installer, which asks to confirm. Later and Back put it away until the app is opened again
+ * an hour or more from now. Settings, Updates still has it.
+ */
+@Composable
+private fun UpdatePrompt(
+    release: AppUpdater.Release,
+    message: String?,
+    busy: Boolean,
+    onInstall: () -> Unit,
+    onLater: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val later by rememberUpdatedState(onLater)
+    val install = remember { FocusRequester() }
+    BackHandler { later() }
+    LaunchedEffect(Unit) {
+        withFrameNanos { }
+        runCatching { install.requestFocus() }
+    }
+    // Taps are handled without making the backdrop or the card focusable, so the remote only
+    // ever lands on the two buttons. A tap outside the card means Later.
+    Box(
+        modifier
+            .fillMaxSize()
+            .background(Color(0x99000000))
+            .pointerInput(Unit) { detectTapGestures { later() } },
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            Modifier
+                .trapFocus()
+                .padding(16.dp)
+                .widthIn(max = 460.dp)
+                .clip(RoundedCornerShape(16.dp))
+                .background(Tv.Surface3)
+                .pointerInput(Unit) { detectTapGestures { } }
+                .padding(22.dp)
+        ) {
+            Text("A new version is ready", style = TvType.Title)
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "Build ${release.versionCode} is available. You have build ${BuildConfig.VERSION_CODE}. Android asks you to confirm before it installs.",
+                style = TvType.Small,
+                color = Tv.Ink2
+            )
+            if (message != null) {
+                Spacer(Modifier.height(10.dp))
+                Text(message, style = TvType.SmallStrong, color = Tv.Ink2)
+            }
+            Spacer(Modifier.height(16.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                PillButton(
+                    if (busy) "Downloading" else "Install now",
+                    onInstall,
+                    modifier = Modifier.focusRequester(install),
+                    icon = TvIcons.Download,
+                    enabled = !busy
+                )
+                PillButton("Later", { later() })
+            }
         }
     }
 }

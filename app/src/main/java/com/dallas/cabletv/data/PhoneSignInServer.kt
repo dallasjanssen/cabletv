@@ -369,6 +369,9 @@ class PhoneSignInServer(
           <label>Locked groups and categories (comma separated)<input name="locked" autocapitalize="off" autocorrect="off" value="${value("locked")}"></label>
           <input type="hidden" name="strip" value="0">
           <label><input type="checkbox" name="strip" value="1" ${if (strip) "checked" else ""}>Show channel names without country prefixes</label>
+          <h2>Home Assistant (optional)</h2>
+          <p>The URL of an automation's Webhook trigger. The TV sends it what is playing. Leave it empty to turn this off.</p>
+          <label>Webhook URL<input name="ha" autocapitalize="off" autocorrect="off" placeholder="http://homeassistant.local:8123/api/webhook/..." value="${value("ha")}"></label>
           <button type="submit">Send to TV</button>
         </form>
         $backupSection

@@ -47,6 +47,9 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import coil.compose.AsyncImage
+import com.dallas.cabletv.data.HA_PAUSED
+import com.dallas.cabletv.data.HA_PLAYING
+import com.dallas.cabletv.data.HomeAssistantReporter
 import com.dallas.cabletv.data.JellyfinClient
 import com.dallas.cabletv.data.Settings
 import com.dallas.cabletv.data.UserStateStore
@@ -54,6 +57,7 @@ import com.dallas.cabletv.data.VodItem
 import com.dallas.cabletv.data.XtreamClient
 import com.dallas.cabletv.data.TrackMemory
 import com.dallas.cabletv.data.newPlayer
+import com.dallas.cabletv.data.vodNowPlaying
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -643,6 +647,9 @@ private fun VodPlayer(
     var controls by remember { mutableStateOf(true) }
     var tracks by remember { mutableStateOf(false) }
     var playingNow by remember { mutableStateOf(true) }
+    // Playing or paused as the viewer chose, which stays steady while the stream buffers.
+    var wantsPlay by remember { mutableStateOf(true) }
+    var visible by remember { mutableStateOf(lifecycle?.currentState?.isAtLeast(Lifecycle.State.STARTED) != false) }
     var position by remember { mutableLongStateOf(0L) }
     var duration by remember { mutableLongStateOf(0L) }
     var lastKey by remember { mutableLongStateOf(System.currentTimeMillis()) }
@@ -675,6 +682,10 @@ private fun VodPlayer(
                 playingNow = isPlaying
             }
 
+            override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+                wantsPlay = playWhenReady
+            }
+
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (playbackState == Player.STATE_ENDED) {
                     val next = latestNext
@@ -701,6 +712,29 @@ private fun VodPlayer(
         }
     }
 
+    // Google Home, the Google TV Now Playing panel and Home Assistant hear about the title while it
+    // is on screen. Released before the player, because effects are disposed in reverse order.
+    val nowPlaying = remember { NowPlayingSession(context, "vod", player).apply { seekable = true } }
+    DisposableEffect(nowPlaying) {
+        onDispose {
+            nowPlaying.release()
+            HomeAssistantReporter.clear("vod")
+        }
+    }
+    SideEffect {
+        nowPlaying.onNext = latestNext?.let { next -> { latestOnNext(next) } }
+    }
+    val info = remember(item) { vodNowPlaying(item) }
+    LaunchedEffect(visible, failed, wantsPlay) {
+        if (!visible || failed) {
+            nowPlaying.show(null)
+            HomeAssistantReporter.clear("vod")
+            return@LaunchedEffect
+        }
+        nowPlaying.show(info)
+        HomeAssistantReporter.report("vod", if (wantsPlay) HA_PLAYING else HA_PAUSED, info)
+    }
+
     // Leaving the app (Home on the remote) pauses, saves the place and reports it. Coming back
     // shows the controls and stays paused. A pending next episode waits for the viewer instead.
     DisposableEffect(lifecycle) {
@@ -708,6 +742,9 @@ private fun VodPlayer(
             when (event) {
                 Lifecycle.Event.ON_STOP -> {
                     player.pause()
+                    // Off screen, nothing may start it again. Screens do not redraw now, so this is not left to an effect.
+                    visible = false
+                    nowPlaying.show(null)
                     pendingNext = null
                     savePosition()
                     jellyfin?.let { c ->
@@ -716,6 +753,7 @@ private fun VodPlayer(
                     }
                 }
                 Lifecycle.Event.ON_START -> {
+                    visible = true
                     controls = true
                     lastKey = System.currentTimeMillis()
                 }

@@ -42,6 +42,11 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.dallas.cabletv.BuildConfig
 import com.dallas.cabletv.data.AppUpdater
+import com.dallas.cabletv.data.HomeAssistantReporter
+import com.dallas.cabletv.data.friendlyError
+import com.dallas.cabletv.data.isWebhookUrl
+import com.dallas.cabletv.data.normalizeWebhookUrl
+import com.dallas.cabletv.data.tvDeviceName
 import com.dallas.cabletv.data.JellyfinClient
 import com.dallas.cabletv.data.epgAddresses
 import com.dallas.cabletv.data.LiveChannel
@@ -74,6 +79,7 @@ enum class SettingsPane(val label: String, val icon: ImageVector) {
     Profiles("Profiles", TvIcons.People),
     Lock("Parental lock", TvIcons.Lock),
     Recordings("Recordings", TvIcons.Download),
+    HomeAssistant("Home Assistant", TvIcons.Home),
     Backup("Backup & restore", TvIcons.Download),
     Updates("Updates", TvIcons.Download)
 }
@@ -175,12 +181,14 @@ private class Drafts(s: Settings) {
     var js by mutableStateOf(s.jellyfinServer)
     var ju by mutableStateOf("")
     var jp by mutableStateOf("")
+    var ha by mutableStateOf(s.homeAssistantWebhook)
 
-    /** True when a Live TV or Jellyfin field holds something that was not saved. */
+    /** True when a Live TV, Jellyfin or Home Assistant field holds something that was not saved. */
     fun unsaved(s: Settings): Boolean =
         xs.trim() != s.xtreamServer || xu.trim() != s.xtreamUser || xp.trim() != s.xtreamPass ||
             m3u.trim() != s.m3uUrl || epg.trim() != s.epgUrl || su.trim() != s.stalkerUrl || sm.trim() != s.stalkerMac ||
-            js.trim() != s.jellyfinServer || ju.isNotBlank() || jp.isNotEmpty()
+            js.trim() != s.jellyfinServer || ju.isNotBlank() || jp.isNotEmpty() ||
+            normalizeWebhookUrl(ha) != s.homeAssistantWebhook
 }
 
 /**
@@ -334,7 +342,8 @@ fun SettingsScreen(
         fields["jp"]?.takeIf { it.isNotEmpty() }?.let { drafts.jp = it }
         val live = listOf("xs", "xu", "xp", "m3u", "su", "sm", "epg").any { !fields[it].isNullOrBlank() }
         val library = !fields["js"].isNullOrBlank() && !fields["ju"].isNullOrBlank()
-        val hasCustom = fields.containsKey("hidden") || fields.containsKey("locked") || fields.containsKey("strip")
+        val hasCustom = fields.containsKey("hidden") || fields.containsKey("locked") || fields.containsKey("strip") ||
+            fields.containsKey("ha")
         val results = mutableListOf<String>()
         fun report(r: String) {
             results += r
@@ -353,11 +362,18 @@ fun SettingsScreen(
                 val hidden = fields["hidden"]?.trim()
                 val locked = fields["locked"]?.trim()
                 val strip = fields["strip"]?.let(::phoneBool)
+                var webhook = fields["ha"]?.let(::normalizeWebhookUrl)
+                if (webhook != null && !isWebhookUrl(webhook)) {
+                    report("The Home Assistant webhook URL needs to start with http:// or https://, so it was not saved.")
+                    webhook = null
+                }
                 if (hidden != null) onHiddenFilters(hidden)
                 val merged = current.copy(
                     stripPrefixes = strip ?: current.stripPrefixes,
-                    lockedFilters = locked ?: current.lockedFilters
+                    lockedFilters = locked ?: current.lockedFilters,
+                    homeAssistantWebhook = webhook ?: current.homeAssistantWebhook
                 )
+                if (webhook != null) drafts.ha = webhook
                 if (merged != current) {
                     onSave(merged)
                     current = merged
@@ -427,7 +443,8 @@ fun SettingsScreen(
         "js" to latest.jellyfinServer,
         "hidden" to hiddenFilters,
         "locked" to latest.lockedFilters,
-        "strip" to if (latest.stripPrefixes) "1" else "0"
+        "strip" to if (latest.stripPrefixes) "1" else "0",
+        "ha" to latest.homeAssistantWebhook
     )
 
     val listRequesters = remember { SettingsPane.entries.associateWith { FocusRequester() } }
@@ -465,6 +482,7 @@ fun SettingsScreen(
                 SettingsPane.Profiles -> ProfilesPane(profiles, activeProfileId, onSwitchProfile, onAddProfile, onRemoveProfile, showToast)
                 SettingsPane.Lock -> LockPane(pinSet, onSetPin, onRemovePin, settings, allChannels, vodCategories, onSave)
                 SettingsPane.Recordings -> RecordingsPane(listRequesters.getValue(SettingsPane.Recordings))
+                SettingsPane.HomeAssistant -> HomeAssistantPane(settings, drafts, onSave)
                 SettingsPane.Backup -> BackupPane(
                     busy = backupBusy,
                     message = backupMessage,
@@ -931,6 +949,108 @@ private fun RecordingsPane(fallbackFocus: FocusRequester) {
                 }, modifier = if (i == 0) Modifier.focusRequester(firstDelete) else Modifier)
             }
         }
+    }
+}
+
+/**
+ * Where this TV tells Home Assistant what is playing, and the links Home Assistant can open.
+ * The webhook URL is easier to paste from the phone setup page than to type with a remote.
+ */
+@Composable
+private fun HomeAssistantPane(settings: Settings, drafts: Drafts, onSave: (Settings) -> Unit) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val device = remember { tvDeviceName(context) }
+    var message by remember { mutableStateOf<String?>(null) }
+    var busy by remember { mutableStateOf(false) }
+    val connected = settings.homeAssistantWebhook.isNotBlank()
+
+    // The typed address with http:// added when it has no scheme, or null after saying what is wrong.
+    fun typedUrl(): String? {
+        val url = normalizeWebhookUrl(drafts.ha)
+        if (!isWebhookUrl(url)) {
+            message = "The webhook URL needs to start with http:// or https://."
+            return null
+        }
+        return url
+    }
+
+    fun save() {
+        val url = typedUrl() ?: return
+        drafts.ha = url
+        onSave(settings.copy(homeAssistantWebhook = url))
+        message = if (url.isEmpty()) "Saved. Home Assistant is no longer told what is playing." else "Saved."
+    }
+
+    fun sendTest() {
+        val url = typedUrl() ?: return
+        if (url.isEmpty()) {
+            message = "Enter the webhook URL first."
+            return
+        }
+        val body = HomeAssistantReporter.snapshot()
+        busy = true
+        message = "Sending"
+        scope.launch {
+            val result = withContext(Dispatchers.IO) { HomeAssistantReporter.sendNow(url, body) }
+            busy = false
+            message = result.fold(
+                onSuccess = { code ->
+                    if (code in 200..299) "Sent, and Home Assistant answered. Check that your automation ran."
+                    else "Home Assistant answered with error $code. Check the address."
+                },
+                onFailure = { "Home Assistant did not answer. ${friendlyError(it)}" }
+            )
+        }
+    }
+
+    PaneTitle(
+        "Home Assistant",
+        "Home Assistant can see what is playing on this TV and turn on a channel. Paste the URL of an automation's Webhook trigger here, or send it from the phone setup page."
+    )
+    StatusChip(if (connected) "Telling Home Assistant what is playing" else "Not set up", ok = connected)
+    Spacer(Modifier.height(12.dp))
+    SettingsField("Webhook URL", drafts.ha, placeholder = "http://homeassistant.local:8123/api/webhook/...") { drafts.ha = it }
+    Spacer(Modifier.height(14.dp))
+    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        PillButton("Save", { save() }, icon = TvIcons.Check)
+        PillButton(if (busy) "Sending" else "Send test", { sendTest() }, enabled = !busy)
+    }
+    Message(message)
+
+    SectionLabel("This TV", Modifier.padding(top = 22.dp, bottom = 6.dp))
+    Text(
+        "Reports itself as \"$device\". The name comes from the TV's own settings, under About, Device name.",
+        style = TvType.Small,
+        color = Tv.Ink2,
+        modifier = Modifier.widthIn(max = 560.dp)
+    )
+
+    SectionLabel("Channel links", Modifier.padding(top = 22.dp, bottom = 6.dp))
+    Text(
+        "Home Assistant opens these with the Android TV Remote integration. They start the app if it is closed.",
+        style = TvType.Small,
+        color = Tv.Ink2,
+        modifier = Modifier.widthIn(max = 560.dp)
+    )
+    Spacer(Modifier.height(8.dp))
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        LinkExample("cabletv://channel/12", "Channel number 12")
+        LinkExample("cabletv://channel/ESPN", "The channel named ESPN")
+        LinkExample("cabletv://live", "Live TV on the last channel")
+    }
+}
+
+@Composable
+private fun LinkExample(link: String, meaning: String) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            link,
+            style = TvType.SmallStrong.copy(fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace),
+            modifier = Modifier.width(250.dp),
+            maxLines = 1
+        )
+        Text(meaning, style = TvType.Small, color = Tv.Ink2)
     }
 }
 

@@ -18,7 +18,7 @@ The screens are laid out for Android TV's 960 by 540 grid, with one typeface (Fi
 - **Movies & Shows**: provider categories and Jellyfin genres, plus continue and recently added. A title opens a details page with the plot and year when the provider sends them. The next episode waits ten seconds and can be cancelled. Each profile can have its own Jellyfin login, so continue watching is not shared.
 - **Search**: an on-screen keyboard with results beside it, for channels, shows on now or later, movies and series. Accents and punctuation are ignored, so "tele" finds "Télé". A row of symbol keys sits under the letters.
 - **Two channels**: two pictures side by side. Left and right pick a picture, and only that one plays sound. Up and down change its channel. Locked channels are skipped.
-- **Settings**: phone setup, live TV (including a Guide URL and subscription expiry), Jellyfin, channel list, profiles, parental lock, recordings, backup and restore, and updates. The phone setup page can edit live/library logins, channel customizations, and download or upload a backup file. Hidden channels belong to the profile. Locked groups need the PIN before they play; movie and show categories can be locked too. After five wrong PINs, the PIN pad waits 30 seconds. Each section saves by itself, and leaving with unsaved typing says so. A running recording can be stopped in Recordings.
+- **Settings**: phone setup, live TV (including a Guide URL and subscription expiry), Jellyfin, channel list, profiles, parental lock, recordings, Home Assistant, backup and restore, and updates. The phone setup page can edit live/library logins, channel customizations, the Home Assistant webhook, and download or upload a backup file. Hidden channels belong to the profile. Locked groups need the PIN before they play; movie and show categories can be locked too. After five wrong PINs, the PIN pad waits 30 seconds. Each section saves by itself, and leaving with unsaved typing says so. A running recording can be stopped in Recordings.
 - **First launch**: with nothing set up, the app opens on a QR code. Focus starts on New code.
 
 ## Remote and keyboard controls
@@ -45,6 +45,8 @@ The screens are laid out for Android TV's 960 by 540 grid, with one typeface (Fi
 3. Phone: pick your phone at the top and press Run.
 4. Android TV: build the APK with **Build > Build Bundle(s) / APK(s) > Build APK(s)**. The file is at `app/build/outputs/apk/debug/app-debug.apk`.
 
+When the app opens and a newer build is out, it offers it on screen with Install now and Later. Later puts it away until the app is opened again an hour or more later. The app looks at most once an hour, and Settings, Updates can always check by hand.
+
 In-app updates only work with the release build: the `cabletv-release-apk` artifact from the CI run, or the APK attached to a GitHub release. A debug build is signed with a different key, so Android will not install a release update over it. Use the debug build for development.
 
 ### Installing on the TV
@@ -61,11 +63,107 @@ adb install -r app-debug.apk
 
 Replace the IP with your TV's address. Accept the debugging prompt on the TV the first time.
 
+## Google Home and Home Assistant
+
+### What is playing
+
+The app tells Android what is on screen: the channel, the show from the guide, and the channel logo, or the movie or episode with its poster. Google Home, the Google TV Now Playing panel and "Hey Google, pause" can see it and pause it. Next and previous change channel. It stops as soon as the app leaves the screen, so nothing can start playing in the background.
+
+### Turning on a channel
+
+The app opens these links, and starts if it is closed:
+
+| Link | Opens |
+| --- | --- |
+| `cabletv://channel/12` | Channel number 12 |
+| `cabletv://channel/ESPN` | The channel named ESPN. Case, accents and punctuation are ignored, and "ESPN" finds "ESPN HD" before "ESPN2" |
+| `cabletv://channel?name=ESPN`, `?number=12`, `?id=1234` | The same, written as a query. In a query, write a plus sign as `%2B` |
+| `cabletv://live` | Live TV on the last channel |
+
+A locked channel still asks for the PIN. A channel that is hidden or not in the list shows a message instead.
+
+From Home Assistant, use the Android TV Remote integration for the Google TV box. This script turns the TV on and changes the channel:
+
+```yaml
+alias: Watch channel
+mode: restart
+fields:
+  tv:
+    name: TV
+    required: true
+    selector:
+      entity:
+        filter:
+          - domain: remote
+            integration: androidtv_remote
+  channel:
+    name: Channel number or name
+    required: true
+    selector:
+      text:
+sequence:
+  - action: remote.turn_on
+    target:
+      entity_id: "{{ tv }}"
+  - delay:
+      seconds: 2
+  - action: remote.turn_on
+    target:
+      entity_id: "{{ tv }}"
+    data:
+      activity: "cabletv://channel/{{ channel | urlencode }}"
+```
+
+From a computer: `adb shell am start -a android.intent.action.VIEW -d "cabletv://channel/12"`
+
+### Telling Home Assistant what is playing
+
+Make a webhook in Home Assistant, then paste its URL in Settings, Home Assistant on the TV, or in the phone setup page. Send test checks that Home Assistant answers. Give each TV its own webhook ID.
+
+The TV sends a JSON message when the channel, show or pause state changes, and when it leaves the screen:
+
+```json
+{"device": "Living Room TV", "state": "playing", "kind": "live", "title": "SportsCenter",
+ "channel": "ESPN", "channel_number": 206, "channel_id": "1234",
+ "start": "2026-11-24T18:00:00Z", "end": "2026-11-24T19:00:00Z", "image": "http://..."}
+```
+
+`state` is `playing`, `paused` or `idle`. `kind` is `live`, `replay`, `movie` or `episode`. Movies and episodes send `series`, `season`, `episode` and `year` instead of the channel fields. `device` is the TV's name from its own settings, under About, Device name. Fields with nothing to say are left out, and `idle` sends only `device` and `state`.
+
+This sensor, in `configuration.yaml`, keeps the latest message for one TV:
+
+```yaml
+template:
+  - triggers:
+      - trigger: webhook
+        webhook_id: cable-tv-living-room
+        allowed_methods:
+          - POST
+        local_only: true
+    sensor:
+      - name: Living Room Cable TV
+        unique_id: cable_tv_living_room
+        icon: mdi:television-classic
+        state: "{{ trigger.json.state }}"
+        attributes:
+          kind: "{{ trigger.json.kind | default(none) }}"
+          title: "{{ trigger.json.title | default(none) }}"
+          channel: "{{ trigger.json.channel | default(none) }}"
+          channel_number: "{{ trigger.json.channel_number | default(none) }}"
+          series: "{{ trigger.json.series | default(none) }}"
+          start: "{{ trigger.json.start | default(none) }}"
+          end: "{{ trigger.json.end | default(none) }}"
+          image: "{{ trigger.json.image | default(none) }}"
+```
+
+The TV's webhook URL is then `http://<home assistant address>:8123/api/webhook/cable-tv-living-room`.
+
 ## Security notes
 
 - Credentials are stored with AES-256 encryption through Android's EncryptedSharedPreferences.
 - The Jellyfin password is used once to sign in and is not stored. The app keeps the access token only.
 - Nothing secret belongs in source files. Do not commit real credentials to a repository.
+- The Home Assistant webhook URL is stored with the other settings. Anyone with it can write to that webhook, so treat it like a password. A webhook with `local_only: true` only accepts messages from your home network.
 
 ## Known limits (v1)
 
