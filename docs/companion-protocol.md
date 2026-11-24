@@ -8,12 +8,12 @@ is written down here. When the code and this document disagree, fix one of them.
 
 | Part | Where | What it does |
 | --- | --- | --- |
-| Shared core | `data/companion/CompanionProtocol.kt`, `data/companion/CompanionIdentity.kt` | Constants, message framing, the pairing proof, keystore identities and TLS contexts. Used by both sides. |
+| Shared core | `data/companion/CompanionProtocol.kt`, `data/companion/CompanionIdentity.kt`, `data/companion/CompanionDevice.kt` | Constants, message framing, the pairing proof, keystore identities and TLS contexts. Used by both sides. |
 | TV server | `data/companion/server/` plus hooks in `ui/App.kt` and `ui/Settings.kt` | Runs inside the TV app while it is on screen. Answers paired phones: remote keys, channel links, what is playing, settings and sync. |
 | Phone app | `data/companion/client/`, `ui/companion/`, routing in `MainActivity.kt` | What a phone shows: My TVs, pairing, remote, now playing, settings, sync, and Watch on this phone. |
 | Android TV remote | `data/atvremote/` | Talks to the TV's own Android TV Remote Service, the same one Home Assistant uses, for power, volume, Home and opening the app while it is closed. Used by the phone app. |
 
-Phone or TV: the app counts as running on a TV when
+Phone or TV: `isTelevision(context)` in `data/companion/CompanionDevice.kt` decides. It is true when
 `packageManager.hasSystemFeature(PackageManager.FEATURE_LEANBACK)` is true or
 `UiModeManager.currentModeType == Configuration.UI_MODE_TYPE_TELEVISION`. Everything else is a phone.
 
