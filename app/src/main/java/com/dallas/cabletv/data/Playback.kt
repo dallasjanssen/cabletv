@@ -3,16 +3,108 @@ package com.dallas.cabletv.data
 import android.content.Context
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
+import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
-import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.common.util.Util
+import androidx.media3.datasource.DataSource
+import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.HttpDataSource
+import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.drm.DrmSessionManagerProvider
+import androidx.media3.exoplayer.hls.HlsMediaSource
+import androidx.media3.exoplayer.hls.DefaultHlsExtractorFactory
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.source.MediaSource
+import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
+import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy
+import androidx.media3.extractor.DefaultExtractorsFactory
+import androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory
+import okhttp3.OkHttpClient
+import java.util.concurrent.TimeUnit
 
 /** How far back a live channel can be paused or rewound from what is already buffered. */
 const val LIVE_BUFFER_MS = 3 * 60_000
+
+/**
+ * One OkHttp client for every player, so tiles and the main picture share connections.
+ * The other clients in the app are private to their own files, so this one is built fresh.
+ */
+private val playerHttp: OkHttpClient by lazy {
+    OkHttpClient.Builder()
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(15, TimeUnit.SECONDS)
+        .followRedirects(true)
+        .followSslRedirects(true)
+        .retryOnConnectionFailure(true)
+        .build()
+}
+
+/**
+ * Retries a failed segment or playlist load inside the player, a little longer and more often
+ * than the default. Without this a single 404 or timeout reaches onPlayerError, which reloads
+ * the stream and drops the buffer. Errors the default treats as final (bad data, missing file)
+ * stay final, because the delay is only changed when the default would retry.
+ */
+private class LiveLoadErrorPolicy : DefaultLoadErrorHandlingPolicy() {
+    override fun getMinimumLoadableRetryCount(dataType: Int): Int = 8
+
+    override fun getRetryDelayMsFor(loadErrorInfo: LoadErrorHandlingPolicy.LoadErrorInfo): Long {
+        val base = super.getRetryDelayMsFor(loadErrorInfo)
+        if (base == C.TIME_UNSET) return base
+        // A refusal will not change on retry. Failing at once lets the MPEG-TS fallback start quickly.
+        val status = (loadErrorInfo.exception as? HttpDataSource.InvalidResponseCodeException)?.responseCode
+        if (status != null && status in 400..499 && status != 404 && status != 408 && status != 429) return C.TIME_UNSET
+        return minOf(500L * loadErrorInfo.errorCount, 2_000L)
+    }
+}
+
+/** TS flags for IPTV streams that start on a non keyframe or lack access unit delimiters. */
+private const val TS_FLAGS =
+    DefaultTsPayloadReaderFactory.FLAG_ALLOW_NON_IDR_KEYFRAMES or
+        DefaultTsPayloadReaderFactory.FLAG_DETECT_ACCESS_UNITS
+
+/**
+ * DefaultMediaSourceFactory has no setter for the HLS extractor in Media3 1.4.1, so HLS items
+ * get their own HlsMediaSource.Factory with the TS flags above. Everything else goes to [fallback].
+ */
+private class LiveMediaSourceFactory(
+    private val fallback: DefaultMediaSourceFactory,
+    dataSourceFactory: DataSource.Factory,
+    policy: LoadErrorHandlingPolicy,
+) : MediaSource.Factory {
+    // Subtitles must be parsed while extracting, as DefaultMediaSourceFactory does. The text
+    // renderer in this Media3 version refuses raw WebVTT, so without this an HLS stream with
+    // subtitles fails as soon as captions are turned on.
+    @Suppress("DEPRECATION")
+    private val hls = HlsMediaSource.Factory(dataSourceFactory)
+        .setExtractorFactory(DefaultHlsExtractorFactory(TS_FLAGS, true))
+        .experimentalParseSubtitlesDuringExtraction(true)
+        .setLoadErrorHandlingPolicy(policy)
+
+    override fun setDrmSessionManagerProvider(provider: DrmSessionManagerProvider): MediaSource.Factory {
+        fallback.setDrmSessionManagerProvider(provider)
+        hls.setDrmSessionManagerProvider(provider)
+        return this
+    }
+
+    override fun setLoadErrorHandlingPolicy(policy: LoadErrorHandlingPolicy): MediaSource.Factory {
+        fallback.setLoadErrorHandlingPolicy(policy)
+        hls.setLoadErrorHandlingPolicy(policy)
+        return this
+    }
+
+    override fun getSupportedTypes(): IntArray = fallback.supportedTypes
+
+    override fun createMediaSource(mediaItem: MediaItem): MediaSource {
+        val config = mediaItem.localConfiguration
+        val isHls = config != null &&
+            Util.inferContentTypeForUriAndMimeType(config.uri, config.mimeType) == C.CONTENT_TYPE_HLS
+        return if (isHls) hls.createMediaSource(mediaItem) else fallback.createMediaSource(mediaItem)
+    }
+}
 
 /**
  * A player that sends the same client identity the provider API calls use.
@@ -20,12 +112,19 @@ const val LIVE_BUFFER_MS = 3 * 60_000
  * Those two leave audio focus alone, because two players asking for it would pause each other.
  */
 fun newPlayer(context: Context, compact: Boolean = false): ExoPlayer {
-    val http = DefaultHttpDataSource.Factory()
-        .setUserAgent(PLAYER_USER_AGENT)
-        .setAllowCrossProtocolRedirects(true)
+    val okHttp = OkHttpDataSource.Factory(playerHttp).setUserAgent(PLAYER_USER_AGENT)
+    // The default wrapper keeps file and content URIs working next to http.
+    val http = DefaultDataSource.Factory(context, okHttp)
+    val policy = LiveLoadErrorPolicy()
+    val extractors = DefaultExtractorsFactory().setTsExtractorFlags(TS_FLAGS)
+    val sources = LiveMediaSourceFactory(
+        DefaultMediaSourceFactory(http, extractors).setLoadErrorHandlingPolicy(policy),
+        http,
+        policy,
+    )
     val load = if (compact) {
         DefaultLoadControl.Builder()
-            .setBufferDurationsMs(8_000, 15_000, 1_500, 3_000)
+            .setBufferDurationsMs(8_000, 15_000, 1_500, 4_000)
             .setBackBuffer(0, false)
             .setTargetBufferBytes(16 * 1024 * 1024)
             .build()
@@ -33,7 +132,7 @@ fun newPlayer(context: Context, compact: Boolean = false): ExoPlayer {
         // The size cap keeps a high bitrate stream from filling the memory before the time limit.
         // The first 15 seconds still load past the cap, so the rewind buffer can never stall playback.
         DefaultLoadControl.Builder()
-            .setBufferDurationsMs(15_000, LIVE_BUFFER_MS, 1_500, 3_000)
+            .setBufferDurationsMs(15_000, LIVE_BUFFER_MS, 1_500, 5_000)
             .setBackBuffer(LIVE_BUFFER_MS, true)
             .setTargetBufferBytes(64 * 1024 * 1024)
             .setPrioritizeTimeOverSizeThresholds(true)
@@ -46,7 +145,7 @@ fun newPlayer(context: Context, compact: Boolean = false): ExoPlayer {
     fun build(loadControl: DefaultLoadControl): ExoPlayer =
         ExoPlayer.Builder(context)
             .setLoadControl(loadControl)
-            .setMediaSourceFactory(DefaultMediaSourceFactory(http))
+            .setMediaSourceFactory(sources)
             .setAudioAttributes(audio, !compact)
             .setHandleAudioBecomingNoisy(true)
             .build()
@@ -55,7 +154,7 @@ fun newPlayer(context: Context, compact: Boolean = false): ExoPlayer {
     return runCatching { build(load) }.getOrElse { first ->
         // Some devices fail to create codec state under pressure. Retry once with a lighter buffer.
         val fallbackLoad = DefaultLoadControl.Builder()
-            .setBufferDurationsMs(8_000, 20_000, 1_500, 3_000)
+            .setBufferDurationsMs(8_000, 20_000, 1_500, 5_000)
             .setBackBuffer(0, false)
             .setTargetBufferBytes(24 * 1024 * 1024)
             .build()
