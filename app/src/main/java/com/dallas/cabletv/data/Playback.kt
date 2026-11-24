@@ -22,7 +22,6 @@ import androidx.media3.exoplayer.source.MediaSource
 import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
 import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy
 import androidx.media3.extractor.DefaultExtractorsFactory
-import androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory
 import okhttp3.OkHttpClient
 import java.util.concurrent.TimeUnit
 
@@ -80,10 +79,13 @@ private class LiveLoadErrorPolicy : DefaultLoadErrorHandlingPolicy() {
     }
 }
 
-/** TS flags for IPTV streams that start on a non keyframe or lack access unit delimiters. */
-private const val TS_FLAGS =
-    DefaultTsPayloadReaderFactory.FLAG_ALLOW_NON_IDR_KEYFRAMES or
-        DefaultTsPayloadReaderFactory.FLAG_DETECT_ACCESS_UNITS
+/**
+ * TS flags for the video path, kept at the Media3 defaults. Allowing streams to start on a non IDR
+ * keyframe and detecting access units by hand was tried for a faster first picture, but on some
+ * channels the picture froze on its first frame while audio and captions kept playing. Turn these
+ * back on only for a stream that is shown to need them.
+ */
+private const val TS_FLAGS = 0
 
 /**
  * DefaultMediaSourceFactory has no setter for the HLS extractor in Media3 1.4.1, so HLS items
