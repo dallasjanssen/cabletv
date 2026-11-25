@@ -245,12 +245,16 @@ class AppCompanionBackend(
                 if (channels.isEmpty()) error("No channels loaded. Check the live TV login.")
                 val batches = (channelsNeedingModel(channels, doc).size + MODEL_BATCH_SIZE - 1) / MODEL_BATCH_SIZE
                 LineupBuildStatus.setTotal(batches)
-                val updated = runModelPass(channels, doc, System.currentTimeMillis()) { prompt ->
+                val updated = runModelPass(
+                    channels,
+                    doc,
+                    System.currentTimeMillis(),
+                    onBatchDone = { lineupStore.save(it) }
+                ) { prompt ->
                     val answer = openRouterAsk(doc.openRouterKey, doc.openRouterModel, prompt)
                     LineupBuildStatus.advance()
                     answer
                 }
-                lineupStore.save(updated)
                 val placed = updated.assignments.values.count { it.number != null }
                 LineupBuildStatus.finish("Built. $placed channels placed by the model, the rest sit in their genre blocks.")
             } catch (e: Exception) {

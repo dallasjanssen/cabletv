@@ -11,7 +11,7 @@ import java.util.concurrent.TimeUnit
 private const val OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 private val lineupHttp = OkHttpClient.Builder()
-    .readTimeout(120, TimeUnit.SECONDS)
+    .readTimeout(240, TimeUnit.SECONDS)
     .build()
 
 /**

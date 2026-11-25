@@ -279,16 +279,36 @@ class LineupPassTest {
     }
 
     @Test
-    fun failedBatchThrowsSoNothingIsSaved() {
-        val channels = listOf(ch("a", "Newsy Channel"))
+    fun finishedBatchesAreKeptWhenALaterBatchFails() {
+        val channels = (1..61).map { ch("c$it", "Zq$it Unlisted") }
         val doc = withLineupCsv(LineupDoc(), csv, now = 1L)
+        val saved = mutableListOf<LineupDoc>()
         var threw = false
         try {
-            runModelPass(channels, doc, now = 2L) { throw IllegalStateException("network") }
+            runModelPass(channels, doc, now = 2L, retries = 0, backoffMs = 0L, onBatchDone = { saved += it }) { prompt ->
+                if (prompt.contains("c61 | ")) throw IllegalStateException("network")
+                """[{"id":"c1","number":202,"genre":"News","confidence":0.9}]"""
+            }
         } catch (e: IllegalStateException) {
             threw = true
         }
         assertTrue(threw)
+        assertEquals(1, saved.size)
+        assertEquals(202, saved.last().assignments.getValue("c1").number)
+    }
+
+    @Test
+    fun failedRequestIsRetried() {
+        val channels = listOf(ch("a", "Newsy Channel"))
+        val doc = withLineupCsv(LineupDoc(), csv, now = 1L)
+        var calls = 0
+        val out = runModelPass(channels, doc, now = 2L, retries = 2, backoffMs = 0L) {
+            calls++
+            if (calls == 1) throw IllegalStateException("rate limited")
+            """[{"id":"a","number":202,"genre":"News","confidence":0.9}]"""
+        }
+        assertEquals(2, calls)
+        assertEquals(202, out.assignments.getValue("a").number)
     }
 
     @Test

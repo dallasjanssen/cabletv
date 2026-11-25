@@ -1,6 +1,8 @@
 package com.dallas.cabletv.data
 
 import java.text.Normalizer
+import java.util.concurrent.ExecutorCompletionService
+import java.util.concurrent.Executors
 
 /*
  * The DIRECTV-style lineup: the channel numbers the person wants, and how the provider's channels
@@ -294,6 +296,12 @@ fun lineupPrompt(batch: List<LiveChannel>, lineup: List<LineupChannel>): String 
 /** How many channels go to the model in one request. */
 const val MODEL_BATCH_SIZE = 60
 
+/** How many model requests run at the same time during a build. */
+const val MODEL_CONCURRENCY = 4
+
+/** How many times a failed model request is tried again before its batch is given up on. */
+const val MODEL_RETRIES = 2
+
 /**
  * A new lineup from a CSV. The old assignments are dropped, because their numbers came from the old
  * lineup. The person's overrides are kept, so a pick still applies when its number is in the new lineup.
@@ -306,31 +314,112 @@ fun withLineupCsv(doc: LineupDoc, text: String, now: Long): LineupDoc =
         assignments = emptyMap()
     )
 
+/** The result of one batch: its placements when it worked, or the last error when every try failed. */
+private class BatchOutcome(val assignments: List<LineupAssignment>?, val error: Exception?)
+
+/** Asks the model about one batch, retrying a failed request up to [retries] times. Never throws. */
+private fun askBatch(
+    batch: List<LiveChannel>,
+    lineup: List<LineupChannel>,
+    numbers: Set<Int>,
+    retries: Int,
+    backoffMs: Long,
+    ask: (String) -> String
+): BatchOutcome {
+    val names = batch.associate { it.id to it.name }
+    val prompt = lineupPrompt(batch, lineup)
+    var last: Exception? = null
+    for (attempt in 0..retries) {
+        try {
+            val answer = ask(prompt)
+            val placed = parseModelAnswers(answer, names.keys, numbers).map { p ->
+                LineupAssignment(
+                    providerId = p.providerId,
+                    providerName = names.getValue(p.providerId),
+                    number = p.number,
+                    genre = p.genre,
+                    source = "model",
+                    confidence = p.confidence
+                )
+            }
+            return BatchOutcome(placed, null)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            return BatchOutcome(null, e)
+        } catch (e: Exception) {
+            last = e
+            if (attempt < retries && backoffMs > 0) {
+                try {
+                    Thread.sleep(backoffMs * (attempt + 1))
+                } catch (ie: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return BatchOutcome(null, ie)
+                }
+            }
+        }
+    }
+    return BatchOutcome(null, last)
+}
+
 /**
- * Sends the channels that still need a placement to [ask], one batch at a time, and returns the doc
- * with the answers added. A batch that throws stops the pass and nothing is returned, so a failed
- * build never leaves half a lineup behind. Channels the model leaves out are asked about again next time.
+ * Sends the channels that still need a placement to [ask], [MODEL_BATCH_SIZE] at a time with up to
+ * [concurrency] requests in flight, and returns the doc with the answers added.
+ *
+ * Each batch is retried up to [retries] times, waiting [backoffMs] times the attempt number between
+ * tries. Every batch that succeeds is added to the doc and handed to [onBatchDone] straight away, so
+ * finished work is kept even if a later batch fails. When some batches still fail after their retries,
+ * the rest are kept and an IllegalStateException is thrown at the end. Channels the model leaves out
+ * are asked about again next time, so building again only asks about what is still missing.
  */
-fun runModelPass(channels: List<LiveChannel>, doc: LineupDoc, now: Long, ask: (String) -> String): LineupDoc {
+fun runModelPass(
+    channels: List<LiveChannel>,
+    doc: LineupDoc,
+    now: Long,
+    concurrency: Int = MODEL_CONCURRENCY,
+    retries: Int = MODEL_RETRIES,
+    backoffMs: Long = 2_000L,
+    onBatchDone: (LineupDoc) -> Unit = {},
+    ask: (String) -> String
+): LineupDoc {
     val pending = channelsNeedingModel(channels, doc)
     if (pending.isEmpty()) return doc
     val numbers = doc.lineup.map { it.number }.toSet()
-    val assignments = LinkedHashMap(doc.assignments)
-    pending.chunked(MODEL_BATCH_SIZE).forEach { batch ->
-        val names = batch.associate { it.id to it.name }
-        val answer = ask(lineupPrompt(batch, doc.lineup))
-        parseModelAnswers(answer, names.keys, numbers).forEach { p ->
-            assignments[p.providerId] = LineupAssignment(
-                providerId = p.providerId,
-                providerName = names.getValue(p.providerId),
-                number = p.number,
-                genre = p.genre,
-                source = "model",
-                confidence = p.confidence
+    val batches = pending.chunked(MODEL_BATCH_SIZE)
+    val threads = concurrency.coerceAtLeast(1).coerceAtMost(batches.size)
+    val pool = Executors.newFixedThreadPool(threads) { r -> Thread(r, "lineup-model").apply { isDaemon = true } }
+    val completed = ExecutorCompletionService<BatchOutcome>(pool)
+    try {
+        batches.forEach { batch ->
+            completed.submit { askBatch(batch, doc.lineup, numbers, retries, backoffMs, ask) }
+        }
+        var current = doc
+        var failed = 0
+        var firstError: Exception? = null
+        repeat(batches.size) {
+            val outcome = completed.take().get()
+            val placed = outcome.assignments
+            if (placed == null) {
+                failed++
+                if (firstError == null) firstError = outcome.error
+            } else {
+                current = current.copy(
+                    revision = current.revision + 1,
+                    builtAtMs = now,
+                    assignments = LinkedHashMap(current.assignments).apply { placed.forEach { put(it.providerId, it) } }
+                )
+                onBatchDone(current)
+            }
+        }
+        if (failed > 0) {
+            throw IllegalStateException(
+                "$failed of ${batches.size} lineup requests failed (${firstError?.message ?: "unknown error"}). " +
+                    "Finished batches are saved. Build again to retry the rest."
             )
         }
+        return current
+    } finally {
+        pool.shutdownNow()
     }
-    return doc.copy(revision = doc.revision + 1, builtAtMs = now, assignments = assignments)
 }
 
 /**
