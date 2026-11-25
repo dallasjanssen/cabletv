@@ -1,7 +1,10 @@
 package com.dallas.cabletv.data.companion.server
 
+import com.dallas.cabletv.data.LineupDoc
 import com.dallas.cabletv.data.Profile
 import com.dallas.cabletv.data.Settings
+import com.dallas.cabletv.data.lineupFromJson
+import com.dallas.cabletv.data.lineupToJson
 import com.dallas.cabletv.data.companion.CompanionProtocol
 import com.dallas.cabletv.data.companion.CompanionProtocol.Sections
 import org.json.JSONArray
@@ -36,6 +39,12 @@ interface SyncTarget {
 
     /** Sets the stored PIN from salt and hash text. Empty removes the PIN. */
     fun setPinRecord(record: String)
+
+    /** The saved channel lineup, including its OpenRouter key. Empty when none is saved. */
+    fun lineup(): LineupDoc
+
+    /** Replaces the saved channel lineup, and the channels reload. */
+    fun setLineup(doc: LineupDoc)
 }
 
 /**
@@ -87,6 +96,9 @@ class SyncData(private val target: SyncTarget, private val tvName: String) {
         }
         if (Sections.LOCK in sections) {
             out.put(Sections.LOCK, JSONObject().put("pin_record", target.pinRecord()).put("locked_filters", s.lockedFilters))
+        }
+        if (Sections.LINEUP in sections) {
+            out.put(Sections.LINEUP, lineupToJson(target.lineup()))
         }
         return JSONObject().put("format", FORMAT).put("source_tv", tvName).put("sections", out)
     }
@@ -140,6 +152,17 @@ class SyncData(private val target: SyncTarget, private val tvName: String) {
             if (lock.has("locked_filters")) settings = settings.copy(lockedFilters = lock.optString("locked_filters").trim())
             if (record != null) target.setPinRecord(record)
             messages += "Parental lock copied."
+        }
+
+        sections.optJSONObject(Sections.LINEUP)?.let { section ->
+            // A copy with no channels would wipe the lineup on the target, so it is refused instead.
+            val doc = lineupFromJson(section.toString())
+            if (doc.isEmpty) {
+                messages += "That copy has no channel lineup, so the lineup was not copied."
+            } else {
+                target.setLineup(doc)
+                messages += "Channel lineup copied."
+            }
         }
 
         if (settings != target.settings()) target.saveSettings(settings)

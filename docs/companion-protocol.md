@@ -171,7 +171,9 @@ other. Each part is a key under `sections`:
   "channels": {"hidden_filters": "", "strip_prefixes": false,
                "profiles": [{"name": "Main", "hidden_filters": null}]},
   "favorites": {"profiles": [{"name": "Main", "favorites": ["1234", "5678"]}]},
-  "lock": {"pin_record": "", "locked_filters": ""}}}
+  "lock": {"pin_record": "", "locked_filters": ""},
+  "lineup": {"revision": 0, "builtAtMs": 0, "lineup": [], "assignments": {}, "overrides": {},
+             "genreBlocks": {}, "openRouterKey": "", "openRouterModel": ""}}}
 ```
 
 `export_sync` takes `sections`, a list of the keys wanted, and answers with only those.
@@ -185,6 +187,11 @@ other. Each part is a key under `sections`:
 - `lock` sets the PIN (`pin_record` is the stored salt and hash, so the PIN never travels as typed;
   empty removes the PIN) and the locked groups.
 - Profiles are matched by name, ignoring case. A profile missing on the target is created.
+- `lineup` replaces the whole channel lineup on the target: the lineup rows, the person's
+  overrides, the model's assignments, the genre blocks, and the OpenRouter key and model. The
+  target then reloads its channels. A copy with no lineup rows is refused, so it cannot wipe the
+  target's lineup. The lineup holds only public channel names and numbers and the key, so it
+  never includes stream addresses or logins.
 
 Never part of sync: the Home Assistant webhook, the last channel, recents, resume points, track
 choices, reminders, recordings and paired phones. They belong to one TV.

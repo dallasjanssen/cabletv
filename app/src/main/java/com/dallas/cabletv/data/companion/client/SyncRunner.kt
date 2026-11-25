@@ -10,7 +10,8 @@ data class SyncChoice(val key: String, val label: String) {
             SyncChoice(Sections.LOGINS, "Logins"),
             SyncChoice(Sections.CHANNELS, "Channel customizations"),
             SyncChoice(Sections.FAVORITES, "Favorites"),
-            SyncChoice(Sections.LOCK, "Parental lock")
+            SyncChoice(Sections.LOCK, "Parental lock"),
+            SyncChoice(Sections.LINEUP, "Channel lineup")
         )
     }
 }

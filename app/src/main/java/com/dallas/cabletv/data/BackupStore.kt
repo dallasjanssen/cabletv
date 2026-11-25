@@ -13,7 +13,8 @@ import org.json.JSONObject
 class BackupStore(
     context: Context,
     private val settingsStore: SettingsStore,
-    private val profileStore: ProfileStore
+    private val profileStore: ProfileStore,
+    private val lineupStore: LineupStore
 ) {
     private val appContext = context.applicationContext
 
@@ -41,6 +42,7 @@ class BackupStore(
         val allPrefs = linkedMapOf<String, Map<String, Any>>()
         allPrefs[SettingsStore.PREFS_NAME] = settingsStore.backupEntries()
         allPrefs[ProfileStore.PREFS_NAME] = profileStore.backupEntries()
+        allPrefs[LineupStore.PREFS_NAME] = lineupStore.backupEntries()
         allPrefs[TRACK_PREFS] = snapshotPrefs(TRACK_PREFS)
         profileIdsForBackup().forEach { id ->
             val name = userStatePrefsName(id)
@@ -81,6 +83,8 @@ class BackupStore(
         val oldProfileIds = profileIdsForBackup()
         settingsStore.restoreEntries(incoming[SettingsStore.PREFS_NAME].orEmpty())
         profileStore.restoreEntries(incoming[ProfileStore.PREFS_NAME].orEmpty())
+        // Older backups have no lineup. Leave the saved one alone when that is the case.
+        incoming[LineupStore.PREFS_NAME]?.let { lineupStore.restoreEntries(it) }
         val newProfileIds = profileIdsForBackup()
 
         val knownOrdinary = linkedSetOf(TRACK_PREFS)
@@ -92,7 +96,7 @@ class BackupStore(
         }
 
         incoming.forEach { (name, values) ->
-            if (name == SettingsStore.PREFS_NAME || name == ProfileStore.PREFS_NAME || name in knownOrdinary) return@forEach
+            if (name == SettingsStore.PREFS_NAME || name == ProfileStore.PREFS_NAME || name == LineupStore.PREFS_NAME || name in knownOrdinary) return@forEach
             restorePrefs(appContext.getSharedPreferences(name, Context.MODE_PRIVATE), values)
         }
     }

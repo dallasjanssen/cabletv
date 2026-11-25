@@ -8,6 +8,8 @@ import androidx.activity.ComponentActivity
 import com.dallas.cabletv.BuildConfig
 import com.dallas.cabletv.data.DebugLog
 import com.dallas.cabletv.data.EpgCache
+import com.dallas.cabletv.data.LineupDoc
+import com.dallas.cabletv.data.LineupStore
 import com.dallas.cabletv.data.LiveChannel
 import com.dallas.cabletv.data.VodItem
 import com.dallas.cabletv.data.isLocked
@@ -200,6 +202,8 @@ class AppCompanionBackend(
         override fun setFavorites(profileId: String, ids: Set<String>) = UserStateStore(context, profileId).replaceFavorites(ids)
         override fun pinRecord(): String = settingsStore.pinRecord()
         override fun setPinRecord(record: String) = settingsStore.setPinRecord(record)
+        override fun lineup(): LineupDoc = LineupStore(context).load()
+        override fun setLineup(doc: LineupDoc) = LineupStore(context).save(doc)
     }
 
     private companion object {

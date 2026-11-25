@@ -53,6 +53,9 @@ import com.dallas.cabletv.data.EpgCache
 import com.dallas.cabletv.data.HA_PAUSED
 import com.dallas.cabletv.data.HA_PLAYING
 import com.dallas.cabletv.data.HomeAssistantReporter
+import com.dallas.cabletv.data.LineupChanges
+import com.dallas.cabletv.data.LineupStore
+import com.dallas.cabletv.data.applyLineup
 import com.dallas.cabletv.data.describeChannelLink
 import com.dallas.cabletv.data.favoriteChannels
 import com.dallas.cabletv.data.findLinkedChannel
@@ -170,7 +173,8 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
 
     // ------------------------------------------------------------ Profiles
     val profileStore = remember { ProfileStore(context) }
-    val backupStore = remember { BackupStore(context, store, profileStore) }
+    val lineupStore = remember { LineupStore(context) }
+    val backupStore = remember { BackupStore(context, store, profileStore, lineupStore) }
     var profiles by remember { mutableStateOf(profileStore.profiles()) }
     var profileId by remember { mutableStateOf(profileStore.active()) }
 
@@ -255,7 +259,9 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
 
     // Reload the channel list only when the live login changes. Hiding channels does not reload.
     // Each source loads on its own, so one that fails does not hide the channels of the others.
-    LaunchedEffect(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass, settings.m3uUrl, settings.stalkerUrl, settings.stalkerMac, channelReload) {
+    // A saved, synced or restored lineup reloads the channels, so the new numbers show at once.
+    val lineupRevision by LineupChanges.revision.collectAsState()
+    LaunchedEffect(settings.xtreamServer, settings.xtreamUser, settings.xtreamPass, settings.m3uUrl, settings.stalkerUrl, settings.stalkerMac, channelReload, lineupRevision) {
         loadedChannels = emptyList()
         channelError = null
         if (!settings.hasLiveSource) {
@@ -264,7 +270,10 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
         }
         channelsLoading = true
         val s = settings
-        withContext(Dispatchers.IO) { runCatching { ChannelSource.loadReport(s) } }
+        withContext(Dispatchers.IO) {
+            runCatching { ChannelSource.loadReport(s) }
+                .map { it.copy(channels = applyLineup(it.channels, lineupStore.load())) }
+        }
             .onSuccess { report ->
                 loadedChannels = report.channels
                 val problems = report.problems.joinToString(" ")

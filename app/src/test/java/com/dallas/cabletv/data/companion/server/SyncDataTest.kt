@@ -1,5 +1,7 @@
 package com.dallas.cabletv.data.companion.server
 
+import com.dallas.cabletv.data.LineupChannel
+import com.dallas.cabletv.data.LineupDoc
 import com.dallas.cabletv.data.Profile
 import com.dallas.cabletv.data.Settings
 import com.dallas.cabletv.data.companion.CompanionProtocol.Errors
@@ -34,6 +36,9 @@ private class FakeTv(
     override fun setFavorites(profileId: String, ids: Set<String>) { favs[profileId] = ids }
     override fun pinRecord() = pin
     override fun setPinRecord(record: String) { pin = record }
+    var lineupDoc = LineupDoc()
+    override fun lineup(): LineupDoc = lineupDoc
+    override fun setLineup(doc: LineupDoc) { lineupDoc = doc }
 }
 
 class SyncDataTest {
@@ -280,5 +285,35 @@ class SyncDataTest {
         val text = SyncData(sourceTv(), "TV").export(Sections.ALL).toString()
         val back = JSONObject(text)
         assertTrue(back.getJSONObject("sections").getJSONObject("favorites").getJSONArray("profiles") is JSONArray)
+    }
+}
+
+class SyncLineupTest {
+
+    @Test
+    fun lineupCopiesToAnotherTvWithItsOverridesAndKey() {
+        val source = FakeTv()
+        source.lineupDoc = LineupDoc(
+            revision = 2,
+            lineup = listOf(LineupChannel(206, null, "ESPN", "Sports", "Main")),
+            overrides = mapOf("p1" to 206),
+            openRouterKey = "key",
+            openRouterModel = "model"
+        )
+        val exported = SyncData(source, "Source").export(listOf(Sections.LINEUP))
+        val target = FakeTv()
+        val messages = SyncData(target, "Target").import(exported)
+        assertEquals(source.lineupDoc, target.lineupDoc)
+        assertTrue(messages.contains("Channel lineup copied."))
+    }
+
+    @Test
+    fun emptyLineupIsRefusedAndTargetKeepsItsOwn() {
+        val target = FakeTv()
+        target.lineupDoc = LineupDoc(revision = 5, lineup = listOf(LineupChannel(202, null, "CNN", "News", "Main")))
+        val data = JSONObject("""{"format": 1, "sections": {"lineup": {"lineup": []}}}""")
+        val messages = SyncData(target, "Target").import(data)
+        assertEquals(5, target.lineupDoc.revision)
+        assertTrue(messages.any { it.contains("not copied") })
     }
 }

@@ -96,7 +96,8 @@ object CompanionProtocol {
         const val CHANNELS = "channels"
         const val FAVORITES = "favorites"
         const val LOCK = "lock"
-        val ALL = listOf(LOGINS, CHANNELS, FAVORITES, LOCK)
+        const val LINEUP = "lineup"
+        val ALL = listOf(LOGINS, CHANNELS, FAVORITES, LOCK, LINEUP)
     }
 
     /**
