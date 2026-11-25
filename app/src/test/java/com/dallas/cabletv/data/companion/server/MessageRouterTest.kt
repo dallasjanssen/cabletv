@@ -40,6 +40,10 @@ private class FakeBackend : CompanionBackend {
     override fun search(query: String) = SearchView(JSONArray(), JSONArray())
     override fun library(movies: Boolean, offset: Int, limit: Int) = LibraryView(JSONArray(), 0)
     override fun openTitle(source: String, mediaType: String, id: String) = false
+    override fun lineup(): JSONObject = JSONObject().put("lineup_channels", 7).put("key_set", true)
+    override fun putLineup(csv: String?, builtin: Boolean): List<String> = listOf("Lineup saved.")
+    override fun putLineupKey(key: String?, model: String?): List<String> = listOf("OpenRouter key saved.")
+    override fun buildLineup(): List<String> = listOf("Building the lineup.")
 }
 
 class MessageRouterTest {
@@ -88,7 +92,7 @@ class MessageRouterTest {
 
     @Test
     fun beforePairingOnlyTheFourOpeningMessagesWork() {
-        for (type in listOf("get_state", "key", "open", "get_favorites", "get_settings", "put_settings", "export_sync", "import_sync", "nonsense")) {
+        for (type in listOf("get_state", "key", "open", "get_favorites", "get_settings", "put_settings", "export_sync", "import_sync", "get_lineup", "put_lineup", "put_lineup_key", "build_lineup", "nonsense")) {
             val reply = send(type)
             assertError(Errors.NOT_PAIRED, reply)
         }
@@ -258,6 +262,10 @@ class MessageRouterTest {
         val requests = listOf(
             "get_settings" to emptyArray<Pair<String, Any?>>(),
             "put_settings" to arrayOf<Pair<String, Any?>>("settings" to JSONObject()),
+            "get_lineup" to emptyArray<Pair<String, Any?>>(),
+            "put_lineup" to arrayOf<Pair<String, Any?>>("csv" to "number,alt_number,name,genre,package"),
+            "put_lineup_key" to arrayOf<Pair<String, Any?>>("openrouter_key" to "k"),
+            "build_lineup" to emptyArray<Pair<String, Any?>>(),
             "export_sync" to arrayOf<Pair<String, Any?>>("sections" to JSONArray().put("logins")),
             "import_sync" to arrayOf<Pair<String, Any?>>("data" to JSONObject().put("format", 1).put("sections", JSONObject()))
         )
@@ -299,6 +307,16 @@ class MessageRouterTest {
         assertEquals("Saved.", reply.getJSONArray("messages").getString(0))
         assertTrue(reply.getJSONObject("settings").getJSONObject("channels").getBoolean("strip_prefixes"))
         assertError(Errors.BAD_REQUEST, send("put_settings"))
+    }
+
+    @Test
+    fun putLineupNeedsCsvOrTheBuiltInChoice() {
+        pairPhone()
+        assertError(Errors.BAD_REQUEST, send("put_lineup", "csv" to "  "))
+        val reply = send("put_lineup", "builtin" to true)
+        assertEquals("saved", reply.getString("type"))
+        assertEquals("Lineup saved.", reply.getJSONArray("messages").getString(0))
+        assertEquals(7, reply.getJSONObject("lineup").getInt("lineup_channels"))
     }
 
     @Test

@@ -165,3 +165,33 @@ fun lineupFromJson(text: String?): LineupDoc {
         LineupDoc()
     }
 }
+
+/**
+ * What the phone shows about the lineup: sizes, whether the key and model are set, and the build's
+ * progress. The key itself is never sent back, only whether one is saved.
+ */
+fun lineupSummaryJson(doc: LineupDoc, build: LineupBuildStatus.Snapshot): JSONObject {
+    val state = when (build.state) {
+        LineupBuildStatus.State.IDLE -> "idle"
+        LineupBuildStatus.State.RUNNING -> "running"
+        LineupBuildStatus.State.DONE -> "done"
+        LineupBuildStatus.State.FAILED -> "failed"
+    }
+    return JSONObject()
+        .put("lineup_channels", doc.lineup.size)
+        .put("placed_by_model", doc.assignments.values.count { it.number != null })
+        .put("in_genre_blocks", doc.assignments.values.count { it.number == null })
+        .put("overrides", doc.overrides.size)
+        .put("revision", doc.revision)
+        .put("built_at_ms", doc.builtAtMs)
+        .put("key_set", doc.openRouterKey.isNotBlank())
+        .put("model", doc.openRouterModel)
+        .put(
+            "build",
+            JSONObject()
+                .put("state", state)
+                .put("message", build.message)
+                .put("done", build.done)
+                .put("total", build.total)
+        )
+}

@@ -22,6 +22,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.dallas.cabletv.data.companion.client.ChannelSettings
 import com.dallas.cabletv.data.companion.client.LibrarySettings
+import com.dallas.cabletv.data.companion.client.LineupSummary
 import com.dallas.cabletv.data.companion.client.LiveSettings
 import com.dallas.cabletv.data.companion.client.SessionStatus
 import com.dallas.cabletv.data.companion.client.SettingsChanges
@@ -41,11 +42,15 @@ fun SettingsTab(m: TvScreenModel) {
     LaunchedEffect(online, load) {
         if (online && load is SettingsLoad.Idle) m.loadSettings()
     }
+    LaunchedEffect(online) {
+        if (online) m.loadLineup()
+    }
 
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
+        if (online) LineupSection(m, sections)
         when {
             load is SettingsLoad.Loaded -> {
                 val s = (load as SettingsLoad.Loaded).settings
@@ -179,5 +184,90 @@ private fun WebhookSection(webhook: String, result: SectionResult?, onSave: (JSO
             enabled = result?.busy != true
         )
         SaveResult(result)
+    }
+}
+
+/** The channel lineup: load it, add the OpenRouter key, then build. Every step runs on the TV. */
+@Composable
+private fun LineupSection(m: TvScreenModel, sections: Map<String, SectionResult>) {
+    val load by m.lineup.collectAsState()
+    val summary = load.summary
+    val result = sections["lineup"]
+    val busy = result?.busy == true
+    val running = summary?.running == true
+    var csv by remember { mutableStateOf("") }
+    var key by remember { mutableStateOf("") }
+    var model by remember(summary?.model) { mutableStateOf(summary?.model.orEmpty()) }
+
+    LaunchedEffect(running) {
+        if (running) m.pollWhileBuilding()
+    }
+
+    val ready = summary != null && summary.lineupChannels > 0 && summary.keySet && model.isNotBlank()
+
+    SectionCard("Channel lineup") {
+        Text(lineupStatus(summary), style = TvType.Small, color = Tv.Ink2)
+        summary?.build?.takeIf { it.state != "idle" }?.let { b ->
+            val text = when {
+                b.state == "running" && b.total > 0 -> "Building: ${b.done} of ${b.total} requests done."
+                b.state == "running" -> "Starting the build..."
+                else -> b.message
+            }
+            MessageLine(text, error = b.state == "failed")
+        }
+        load.error?.let { MessageLine(it, error = true) }
+
+        PrimaryButton(
+            if (busy) "Loading..." else "Use the DIRECTV streaming lineup (11/1/2026)",
+            onClick = { m.useBuiltInLineup() },
+            modifier = Modifier.fillMaxWidth(),
+            enabled = !busy
+        )
+        LabeledField("Or paste your own lineup CSV", csv, { csv = it }, singleLine = false, minLines = 3)
+        SecondaryButton(
+            "Save pasted lineup",
+            onClick = { m.putLineupCsv(csv) },
+            modifier = Modifier.fillMaxWidth(),
+            enabled = csv.isNotBlank() && !busy
+        )
+
+        LabeledField("OpenRouter key", key, { key = it }, secret = true)
+        LabeledField("OpenRouter model", model, { model = it })
+        Text(
+            "Leave the key empty to keep the one already saved.",
+            style = TvType.Small,
+            color = Tv.Ink3
+        )
+        SecondaryButton(
+            if (busy) "Saving..." else "Save key and model",
+            onClick = { m.saveOpenRouter(key.trim().ifEmpty { null }, model.trim()) },
+            modifier = Modifier.fillMaxWidth(),
+            enabled = !busy && model.isNotBlank()
+        )
+
+        PrimaryButton(
+            if (running) "Building..." else "Build lineup",
+            onClick = { m.buildLineup() },
+            modifier = Modifier.fillMaxWidth(),
+            enabled = ready && !running && !busy
+        )
+        Text(
+            "Builds place the channels this lineup does not match by name. Each build uses OpenRouter credit.",
+            style = TvType.Small,
+            color = Tv.Ink3
+        )
+        SaveResult(result)
+    }
+}
+
+private fun lineupStatus(summary: LineupSummary?): String = when {
+    summary == null -> "Loading the lineup..."
+    summary.lineupChannels == 0 -> "No lineup yet. Load the DIRECTV list below, or paste your own."
+    else -> buildString {
+        append("${summary.lineupChannels} lineup channels. ")
+        append("${summary.placedByModel} placed by the model, ${summary.inGenreBlocks} in genre blocks")
+        if (summary.overrides > 0) append(", ${summary.overrides} picked by hand")
+        append(".")
+        if (!summary.keySet) append(" Add an OpenRouter key to place the rest.")
     }
 }

@@ -6,7 +6,17 @@ import android.os.SystemClock
 import android.view.KeyEvent
 import androidx.activity.ComponentActivity
 import com.dallas.cabletv.BuildConfig
+import com.dallas.cabletv.data.ChannelSource
 import com.dallas.cabletv.data.DebugLog
+import com.dallas.cabletv.data.LineupBuildStatus
+import com.dallas.cabletv.data.MODEL_BATCH_SIZE
+import com.dallas.cabletv.data.channelsNeedingModel
+import com.dallas.cabletv.data.friendlyError
+import com.dallas.cabletv.data.lineupSummaryJson
+import com.dallas.cabletv.data.openRouterAsk
+import com.dallas.cabletv.data.parseLineupCsv
+import com.dallas.cabletv.data.runModelPass
+import com.dallas.cabletv.data.withLineupCsv
 import com.dallas.cabletv.data.EpgCache
 import com.dallas.cabletv.data.LineupDoc
 import com.dallas.cabletv.data.LineupStore
@@ -25,6 +35,7 @@ import com.dallas.cabletv.data.UserStateStore
 import com.dallas.cabletv.data.companion.CompanionProtocol
 import com.dallas.cabletv.data.tvDeviceName
 import kotlinx.coroutines.runBlocking
+import kotlin.concurrent.thread
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -185,6 +196,71 @@ class AppCompanionBackend(
         pinSet = settingsStore.hasPin()
     )
 
+    private val lineupStore by lazy { LineupStore(context) }
+
+    override fun lineup(): JSONObject = lineupSummaryJson(lineupStore.load(), LineupBuildStatus.get())
+
+    override fun putLineup(csv: String?, builtin: Boolean): List<String> {
+        val text = if (builtin) {
+            context.assets.open(BUILT_IN_LINEUP).bufferedReader(Charsets.UTF_8).use { it.readText() }
+        } else {
+            csv.orEmpty()
+        }
+        val parsed = parseLineupCsv(text)
+        if (parsed.channels.isEmpty()) {
+            throw CompanionException(CompanionProtocol.Errors.INVALID, "No channels were found. Each row needs a number and a name.")
+        }
+        lineupStore.save(withLineupCsv(lineupStore.load(), text, System.currentTimeMillis()))
+        val messages = mutableListOf("Lineup saved with ${parsed.channels.size} channels.")
+        if (parsed.skipped > 0) messages += "${parsed.skipped} rows were skipped because they had no number or name."
+        return messages
+    }
+
+    override fun putLineupKey(key: String?, model: String?): List<String> {
+        val doc = lineupStore.load()
+        val updated = doc.copy(
+            openRouterKey = key ?: doc.openRouterKey,
+            openRouterModel = model ?: doc.openRouterModel
+        )
+        lineupStore.save(updated)
+        val messages = mutableListOf<String>()
+        if (key != null) messages += if (key.isBlank()) "OpenRouter key removed." else "OpenRouter key saved."
+        if (model != null) messages += "OpenRouter model saved."
+        return messages
+    }
+
+    override fun buildLineup(): List<String> {
+        val doc = lineupStore.load()
+        if (doc.isEmpty) throw CompanionException(CompanionProtocol.Errors.INVALID, "Load the lineup first.")
+        if (doc.openRouterKey.isBlank() || doc.openRouterModel.isBlank()) {
+            throw CompanionException(CompanionProtocol.Errors.INVALID, "Add the OpenRouter key and model first.")
+        }
+        val settings = settingsStore.load()
+        if (!LineupBuildStatus.start()) {
+            throw CompanionException(CompanionProtocol.Errors.BUSY, "A lineup build is already running.")
+        }
+        thread(name = "lineup-build") {
+            try {
+                val channels = ChannelSource.loadReport(settings).channels
+                if (channels.isEmpty()) error("No channels loaded. Check the live TV login.")
+                val batches = (channelsNeedingModel(channels, doc).size + MODEL_BATCH_SIZE - 1) / MODEL_BATCH_SIZE
+                LineupBuildStatus.setTotal(batches)
+                val updated = runModelPass(channels, doc, System.currentTimeMillis()) { prompt ->
+                    val answer = openRouterAsk(doc.openRouterKey, doc.openRouterModel, prompt)
+                    LineupBuildStatus.advance()
+                    answer
+                }
+                lineupStore.save(updated)
+                val placed = updated.assignments.values.count { it.number != null }
+                LineupBuildStatus.finish("Built. $placed channels placed by the model, the rest sit in their genre blocks.")
+            } catch (e: Exception) {
+                DebugLog.log("lineup", "Lineup build failed", e)
+                LineupBuildStatus.fail(friendlyError(e))
+            }
+        }
+        return listOf("Building the lineup. This can take a few minutes.")
+    }
+
     /** Lets [SyncData] read and write this TV's stores. */
     private inner class SyncAdapter : SyncTarget {
         override fun settings(): Settings = main.call { hooks.settings() }
@@ -207,6 +283,8 @@ class AppCompanionBackend(
     }
 
     private companion object {
+        const val BUILT_IN_LINEUP = "lineup/directv-streaming-2026-11-01.csv"
+
         /** Saving can reload the screen, so it is allowed a little longer than a plain read. */
         const val APPLY_TIMEOUT_MS = 10_000L
     }

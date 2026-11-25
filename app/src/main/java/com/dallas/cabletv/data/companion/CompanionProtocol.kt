@@ -70,6 +70,11 @@ object CompanionProtocol {
         const val GET_LIBRARY = "get_library"
         const val LIBRARY = "library"
         const val OPEN_TITLE = "open_title"
+        const val GET_LINEUP = "get_lineup"
+        const val LINEUP = "lineup"
+        const val PUT_LINEUP = "put_lineup"
+        const val PUT_LINEUP_KEY = "put_lineup_key"
+        const val BUILD_LINEUP = "build_lineup"
 
         /** Types a phone may send before it has paired. */
         val BEFORE_PAIRING = setOf(HELLO, PAIR_START, PAIR_FINISH, PING)

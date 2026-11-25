@@ -300,3 +300,29 @@ class LineupPassTest {
         assertEquals(1, channelsNeedingModel(channels, out).size)
     }
 }
+
+class LineupBuildStatusTest {
+
+    @Test
+    fun onlyOnePassRunsAtATime() {
+        assertTrue(LineupBuildStatus.start())
+        assertFalse(LineupBuildStatus.start())
+        LineupBuildStatus.fail("stopped")
+        assertTrue(LineupBuildStatus.start())
+        LineupBuildStatus.finish("done")
+        assertEquals(LineupBuildStatus.State.DONE, LineupBuildStatus.get().state)
+    }
+
+    @Test
+    fun progressCountsRequests() {
+        assertTrue(LineupBuildStatus.start())
+        LineupBuildStatus.setTotal(3)
+        LineupBuildStatus.advance()
+        LineupBuildStatus.advance()
+        val snap = LineupBuildStatus.get()
+        assertEquals(2, snap.done)
+        assertEquals(3, snap.total)
+        assertEquals(LineupBuildStatus.State.RUNNING, snap.state)
+        LineupBuildStatus.finish("done")
+    }
+}

@@ -15,16 +15,19 @@ import com.dallas.cabletv.data.companion.client.SessionStatus
 import com.dallas.cabletv.data.companion.client.GridPage
 import com.dallas.cabletv.data.companion.client.GuideChannel
 import com.dallas.cabletv.data.companion.client.LibraryPage
+import com.dallas.cabletv.data.companion.client.LineupSummary
 import com.dallas.cabletv.data.companion.client.SearchResults
 import com.dallas.cabletv.data.companion.client.TitleItem
 import com.dallas.cabletv.data.companion.client.TvDebugLog
 import com.dallas.cabletv.data.companion.client.objects
+import com.dallas.cabletv.data.companion.client.stringList
 import com.dallas.cabletv.data.companion.client.TvSession
 import com.dallas.cabletv.data.companion.client.TvSettings
 import com.dallas.cabletv.data.companion.client.routeKey
 import com.dallas.cabletv.data.companion.client.withPin
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -43,6 +46,9 @@ sealed interface SettingsLoad {
 }
 
 /** What one section's Save button last did. */
+/** The lineup summary last read from the TV, or the reason it could not be read. */
+data class LineupLoad(val summary: LineupSummary? = null, val error: String? = null)
+
 data class SectionResult(val busy: Boolean = false, val messages: List<String> = emptyList(), val error: String? = null)
 
 /** The Debug tab's state: the last log the TV sent, and whether a request is running. */
@@ -230,6 +236,69 @@ class TvScreenModel(private val tvId: String, private val app: CompanionModel) {
             AtvRemoteException.Reason.BAD_CODE -> "That code did not match. Check the TV and try again."
             AtvRemoteException.Reason.UNREACHABLE -> "Can't reach $name. Is the TV on?"
             else -> "Pairing the TV's remote did not finish. Try again."
+        }
+    }
+
+    // Channel lineup
+
+    private val _lineup = MutableStateFlow(LineupLoad())
+    val lineup: StateFlow<LineupLoad> = _lineup
+
+    /** Reads the lineup summary and the build's progress from the TV. */
+    fun loadLineup() {
+        scope.launch {
+            try {
+                val reply = withPin(tvId, app.pins, { app.askPin(tvNow().name, it) }) { pin ->
+                    session.request(CompanionRequests.getLineup(pin))
+                }
+                reply.optJSONObject("lineup")?.let { _lineup.value = LineupLoad(summary = LineupSummary.fromJson(it)) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: PinCancelledException) {
+                _lineup.value = _lineup.value.copy(error = "The lineup needs the TV's PIN.")
+            } catch (e: Exception) {
+                _lineup.value = _lineup.value.copy(error = app.errorText(e))
+            }
+        }
+    }
+
+    /** Loads the lineup from pasted CSV text. */
+    fun putLineupCsv(csv: String) = lineupAction { pin -> session.request(CompanionRequests.putLineupCsv(pin, csv)) }
+
+    /** Loads the lineup built into the TV app. */
+    fun useBuiltInLineup() = lineupAction { pin -> session.request(CompanionRequests.putLineupBuiltIn(pin)) }
+
+    /** Saves the OpenRouter key and model. A null key keeps the saved one. */
+    fun saveOpenRouter(key: String?, model: String?) = lineupAction { pin ->
+        session.request(CompanionRequests.putLineupKey(pin, key, model))
+    }
+
+    /** Starts the model pass on the TV. Progress comes back through [loadLineup]. */
+    fun buildLineup() = lineupAction { pin -> session.request(CompanionRequests.buildLineup(pin)) }
+
+    /** Keeps the lineup polling while the TV builds, and stops when the build ends. */
+    suspend fun pollWhileBuilding() {
+        while (_lineup.value.summary?.running == true) {
+            delay(2_500)
+            loadLineup()
+        }
+    }
+
+    private fun lineupAction(request: suspend (String?) -> JSONObject) {
+        setSection("lineup", SectionResult(busy = true))
+        scope.launch {
+            try {
+                val reply = withPin(tvId, app.pins, { app.askPin(tvNow().name, it) }) { pin -> request(pin) }
+                reply.optJSONObject("lineup")?.let { _lineup.value = LineupLoad(summary = LineupSummary.fromJson(it)) }
+                val messages = reply.stringList("messages").ifEmpty { listOf("Saved.") }
+                setSection("lineup", SectionResult(messages = messages))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: PinCancelledException) {
+                setSection("lineup", SectionResult(error = "Nothing was saved. The TV needs its PIN."))
+            } catch (e: Exception) {
+                setSection("lineup", SectionResult(error = app.errorText(e)))
+            }
         }
     }
 

@@ -39,6 +39,26 @@ object CompanionRequests {
 
     fun getDebugLog(pin: String?): JSONObject = withPin(JSONObject().put("type", Types.GET_DEBUG_LOG), pin)
 
+    fun getLineup(pin: String?): JSONObject = withPin(JSONObject().put("type", Types.GET_LINEUP), pin)
+
+    /** Loads the lineup from pasted CSV text. */
+    fun putLineupCsv(pin: String?, csv: String): JSONObject =
+        withPin(JSONObject().put("type", Types.PUT_LINEUP).put("csv", csv), pin)
+
+    /** Loads the lineup built into the TV app. */
+    fun putLineupBuiltIn(pin: String?): JSONObject =
+        withPin(JSONObject().put("type", Types.PUT_LINEUP).put("builtin", true), pin)
+
+    /** Saves the OpenRouter key and model. A null field is left as it is on the TV. */
+    fun putLineupKey(pin: String?, key: String?, model: String?): JSONObject {
+        val message = JSONObject().put("type", Types.PUT_LINEUP_KEY)
+        if (key != null) message.put("openrouter_key", key)
+        if (model != null) message.put("openrouter_model", model)
+        return withPin(message, pin)
+    }
+
+    fun buildLineup(pin: String?): JSONObject = withPin(JSONObject().put("type", Types.BUILD_LINEUP), pin)
+
     /** Turns debug logging on or off when [enabled] is given, and empties the log when [clear] is true. */
     fun setDebugLog(pin: String?, enabled: Boolean?, clear: Boolean): JSONObject {
         val message = JSONObject().put("type", Types.SET_DEBUG_LOG)
@@ -245,4 +265,40 @@ fun pairingErrorText(e: CompanionException): String = when (e.code) {
     CompanionProtocol.Errors.CODE_EXPIRED -> "That code has expired. Start again to get a new one."
     CompanionProtocol.Errors.LOCKED -> "Too many wrong codes. Start again to get a new one."
     else -> e.message ?: "Pairing did not finish."
+}
+
+/** How far the TV's lineup build has got. [state] is idle, running, done or failed. */
+data class LineupBuild(val state: String, val message: String, val done: Int, val total: Int)
+
+/** What the phone shows about the TV's channel lineup. The OpenRouter key is never sent, only whether one is saved. */
+data class LineupSummary(
+    val lineupChannels: Int,
+    val placedByModel: Int,
+    val inGenreBlocks: Int,
+    val overrides: Int,
+    val keySet: Boolean,
+    val model: String,
+    val build: LineupBuild
+) {
+    val running: Boolean get() = build.state == "running"
+
+    companion object {
+        fun fromJson(o: JSONObject): LineupSummary {
+            val b = o.optJSONObject("build") ?: JSONObject()
+            return LineupSummary(
+                lineupChannels = o.optInt("lineup_channels", 0),
+                placedByModel = o.optInt("placed_by_model", 0),
+                inGenreBlocks = o.optInt("in_genre_blocks", 0),
+                overrides = o.optInt("overrides", 0),
+                keySet = o.optBoolean("key_set", false),
+                model = o.optString("model", ""),
+                build = LineupBuild(
+                    state = b.optString("state", "idle"),
+                    message = b.optString("message", ""),
+                    done = b.optInt("done", 0),
+                    total = b.optInt("total", 0)
+                )
+            )
+        }
+    }
 }

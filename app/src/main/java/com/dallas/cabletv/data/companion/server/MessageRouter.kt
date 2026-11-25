@@ -58,6 +58,12 @@ class MessageRouter(
                 Types.SEARCH -> search(re, msg)
                 Types.GET_LIBRARY -> library(re, msg)
                 Types.OPEN_TITLE -> openTitle(re, msg)
+                Types.GET_LINEUP -> guarded(re, msg) {
+                    CompanionProtocol.reply(re, Types.LINEUP).put("lineup", backend.lineup())
+                }
+                Types.PUT_LINEUP -> guarded(re, msg) { putLineup(re, msg) }
+                Types.PUT_LINEUP_KEY -> guarded(re, msg) { putLineupKey(re, msg) }
+                Types.BUILD_LINEUP -> guarded(re, msg) { buildLineup(re) }
                 else -> fail(re, Errors.BAD_REQUEST, "The TV does not know that request.")
             }
         } catch (e: CompanionException) {
@@ -124,6 +130,26 @@ class MessageRouter(
             .put("messages", JSONArray(result.messages))
             .put("settings", result.settings)
     }
+
+    private fun lineupSaved(re: Int?, messages: List<String>): JSONObject =
+        CompanionProtocol.reply(re, Types.SAVED)
+            .put("messages", JSONArray(messages))
+            .put("lineup", backend.lineup())
+
+    private fun putLineup(re: Int?, msg: JSONObject): JSONObject {
+        val builtin = msg.optBoolean("builtin", false)
+        val csv = msg.optString("csv")
+        if (!builtin && csv.isBlank()) return fail(re, Errors.BAD_REQUEST, "Paste the lineup or choose the built-in one.")
+        return lineupSaved(re, backend.putLineup(if (builtin) null else csv, builtin))
+    }
+
+    private fun putLineupKey(re: Int?, msg: JSONObject): JSONObject {
+        val key = if (msg.has("openrouter_key")) msg.optString("openrouter_key").trim() else null
+        val model = if (msg.has("openrouter_model")) msg.optString("openrouter_model").trim() else null
+        return lineupSaved(re, backend.putLineupKey(key, model))
+    }
+
+    private fun buildLineup(re: Int?): JSONObject = lineupSaved(re, backend.buildLineup())
 
     private fun exportSync(re: Int?, msg: JSONObject): JSONObject {
         val arr = msg.optJSONArray("sections") ?: return fail(re, Errors.BAD_REQUEST, "Choose what to copy.")

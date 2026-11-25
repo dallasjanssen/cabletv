@@ -89,4 +89,16 @@ interface CompanionBackend {
 
     /** Opens a movie or show on the TV, as choosing it in On Demand does. False when the TV does not have it. */
     fun openTitle(source: String, mediaType: String, id: String): Boolean
+
+    /** The lineup summary and the build's progress. Never includes the OpenRouter key. */
+    fun lineup(): JSONObject
+
+    /** Loads the lineup from CSV text, or the one built into the app when [builtin] is true. Returns messages to show. */
+    fun putLineup(csv: String?, builtin: Boolean): List<String>
+
+    /** Saves the OpenRouter key and model. A null field is left as it is. An empty key clears the saved one. */
+    fun putLineupKey(key: String?, model: String?): List<String>
+
+    /** Starts the model pass in the background. Throws when a pass is already running or the lineup is not ready. */
+    fun buildLineup(): List<String>
 }

@@ -98,6 +98,10 @@ Every message has a `type`. Requests from the phone also have `id`.
 | `put_settings` `{pin?, settings}` | `saved` `{messages, settings}` or `error` | PIN rules apply. |
 | `export_sync` `{pin?, sections}` | `sync_data` `{data}` | PIN rules apply. |
 | `import_sync` `{pin?, data}` | `saved` `{messages}` or `error` | PIN rules apply. |
+| `get_lineup` `{pin?}` | `lineup` `{lineup}` | PIN rules apply. `lineup` is a summary: row counts, whether an OpenRouter key is saved (never the key itself), the model, and the build's `state`, `message`, `done` and `total`. |
+| `put_lineup` `{pin?, csv}` or `{pin?, builtin: true}` | `saved` `{messages, lineup}` or `error` | Loads the lineup from pasted CSV, or the one built into the TV app. An empty lineup is refused. |
+| `put_lineup_key` `{pin?, openrouter_key?, openrouter_model?}` | `saved` `{messages, lineup}` | A missing field is left as it is. An empty key clears the saved one. |
+| `build_lineup` `{pin?}` | `saved` `{messages, lineup}` or `error` | Starts the model pass on the TV in the background, so it can take minutes. The phone polls `get_lineup` for progress. Refused while a build runs, or when the lineup, key or model is missing. |
 | `get_debug_log` `{pin?}` | `debug_log` `{enabled, log}` | PIN rules apply. See Debug log. |
 | `set_debug_log` `{pin?, enabled?, clear?}` | `debug_log` `{enabled, log}` | PIN rules apply. `enabled` turns logging on or off. `clear` empties the log first. |
 | `get_grid` `{group, start_ms, offset?, limit?}` | `grid` `{groups, group, start_ms, end_ms, total, channels}` | Browsing, no PIN. The guide as the TV draws it. See Browsing the TV. |

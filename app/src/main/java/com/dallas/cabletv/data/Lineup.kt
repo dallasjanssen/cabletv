@@ -332,3 +332,34 @@ fun runModelPass(channels: List<LiveChannel>, doc: LineupDoc, now: Long, ask: (S
     }
     return doc.copy(revision = doc.revision + 1, builtAtMs = now, assignments = assignments)
 }
+
+/**
+ * Progress of the model pass that runs on the TV in the background. The phone reads it to show
+ * progress. One pass runs at a time.
+ */
+object LineupBuildStatus {
+    enum class State { IDLE, RUNNING, DONE, FAILED }
+
+    data class Snapshot(val state: State, val message: String, val done: Int, val total: Int)
+
+    private val lock = Any()
+    private var current = Snapshot(State.IDLE, "", 0, 0)
+
+    fun get(): Snapshot = synchronized(lock) { current }
+
+    /** Starts a pass. False when one is already running. */
+    fun start(): Boolean = synchronized(lock) {
+        if (current.state == State.RUNNING) return false
+        current = Snapshot(State.RUNNING, "Starting.", 0, 0)
+        true
+    }
+
+    fun setTotal(total: Int) = synchronized(lock) { current = current.copy(total = total, message = "Asking the model.") }
+
+    /** One model request has finished. */
+    fun advance() = synchronized(lock) { current = current.copy(done = current.done + 1) }
+
+    fun finish(message: String) = synchronized(lock) { current = Snapshot(State.DONE, message, current.done, current.total) }
+
+    fun fail(message: String) = synchronized(lock) { current = Snapshot(State.FAILED, message, current.done, current.total) }
+}
