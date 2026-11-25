@@ -18,6 +18,13 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
+import com.dallas.cabletv.BuildConfig
+import com.dallas.cabletv.data.AppUpdater
+import com.dallas.cabletv.data.friendlyError
 import com.dallas.cabletv.ui.Tv
 
 private const val ROUTE_TVS = "tvs"
@@ -38,6 +45,54 @@ fun CompanionApp(onWatchOnPhone: () -> Unit) {
 
     BackHandler(enabled = route != ROUTE_TVS) { route = ROUTE_TVS }
 
+    // Before the phone starts watching, look for a newer build. A slow or failed check never blocks watching.
+    var checkingUpdate by remember { mutableStateOf(false) }
+    var offeredUpdate by remember { mutableStateOf<AppUpdater.Release?>(null) }
+    var installing by remember { mutableStateOf(false) }
+    var updateNote by remember { mutableStateOf<String?>(null) }
+
+    fun checkThenWatch() {
+        if (checkingUpdate) return
+        // A debug build is signed with another key, so there is nothing to offer it.
+        if (BuildConfig.DEBUG) {
+            onWatchOnPhone()
+            return
+        }
+        checkingUpdate = true
+        scope.launch {
+            val found = withContext(Dispatchers.IO) {
+                runCatching { AppUpdater.latest(BuildConfig.VERSION_CODE, callTimeoutSeconds = UPDATE_CHECK_SECONDS) }.getOrNull()
+            }
+            checkingUpdate = false
+            if (found == null) onWatchOnPhone() else {
+                updateNote = null
+                offeredUpdate = found
+            }
+        }
+    }
+
+    fun installOffered(release: AppUpdater.Release) {
+        if (!context.packageManager.canRequestPackageInstalls()) {
+            updateNote = "Allow installs from Cable TV in Android settings, then press Install again."
+            return
+        }
+        installing = true
+        updateNote = null
+        scope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching { AppUpdater.download(release, File(context.cacheDir, "updates")) }
+            }
+            result
+                .onSuccess { apk ->
+                    runCatching { AppUpdater.install(context, apk) }
+                        .onSuccess { offeredUpdate = null }
+                        .onFailure { updateNote = it.message ?: "The installer did not open." }
+                }
+                .onFailure { updateNote = "The download did not finish. ${friendlyError(it)}" }
+            installing = false
+        }
+    }
+
     Box(Modifier.fillMaxSize().background(Tv.Bg).systemBarsPadding().imePadding()) {
         when {
             route == ROUTE_SYNC -> SyncScreen(model, onBack = { route = ROUTE_TVS })
@@ -50,11 +105,21 @@ fun CompanionApp(onWatchOnPhone: () -> Unit) {
                 model,
                 onOpenTv = { route = ROUTE_TV_PREFIX + it },
                 onSync = { route = ROUTE_SYNC },
-                onWatchOnPhone = onWatchOnPhone
+                onWatchOnPhone = { checkThenWatch() }
             )
         }
     }
 
+    offeredUpdate?.let { release ->
+        UpdateOfferDialog(
+            release = release,
+            busy = installing,
+            note = updateNote,
+            onInstall = { installOffered(release) },
+            onWatch = { offeredUpdate = null; onWatchOnPhone() },
+            onCancel = { offeredUpdate = null }
+        )
+    }
     PairingDialogs(model)
     PinDialog(model)
     val review by model.syncReview.collectAsState()
@@ -114,3 +179,6 @@ private fun PinDialog(model: CompanionModel) {
         )
     }
 }
+
+/** How long the check before Watch on this phone may take. Past this it is skipped and watching starts. */
+private const val UPDATE_CHECK_SECONDS = 8L

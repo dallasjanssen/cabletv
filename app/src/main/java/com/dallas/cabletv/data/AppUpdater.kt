@@ -27,14 +27,22 @@ object AppUpdater {
         .readTimeout(120, TimeUnit.SECONDS)
         .build()
 
-    /** Returns the newest release if it is newer than [currentCode], otherwise null. */
-    fun latest(currentCode: Int): Release? {
+    /**
+     * Returns the newest release if it is newer than [currentCode], otherwise null. A positive
+     * [callTimeoutSeconds] caps the whole check, for callers that must not wait long.
+     */
+    fun latest(currentCode: Int, callTimeoutSeconds: Long = 0L): Release? {
         val req = Request.Builder()
             .url("https://api.github.com/repos/$REPO/releases?per_page=20")
             .header("Accept", "application/vnd.github+json")
             .header("User-Agent", "CableTV/1.0")
             .build()
-        http.newCall(req).execute().use { resp ->
+        val client = if (callTimeoutSeconds > 0) {
+            http.newBuilder().callTimeout(callTimeoutSeconds, TimeUnit.SECONDS).build()
+        } else {
+            http
+        }
+        client.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) error("GitHub returned HTTP ${resp.code}")
             val releases = JSONArray(resp.body?.string() ?: error("Empty response from GitHub"))
             var best: Release? = null
