@@ -11,6 +11,7 @@ import com.dallas.cabletv.data.companion.client.PairedTv
 import com.dallas.cabletv.data.companion.client.PinCancelledException
 import com.dallas.cabletv.data.companion.client.RemoteKey
 import com.dallas.cabletv.data.companion.client.SavedReply
+import com.dallas.cabletv.data.companion.client.SyncChoice
 import com.dallas.cabletv.data.companion.client.SessionStatus
 import com.dallas.cabletv.data.companion.client.GridPage
 import com.dallas.cabletv.data.companion.client.GuideChannel
@@ -18,6 +19,7 @@ import com.dallas.cabletv.data.companion.client.LibraryPage
 import com.dallas.cabletv.data.companion.client.LineupSummary
 import com.dallas.cabletv.data.companion.client.SearchResults
 import com.dallas.cabletv.data.companion.client.TitleItem
+import com.dallas.cabletv.data.companion.client.TvCopy
 import com.dallas.cabletv.data.companion.client.TvDebugLog
 import com.dallas.cabletv.data.companion.client.objects
 import com.dallas.cabletv.data.companion.client.stringList
@@ -300,6 +302,72 @@ class TvScreenModel(private val tvId: String, private val app: CompanionModel) {
                 setSection("lineup", SectionResult(error = app.errorText(e)))
             }
         }
+    }
+
+    // Copy on this phone
+
+    private val _copy = MutableStateFlow<TvCopy?>(null)
+    val copy: StateFlow<TvCopy?> = _copy
+
+    /** Reads the copy this phone has saved for this TV. */
+    fun loadCopy() {
+        _copy.value = app.copies.saved(tvId)
+    }
+
+    /** Exports every section from the TV and keeps it on this phone, replacing any older copy. */
+    fun saveCopyToPhone() {
+        setSection("copy", SectionResult(busy = true))
+        scope.launch {
+            try {
+                val sections = SyncChoice.ALL.map { it.key }
+                val reply = withPin(tvId, app.pins, { app.askPin(tvNow().name, it) }) { pin ->
+                    session.request(CompanionRequests.exportSync(pin, sections))
+                }
+                val data = reply.optJSONObject("data") ?: throw CompanionException(
+                    CompanionException.Kind.PROTOCOL, "The TV sent no setup to copy."
+                )
+                val copy = TvCopy(tvId, tvNow().name, System.currentTimeMillis(), data)
+                app.copies.save(copy)
+                _copy.value = copy
+                setSection("copy", SectionResult(messages = listOf("Copy saved on this phone.")))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: PinCancelledException) {
+                setSection("copy", SectionResult(error = "Nothing was saved. The TV needs its PIN."))
+            } catch (e: Exception) {
+                setSection("copy", SectionResult(error = app.errorText(e)))
+            }
+        }
+    }
+
+    /** Sends the saved copy back to the TV. Only the sections in the copy are changed. */
+    fun restoreCopyToTv() {
+        val saved = _copy.value ?: return setSection("copy", SectionResult(error = "No copy is saved on this phone."))
+        setSection("copy", SectionResult(busy = true))
+        scope.launch {
+            try {
+                val reply = withPin(tvId, app.pins, { app.askPin(tvNow().name, it) }) { pin ->
+                    session.request(CompanionRequests.importSync(pin, saved.data))
+                }
+                val messages = reply.stringList("messages").ifEmpty { listOf("Copy restored to the TV.") }
+                // Logins and channel settings may have changed, so the Settings tab reloads them.
+                _settings.value = SettingsLoad.Idle
+                setSection("copy", SectionResult(messages = messages))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: PinCancelledException) {
+                setSection("copy", SectionResult(error = "Nothing was restored. The TV needs its PIN."))
+            } catch (e: Exception) {
+                setSection("copy", SectionResult(error = app.errorText(e)))
+            }
+        }
+    }
+
+    /** Removes the copy from this phone. The TV is not changed. */
+    fun deleteCopy() {
+        app.copies.remove(tvId)
+        _copy.value = null
+        setSection("copy", SectionResult(messages = listOf("Copy removed from this phone.")))
     }
 
     // Settings

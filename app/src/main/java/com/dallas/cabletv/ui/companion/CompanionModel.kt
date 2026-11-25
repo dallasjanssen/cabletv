@@ -11,6 +11,7 @@ import com.dallas.cabletv.data.companion.client.CompanionException
 import com.dallas.cabletv.data.companion.client.LinkConnector
 import com.dallas.cabletv.data.companion.client.PairedTv
 import com.dallas.cabletv.data.companion.client.PairedTvStore
+import com.dallas.cabletv.data.companion.client.TvCopyStore
 import com.dallas.cabletv.data.companion.client.PinCancelledException
 import com.dallas.cabletv.data.companion.client.PinMemory
 import com.dallas.cabletv.data.companion.client.SyncRunner
@@ -56,6 +57,9 @@ class PinPrompt(val tvName: String, val wasWrong: Boolean, val answer: Completab
 class CompanionModel(context: Context, private val scope: CoroutineScope) {
     private val appContext = context.applicationContext
     val store = PairedTvStore(appContext)
+
+    /** This phone's copies of each TV's setup. */
+    val copies = TvCopyStore(appContext)
     private val discovery = TvDiscovery(appContext)
 
     /** The parental PIN of each TV, until the app closes. */

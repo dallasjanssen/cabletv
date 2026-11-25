@@ -197,6 +197,10 @@ other. Each part is a key under `sections`:
   target's lineup. The lineup holds only public channel names and numbers and the key, so it
   never includes stream addresses or logins.
 
+A phone can keep a copy of a TV's setup: it asks for `export_sync` with every section and stores the
+sync file encrypted on the phone, one copy per TV. Restoring sends that file back with `import_sync`.
+No new message is needed for this, and the TV keeps nothing extra.
+
 Never part of sync: the Home Assistant webhook, the last channel, recents, resume points, track
 choices, reminders, recordings and paired phones. They belong to one TV.
 

@@ -23,6 +23,7 @@ import androidx.compose.ui.unit.dp
 import com.dallas.cabletv.data.companion.client.ChannelSettings
 import com.dallas.cabletv.data.companion.client.LibrarySettings
 import com.dallas.cabletv.data.companion.client.LineupSummary
+import com.dallas.cabletv.data.companion.client.TvCopy
 import com.dallas.cabletv.data.companion.client.LiveSettings
 import com.dallas.cabletv.data.companion.client.SessionStatus
 import com.dallas.cabletv.data.companion.client.SettingsChanges
@@ -30,6 +31,9 @@ import com.dallas.cabletv.ui.StatusChip
 import com.dallas.cabletv.ui.Tv
 import com.dallas.cabletv.ui.TvType
 import org.json.JSONObject
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 /** The Settings tab: the TV's settings sections as forms, each with its own Save. */
 @Composable
@@ -45,11 +49,15 @@ fun SettingsTab(m: TvScreenModel) {
     LaunchedEffect(online) {
         if (online) m.loadLineup()
     }
+    LaunchedEffect(Unit) {
+        m.loadCopy()
+    }
 
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
+        CopySection(m, online, sections)
         if (online) LineupSection(m, sections)
         when {
             load is SettingsLoad.Loaded -> {
@@ -270,4 +278,56 @@ private fun lineupStatus(summary: LineupSummary?): String = when {
         append(".")
         if (!summary.keySet) append(" Add an OpenRouter key to place the rest.")
     }
+}
+
+/** A copy of the TV's setup, kept on this phone. Saving and restoring need the TV. */
+@Composable
+private fun CopySection(m: TvScreenModel, online: Boolean, sections: Map<String, SectionResult>) {
+    val copy by m.copy.collectAsState()
+    val result = sections["copy"]
+    val busy = result?.busy == true
+    var confirmRestore by remember { mutableStateOf(false) }
+    SectionCard("Copy on this phone") {
+        Text(copyStatus(copy), style = TvType.Small, color = Tv.Ink2)
+        Text(
+            "A copy holds the TV's logins, PIN, channel settings, favorites and lineup. It is kept encrypted on this phone only.",
+            style = TvType.Small,
+            color = Tv.Ink3
+        )
+        PrimaryButton(
+            if (busy) "Saving..." else "Save a copy from this TV",
+            onClick = { confirmRestore = false; m.saveCopyToPhone() },
+            modifier = Modifier.fillMaxWidth(),
+            enabled = online && !busy
+        )
+        if (copy != null) {
+            SecondaryButton(
+                if (confirmRestore) "Tap again to replace the TV's setup" else "Restore copy to this TV",
+                onClick = {
+                    if (confirmRestore) {
+                        confirmRestore = false
+                        m.restoreCopyToTv()
+                    } else {
+                        confirmRestore = true
+                    }
+                },
+                modifier = Modifier.fillMaxWidth(),
+                enabled = online && !busy
+            )
+            QuietButton(
+                "Remove copy from this phone",
+                onClick = { confirmRestore = false; m.deleteCopy() },
+                enabled = !busy
+            )
+        }
+        if (!online) Text("Connect to the TV to save or restore a copy.", style = TvType.Small, color = Tv.Ink3)
+        SaveResult(result)
+    }
+}
+
+private fun copyStatus(copy: TvCopy?): String {
+    if (copy == null) return "No copy saved yet."
+    val savedAt = SimpleDateFormat("d MMM yyyy, h:mm a", Locale.getDefault()).format(Date(copy.savedAtMs))
+    val from = copy.tvName.ifBlank { "this TV" }
+    return "Copy from $from, saved $savedAt."
 }
