@@ -54,8 +54,7 @@ class MessageRouter(
                 Types.IMPORT_SYNC -> guarded(re, msg) { importSync(re, msg) }
                 Types.GET_DEBUG_LOG -> guarded(re, msg) { debugLogReply(re, backend.debugLog()) }
                 Types.SET_DEBUG_LOG -> guarded(re, msg) { setDebugLog(re, msg) }
-                Types.GET_GUIDE -> CompanionProtocol.reply(re, Types.GUIDE).put("channels", backend.guide())
-                Types.GET_SCHEDULE -> schedule(re, msg)
+                Types.GET_GRID -> grid(re, msg)
                 Types.SEARCH -> search(re, msg)
                 Types.GET_LIBRARY -> library(re, msg)
                 Types.OPEN_TITLE -> openTitle(re, msg)
@@ -153,13 +152,19 @@ class MessageRouter(
             is PinResult.Wait -> fail(re, Errors.PIN_WAIT, "Too many tries. Wait ${check.seconds} seconds.")
         }
 
-    private fun schedule(re: Int?, msg: JSONObject): JSONObject {
-        val id = msg.optString("channel_id").takeIf { it.isNotEmpty() }
-            ?: return fail(re, Errors.BAD_REQUEST, "Choose a channel.")
-        val view = backend.schedule(id) ?: return fail(re, Errors.BAD_REQUEST, "The TV does not have that channel.")
-        return CompanionProtocol.reply(re, Types.SCHEDULE)
-            .put("channel", view.channel)
-            .put("programs", view.programs)
+    private fun grid(re: Int?, msg: JSONObject): JSONObject {
+        val group = msg.optString("group").trim()
+        if (group.isEmpty()) return fail(re, Errors.BAD_REQUEST, "Choose a category.")
+        val start = msg.optLong("start_ms", 0L)
+        if (start <= 0L) return fail(re, Errors.BAD_REQUEST, "Choose a time for the guide to start from.")
+        val view = backend.grid(group, start, msg.optInt("offset", 0), msg.optInt("limit", BrowseJson.GRID_PAGE_MAX))
+        return CompanionProtocol.reply(re, Types.GRID)
+            .put("groups", view.groups)
+            .put("group", view.group)
+            .put("start_ms", view.startMs)
+            .put("end_ms", view.endMs)
+            .put("total", view.total)
+            .put("channels", view.channels)
     }
 
     private fun search(re: Int?, msg: JSONObject): JSONObject {

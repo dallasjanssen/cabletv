@@ -22,14 +22,18 @@ class BrowseJsonTest {
         VodItem(id = name, name = name, year = null, overview = null, posterUrl = "", streamUrl = "", type = "Movie")
 
     @Test
-    fun scheduleKeepsWhatIsOnAndWhatFollowsInsideTheWindow() {
+    fun gridRowKeepsOnlyTheProgrammesThatOverlapTheWindow() {
         val programs = listOf(
-            program("Ended", 8.0, 9.0),
-            program("On now", 9.5, 10.5),
-            program("Later", 11.0, 12.0),
+            program("Ended", 1.0, 2.0),
+            program("Overlaps", 3.5, 5.0),
+            program("Later", 7.0, 8.0),
             program("Too late", 30.0, 31.0)
         )
-        assertEquals(listOf("On now", "Later"), BrowseJson.scheduleWindow(programs, now).map { it.title })
+        val row = BrowseJson.gridRow(channel("1", "ESPN"), false, programs, startMs = 4 * hour, endMs = 8 * hour, now = now)
+        val titles = row.getJSONArray("programs")
+        assertEquals(2, titles.length())
+        assertEquals("Overlaps", titles.getJSONObject(0).getString("title"))
+        assertEquals("Later", titles.getJSONObject(1).getString("title"))
     }
 
     @Test

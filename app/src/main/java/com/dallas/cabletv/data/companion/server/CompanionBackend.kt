@@ -12,8 +12,18 @@ class PutResult(val messages: List<String>, val settings: JSONObject)
 /** The TV's debug log: whether debug logging is on, and the text recorded so far. */
 class DebugLogState(val enabled: Boolean, val log: String)
 
-/** What `get_schedule` answers with: the channel as the guide lists it, and its programmes for the next hours. */
-class ScheduleView(val channel: JSONObject, val programs: JSONArray)
+/**
+ * What `get_grid` answers with: the category names, the window the rows cover in epoch milliseconds,
+ * how many channels the category has, and the page of channel rows asked for.
+ */
+class GridView(
+    val groups: JSONArray,
+    val group: String,
+    val startMs: Long,
+    val endMs: Long,
+    val total: Int,
+    val channels: JSONArray
+)
 
 /** What `search` answers with: matching channels and matching movies or shows. */
 class SearchView(val channels: JSONArray, val titles: JSONArray)
@@ -64,11 +74,12 @@ interface CompanionBackend {
     /** Turns debug logging on or off when [enabled] is given, and empties the log first when [clear] is true. */
     fun changeDebugLog(enabled: Boolean?, clear: Boolean): DebugLogState
 
-    /** Every channel in the list, with what is on now and next. */
-    fun guide(): JSONArray
-
-    /** A channel's programmes for the next hours, or null when the TV has no channel with that id. */
-    fun schedule(channelId: String): ScheduleView?
+    /**
+     * The guide as the TV draws it: channels of [group] from [offset] on, each with the programmes
+     * that overlap the four hours from [startMs]. The categories and the channel list come from the
+     * same functions as the TV's guide, so the two cannot differ.
+     */
+    fun grid(group: String, startMs: Long, offset: Int, limit: Int): GridView
 
     /** Channels and movies or shows whose name matches [query]. */
     fun search(query: String): SearchView

@@ -47,10 +47,14 @@ object CompanionRequests {
         return withPin(message, pin)
     }
 
-    fun getGuide(): JSONObject = JSONObject().put("type", Types.GET_GUIDE)
-
-    fun getSchedule(channelId: String): JSONObject =
-        JSONObject().put("type", Types.GET_SCHEDULE).put("channel_id", channelId)
+    /** One page of a guide category, with the four hours from [startMs] (epoch milliseconds). */
+    fun getGrid(group: String, startMs: Long, offset: Int, limit: Int): JSONObject =
+        JSONObject()
+            .put("type", Types.GET_GRID)
+            .put("group", group)
+            .put("start_ms", startMs)
+            .put("offset", offset)
+            .put("limit", limit)
 
     fun search(query: String): JSONObject = JSONObject().put("type", Types.SEARCH).put("query", query)
 

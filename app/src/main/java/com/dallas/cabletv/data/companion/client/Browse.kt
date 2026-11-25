@@ -65,8 +65,48 @@ data class TitleItem(
     }
 }
 
-/** The programmes of one channel, for the next hours. */
-data class ScheduleList(val channelId: String, val programs: List<BrowseProgram>)
+/** One channel's row in the guide grid: its programmes in the window the TV sent. */
+data class GridChannel(
+    val id: String,
+    val number: Int,
+    val name: String,
+    val locked: Boolean,
+    val programs: List<BrowseProgram>
+) {
+    companion object {
+        fun fromJson(json: JSONObject): GridChannel = GridChannel(
+            id = json.optString("id"),
+            number = json.optInt("number"),
+            name = json.optString("name"),
+            locked = json.optBoolean("locked"),
+            programs = json.optJSONArray("programs").objects { BrowseProgram.fromJson(it) }
+        )
+    }
+}
+
+/**
+ * The guide grid: the category names, the window the rows cover, how many channels the category
+ * has, and the channels loaded so far.
+ */
+data class GridPage(
+    val groups: List<String>,
+    val group: String,
+    val startMs: Long,
+    val endMs: Long,
+    val total: Int,
+    val channels: List<GridChannel>
+) {
+    companion object {
+        fun fromJson(json: JSONObject): GridPage = GridPage(
+            groups = json.optJSONArray("groups").strings(),
+            group = json.optString("group"),
+            startMs = json.optLong("start_ms"),
+            endMs = json.optLong("end_ms"),
+            total = json.optInt("total"),
+            channels = json.optJSONArray("channels").objects { GridChannel.fromJson(it) }
+        )
+    }
+}
 
 /** What a search found. */
 data class SearchResults(val channels: List<GuideChannel>, val titles: List<TitleItem>)
@@ -78,6 +118,12 @@ data class LibraryPage(val items: List<TitleItem>, val total: Int)
 fun <T> JSONArray?.objects(parse: (JSONObject) -> T): List<T> {
     if (this == null) return emptyList()
     return (0 until length()).mapNotNull { optJSONObject(it)?.let(parse) }
+}
+
+/** Each text entry in the array, in order. Entries that are not text are read as they come. */
+fun JSONArray?.strings(): List<String> {
+    if (this == null) return emptyList()
+    return (0 until length()).map { optString(it) }
 }
 
 private fun instantMs(text: String): Long = runCatching { Instant.parse(text).toEpochMilli() }.getOrDefault(0L)

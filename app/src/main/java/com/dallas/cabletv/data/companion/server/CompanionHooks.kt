@@ -1,6 +1,7 @@
 package com.dallas.cabletv.data.companion.server
 
 import com.dallas.cabletv.data.LiveChannel
+import com.dallas.cabletv.data.Program
 import com.dallas.cabletv.data.Settings
 import com.dallas.cabletv.data.VodItem
 import com.dallas.cabletv.data.companion.CompanionProtocol
@@ -42,6 +43,9 @@ class CompanionHooks {
 
     /** Handles a cabletv: link exactly as one from Home Assistant. */
     @Volatile var openLink: (String) -> Unit = { notReady() }
+
+    /** The programmes the TV's guide shows for a channel, the same list its grid draws. */
+    @Volatile var programsOf: (LiveChannel) -> List<Program> = { notReady() }
 
     /** The movies and the shows the TV has loaded, as On Demand lists them. */
     @Volatile var vodCatalog: () -> Pair<List<VodItem>, List<VodItem>> = { notReady() }

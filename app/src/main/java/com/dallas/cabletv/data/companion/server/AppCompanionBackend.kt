@@ -11,6 +11,9 @@ import com.dallas.cabletv.data.EpgCache
 import com.dallas.cabletv.data.LiveChannel
 import com.dallas.cabletv.data.VodItem
 import com.dallas.cabletv.data.isLocked
+import com.dallas.cabletv.ui.categoryItems
+import com.dallas.cabletv.ui.channelsIn
+import com.dallas.cabletv.ui.groupsOf
 import com.dallas.cabletv.data.HomeAssistantReporter
 import com.dallas.cabletv.data.Profile
 import com.dallas.cabletv.data.ProfileStore
@@ -98,19 +101,21 @@ class AppCompanionBackend(
         return PutResult(change.messages, json)
     }
 
-    override fun guide(): JSONArray {
-        val now = System.currentTimeMillis()
+    override fun grid(group: String, startMs: Long, offset: Int, limit: Int): GridView {
         val channels = main.call { hooks.channels() }
+        val userState = UserStateStore(context, profileStore.active())
+        val rows = channelsIn(group, channels, userState.favorites(), userState.recents())
+        val page = rows.drop(offset.coerceAtLeast(0)).take(limit.coerceIn(1, BrowseJson.GRID_PAGE_MAX))
+        val endMs = startMs + BrowseJson.GRID_WINDOW_MS
+        // The programmes come from the same guide data the TV's grid draws, read on the main thread.
+        val schedules = main.call { page.map { hooks.programsOf(it) } }
         val locks = locks()
-        return JSONArray(channels.map { BrowseJson.channel(it, locks.channel(it), EpgCache.nowNext(it.epgId, it.name), now) })
-    }
-
-    override fun schedule(channelId: String): ScheduleView? {
-        val ch = main.call { hooks.channels() }.firstOrNull { it.id == channelId } ?: return null
         val now = System.currentTimeMillis()
-        val programs = BrowseJson.scheduleWindow(EpgCache.schedule(ch.epgId, ch.name), now).map { BrowseJson.program(it, now) }
-        val channel = BrowseJson.channel(ch, locks().channel(ch), EpgCache.nowNext(ch.epgId, ch.name), now)
-        return ScheduleView(channel, JSONArray(programs))
+        val out = JSONArray()
+        page.forEachIndexed { i, ch ->
+            out.put(BrowseJson.gridRow(ch, locks.channel(ch), schedules[i], startMs, endMs, now))
+        }
+        return GridView(JSONArray(categoryItems(groupsOf(channels))), group, startMs, endMs, rows.size, out)
     }
 
     override fun search(query: String): SearchView {

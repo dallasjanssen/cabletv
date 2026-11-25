@@ -1057,6 +1057,7 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
         }
         companionHooks.openLink = { companionLink = it }
         companionHooks.vodCatalog = { shelves.movies to shelves.series }
+        companionHooks.programsOf = { guide.schedule(it) }
         companionHooks.openTitle = { companionTitle = it }
         companionHooks.showToast = showToast
     }

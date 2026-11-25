@@ -100,8 +100,7 @@ Every message has a `type`. Requests from the phone also have `id`.
 | `import_sync` `{pin?, data}` | `saved` `{messages}` or `error` | PIN rules apply. |
 | `get_debug_log` `{pin?}` | `debug_log` `{enabled, log}` | PIN rules apply. See Debug log. |
 | `set_debug_log` `{pin?, enabled?, clear?}` | `debug_log` `{enabled, log}` | PIN rules apply. `enabled` turns logging on or off. `clear` empties the log first. |
-| `get_guide` | `guide` `{channels}` | Browsing, no PIN. See Browsing the TV. |
-| `get_schedule` `{channel_id}` | `schedule` `{channel, programs}` | Browsing, no PIN. Programmes for the next 12 hours. |
+| `get_grid` `{group, start_ms, offset?, limit?}` | `grid` `{groups, group, start_ms, end_ms, total, channels}` | Browsing, no PIN. The guide as the TV draws it. See Browsing the TV. |
 | `search` `{query}` | `results` `{channels, titles}` | Browsing, no PIN. Up to 40 of each. |
 | `get_library` `{kind, offset?, limit?}` | `library` `{items, total}` | Browsing, no PIN. `kind` is `movies` or `series`. Up to 100 per page. |
 | `open_title` `{source, media_type, id}` | `ok` | Opens a movie or show on the TV. The TV asks for its PIN when the title is locked. |
@@ -196,10 +195,16 @@ The phone's Guide, Search and Library tabs read the TV's own lists. Browsing nev
 TV shows. Only a choice does: `open` with a channel link tunes the TV, and `open_title` opens a
 movie or show the way choosing it in On Demand does.
 
-- `guide` answers `channels`: each `{id, number, name, locked, now?, next?}`. `now` and `next` are
-  programmes `{title, start, end, desc?, on_now}`, with times as ISO 8601 text.
-- `schedule` answers `channel` (the same shape as a guide channel) and `programs`, the programmes
-  that are on now or start in the next 12 hours, oldest first.
+- `get_grid` is the guide grid. `group` is one of the TV's categories, taken from `groups` in the
+  answer: Favorites, Recently watched, All channels, or a provider group. The favorites and recent
+  channels are the active profile's. `start_ms` is the epoch time the window starts at, and the
+  window is four hours. The app sends a half hour boundary, as the TV's guide does.
+- `grid` answers `groups`, `group`, `start_ms` and `end_ms` (the window), `total` (channels in the
+  category) and `channels`. Each channel is `{id, number, name, locked, programs}`, where
+  `programs` are the programmes overlapping the window, `{title, start, end, desc?, on_now}`, with
+  times as ISO 8601 text. An empty `programs` means the guide has nothing for that channel.
+  Page through a long category with `offset` and `limit` (up to 60 per page).
+- The programmes come from the same guide data the TV's grid draws, so the two cannot disagree.
 - `results` answers `channels` (guide channels) and `titles`: each `{id, source, media_type, name,
   year?, locked}`.
 - `library` answers `items` (titles, sorted by name) and `total`. Ask for the next page with

@@ -12,10 +12,9 @@ import com.dallas.cabletv.data.companion.client.PinCancelledException
 import com.dallas.cabletv.data.companion.client.RemoteKey
 import com.dallas.cabletv.data.companion.client.SavedReply
 import com.dallas.cabletv.data.companion.client.SessionStatus
-import com.dallas.cabletv.data.companion.client.BrowseProgram
+import com.dallas.cabletv.data.companion.client.GridPage
 import com.dallas.cabletv.data.companion.client.GuideChannel
 import com.dallas.cabletv.data.companion.client.LibraryPage
-import com.dallas.cabletv.data.companion.client.ScheduleList
 import com.dallas.cabletv.data.companion.client.SearchResults
 import com.dallas.cabletv.data.companion.client.TitleItem
 import com.dallas.cabletv.data.companion.client.TvDebugLog
@@ -312,10 +311,9 @@ class TvScreenModel(private val tvId: String, private val app: CompanionModel) {
     // Guide, search and library. Browsing only reads; nothing here changes what the TV shows.
     private val pageSize = 50
 
-    private val _guide = MutableStateFlow(BrowseLoad<List<GuideChannel>>())
-    val guide: StateFlow<BrowseLoad<List<GuideChannel>>> = _guide
-    private val _schedule = MutableStateFlow(BrowseLoad<ScheduleList>())
-    val schedule: StateFlow<BrowseLoad<ScheduleList>> = _schedule
+    private val gridPage = 60
+    private val _grid = MutableStateFlow(BrowseLoad<GridPage>())
+    val grid: StateFlow<BrowseLoad<GridPage>> = _grid
     private val _searchResults = MutableStateFlow(BrowseLoad<SearchResults>())
     val searchResults: StateFlow<BrowseLoad<SearchResults>> = _searchResults
     private val _libraryPage = MutableStateFlow(BrowseLoad<LibraryPage>())
@@ -323,14 +321,21 @@ class TvScreenModel(private val tvId: String, private val app: CompanionModel) {
     private val _libraryMovies = MutableStateFlow(true)
     val libraryMovies: StateFlow<Boolean> = _libraryMovies
 
-    fun loadGuide() = browse(_guide, { session.request(CompanionRequests.getGuide()) }) { r ->
-        r.optJSONArray("channels").objects { GuideChannel.fromJson(it) }
-    }
-
-    fun loadSchedule(channelId: String) =
-        browse(_schedule, { session.request(CompanionRequests.getSchedule(channelId)) }) { r ->
-            ScheduleList(channelId, r.optJSONArray("programs").objects { BrowseProgram.fromJson(it) })
+    /** Shows a guide category from [startMs] on: the first page of its channels, with the programmes for four hours. */
+    fun loadGrid(group: String, startMs: Long) =
+        browse(_grid, { session.request(CompanionRequests.getGrid(group, startMs, 0, gridPage)) }) { r ->
+            GridPage.fromJson(r)
         }
+
+    /** Adds the next page of channels to the guide, when the TV has more. */
+    fun loadMoreGrid() {
+        val current = _grid.value.data ?: return
+        if (_grid.value.busy || current.channels.size >= current.total) return
+        browse(_grid, { session.request(CompanionRequests.getGrid(current.group, current.startMs, current.channels.size, gridPage)) }) { r ->
+            val next = GridPage.fromJson(r)
+            current.copy(channels = current.channels + next.channels, total = next.total)
+        }
+    }
 
     fun search(query: String) = browse(_searchResults, { session.request(CompanionRequests.search(query.trim())) }) { r ->
         SearchResults(

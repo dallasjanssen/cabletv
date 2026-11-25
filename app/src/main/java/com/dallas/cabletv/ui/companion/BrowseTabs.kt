@@ -38,7 +38,7 @@ private fun clock(ms: Long): String = Instant.ofEpochMilli(ms).atZone(ZoneId.sys
 private fun span(p: BrowseProgram): String = "${clock(p.startMs)} to ${clock(p.endMs)}"
 
 @Composable
-private fun NeedsTheTv(text: String) {
+internal fun NeedsTheTv(text: String) {
     SectionCard(null) {
         Text(text, style = TvType.Body, color = Tv.Ink2)
     }
@@ -72,80 +72,6 @@ private fun TitleRow(item: TitleItem, onClick: () -> Unit) {
         val year = item.year?.let { " ($it)" }.orEmpty()
         Text(item.name + year, style = TvType.BodyStrong, color = Tv.Ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
         if (item.locked) Text("Locked. The TV asks for its PIN to open it.", style = TvType.Body, color = Tv.Ink3)
-    }
-}
-
-/**
- * The guide: every channel with what is on now and next. Choosing a channel shows its programmes
- * for the next hours. The TV keeps what it is showing until the person picks something here.
- */
-@Composable
-fun GuideTab(m: TvScreenModel) {
-    val status by m.status.collectAsState()
-    val guide by m.guide.collectAsState()
-    val schedule by m.schedule.collectAsState()
-    val message by m.message.collectAsState()
-    var selected by rememberSaveable { mutableStateOf<String?>(null) }
-    val online = status is SessionStatus.Online
-    LaunchedEffect(online) {
-        if (online && guide.data == null && !guide.busy) m.loadGuide()
-    }
-
-    if (!online) {
-        NeedsTheTv("The guide needs the TV. Cable TV is closed or the TV is off.")
-        return
-    }
-    val chosen = selected
-    Column(
-        Modifier.fillMaxSize().padding(horizontal = 16.dp, vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
-    ) {
-        message?.let { MessageLine(it, error = false) }
-        if (chosen == null) {
-            guide.error?.let { MessageLine(it, error = true) }
-            if (guide.busy && guide.data == null) Text("Loading the guide...", style = TvType.Body, color = Tv.Ink3)
-            SecondaryButton("Refresh guide", onClick = { m.loadGuide() }, modifier = Modifier.fillMaxWidth(), enabled = !guide.busy)
-            LazyColumn(Modifier.weight(1f)) {
-                items(guide.data.orEmpty(), key = { it.id }) { ch ->
-                    ChannelRow(ch) {
-                        selected = ch.id
-                        m.loadSchedule(ch.id)
-                    }
-                }
-            }
-        } else {
-            val channel = guide.data?.firstOrNull { it.id == chosen }
-            SecondaryButton("Back to the guide", onClick = { selected = null }, modifier = Modifier.fillMaxWidth())
-            Text(
-                channel?.name ?: "Channel",
-                style = TvType.Headline,
-                color = Tv.Ink,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-            PrimaryButton("Watch on the TV", onClick = { m.watchChannel(chosen) }, modifier = Modifier.fillMaxWidth())
-            schedule.error?.let { MessageLine(it, error = true) }
-            val programs = schedule.data?.takeIf { it.channelId == chosen }?.programs
-            when {
-                programs == null -> Text("Loading the schedule...", style = TvType.Body, color = Tv.Ink3)
-                programs.isEmpty() -> Text("Nothing is listed for the next hours.", style = TvType.Body, color = Tv.Ink2)
-                else -> LazyColumn(Modifier.weight(1f)) {
-                    items(programs) { p ->
-                        Column(Modifier.fillMaxWidth().padding(vertical = 8.dp).let { base ->
-                            if (p.onNow) base.clickable { m.watchChannel(chosen) } else base
-                        }) {
-                            Text(
-                                (if (p.onNow) "On now  " else "") + span(p),
-                                style = TvType.Body,
-                                color = if (p.onNow) Tv.Accent else Tv.Ink3
-                            )
-                            Text(p.title, style = TvType.BodyStrong, color = if (p.onNow) Tv.Ink else Tv.Ink2, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                            if (p.onNow) Text("Tap to watch it on the TV.", style = TvType.Body, color = Tv.Ink3)
-                        }
-                    }
-                }
-            }
-        }
     }
 }
 

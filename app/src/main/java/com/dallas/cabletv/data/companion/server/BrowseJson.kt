@@ -5,6 +5,7 @@ import com.dallas.cabletv.data.NowNext
 import com.dallas.cabletv.data.Program
 import com.dallas.cabletv.data.SearchMatcher
 import com.dallas.cabletv.data.VodItem
+import org.json.JSONArray
 import org.json.JSONObject
 import java.time.Instant
 
@@ -13,16 +14,17 @@ import java.time.Instant
  * Times are ISO 8601 text, as the now playing message sends them.
  */
 object BrowseJson {
-    /** How far ahead a channel's schedule reaches on the phone. */
-    const val SCHEDULE_HOURS = 12L
+    /** How long the guide grid's window is, in milliseconds: four hours, as the TV's guide shows them. */
+    const val GRID_WINDOW_MS = 4 * 3_600_000L
+
+    /** Most channel rows one grid page sends. */
+    const val GRID_PAGE_MAX = 60
 
     /** Most channels a search lists, and most titles it lists. */
     const val SEARCH_LIMIT = 40
 
     /** Most titles one library page sends. */
     const val LIBRARY_PAGE_MAX = 100
-
-    private const val HOUR_MS = 3_600_000L
 
     fun program(p: Program, now: Long): JSONObject {
         val json = JSONObject()
@@ -56,10 +58,18 @@ object BrowseJson {
         return json
     }
 
-    /** Programmes that are on now or start within the schedule window, in the order given. */
-    fun scheduleWindow(programs: List<Program>, now: Long): List<Program> {
-        val until = now + SCHEDULE_HOURS * HOUR_MS
-        return programs.filter { it.end > now && it.start < until }
+    /**
+     * One channel's row of the grid: the programmes that overlap the window from [startMs] to [endMs],
+     * in the order given. An empty list means the guide has nothing for the channel.
+     */
+    fun gridRow(ch: LiveChannel, locked: Boolean, programs: List<Program>, startMs: Long, endMs: Long, now: Long): JSONObject {
+        val inWindow = programs.filter { it.end > it.start && it.end > startMs && it.start < endMs }
+        return JSONObject()
+            .put("id", ch.id)
+            .put("number", ch.number)
+            .put("name", ch.name)
+            .put("locked", locked)
+            .put("programs", JSONArray(inWindow.map { program(it, now) }))
     }
 
     /** Channels whose name matches [query], in list order, up to [SEARCH_LIMIT]. */
