@@ -46,8 +46,10 @@ import androidx.media3.common.C
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.Timeline
+import androidx.media3.common.VideoSize
 import androidx.media3.exoplayer.ExoPlayer
 import com.dallas.cabletv.data.liveMediaItem
+import com.dallas.cabletv.data.DebugLog
 import com.dallas.cabletv.data.TrackMemory
 import com.dallas.cabletv.data.newPlayer
 import com.dallas.cabletv.data.playbackHttpStatus
@@ -102,6 +104,7 @@ class LivePlayer(context: Context) {
 
     private val listener = object : Player.Listener {
         override fun onPlayerError(error: PlaybackException) {
+            DebugLog.log("live", "Player error ${error.errorCodeName}", error)
             // One switch from HLS to MPEG-TS when the panel refuses the stream before it plays.
             val status = playbackHttpStatus(error)
             val fb = fallback
@@ -126,6 +129,13 @@ class LivePlayer(context: Context) {
         }
 
         override fun onPlaybackStateChanged(playbackState: Int) {
+            DebugLog.log("live", "Playback " + when (playbackState) {
+                Player.STATE_IDLE -> "idle"
+                Player.STATE_BUFFERING -> "buffering"
+                Player.STATE_READY -> "ready"
+                Player.STATE_ENDED -> "ended"
+                else -> "unknown"
+            })
             buffering = playbackState == Player.STATE_BUFFERING
             if (playbackState == Player.STATE_READY) {
                 played = true
@@ -142,6 +152,10 @@ class LivePlayer(context: Context) {
                     if (quickEnds >= MAX_QUICK_ENDS) failed = true else retryLater(reload = true)
                 }
             }
+        }
+
+        override fun onVideoSizeChanged(videoSize: VideoSize) {
+            DebugLog.log("live", "Picture ${videoSize.width}x${videoSize.height}")
         }
 
         override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
@@ -191,6 +205,7 @@ class LivePlayer(context: Context) {
     }
 
     private fun load(target: String) {
+        DebugLog.log("live", "Loading a stream from ${DebugLog.hostOf(target)}")
         handler.removeCallbacksAndMessages(null)
         url = target
         failed = false

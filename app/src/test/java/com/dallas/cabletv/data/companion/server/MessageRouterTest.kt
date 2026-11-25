@@ -33,6 +33,8 @@ private class FakeBackend : CompanionBackend {
     override fun putSettings(settings: JSONObject) = PutResult(listOf("Saved."), settings)
     override fun exportSync(sections: List<String>): JSONObject = JSONObject().put("format", 1).put("sections", JSONObject())
     override fun importSync(data: JSONObject): List<String> = listOf("Done.")
+    override fun debugLog() = DebugLogState(enabled = false, log = "")
+    override fun changeDebugLog(enabled: Boolean?, clear: Boolean) = DebugLogState(enabled = enabled ?: false, log = "")
 }
 
 class MessageRouterTest {

@@ -98,6 +98,8 @@ Every message has a `type`. Requests from the phone also have `id`.
 | `put_settings` `{pin?, settings}` | `saved` `{messages, settings}` or `error` | PIN rules apply. |
 | `export_sync` `{pin?, sections}` | `sync_data` `{data}` | PIN rules apply. |
 | `import_sync` `{pin?, data}` | `saved` `{messages}` or `error` | PIN rules apply. |
+| `get_debug_log` `{pin?}` | `debug_log` `{enabled, log}` | PIN rules apply. See Debug log. |
+| `set_debug_log` `{pin?, enabled?, clear?}` | `debug_log` `{enabled, log}` | PIN rules apply. `enabled` turns logging on or off. `clear` empties the log first. |
 
 Every message except `hello`, `pair_start`, `pair_finish` and `ping` answers `not_paired` until the
 phone has paired.
@@ -182,6 +184,18 @@ other. Each part is a key under `sections`:
 
 Never part of sync: the Home Assistant webhook, the last channel, recents, resume points, track
 choices, reminders, recordings and paired phones. They belong to one TV.
+
+### Debug log
+
+The TV keeps a debug log while debug logging is on. The phone turns it on and off from the Debug
+tab of a TV's screen. The log records playback and phone connection events, such as a channel
+loading, a player error or a phone pairing. Each line goes through the same redaction as crash
+reports, so stream addresses, logins and Authorization headers are hidden before a line is kept.
+Nothing is written while logging is off. The log is kept in the TV's app storage and is cut back
+to its newest part once it passes about 256 KB. It is never part of sync.
+
+`debug_log` answers with `enabled` (whether logging is on) and `log` (the text, oldest line first).
+Both requests need the PIN when the TV has one, because the log shows what was watched.
 
 ### PIN rules
 

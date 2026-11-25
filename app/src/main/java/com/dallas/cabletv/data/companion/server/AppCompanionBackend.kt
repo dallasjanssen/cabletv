@@ -6,6 +6,7 @@ import android.os.SystemClock
 import android.view.KeyEvent
 import androidx.activity.ComponentActivity
 import com.dallas.cabletv.BuildConfig
+import com.dallas.cabletv.data.DebugLog
 import com.dallas.cabletv.data.HomeAssistantReporter
 import com.dallas.cabletv.data.Profile
 import com.dallas.cabletv.data.ProfileStore
@@ -91,6 +92,14 @@ class AppCompanionBackend(
             CompanionJson.settingsJson(view())
         }
         return PutResult(change.messages, json)
+    }
+
+    override fun debugLog(): DebugLogState = DebugLogState(DebugLog.enabled(), DebugLog.read())
+
+    override fun changeDebugLog(enabled: Boolean?, clear: Boolean): DebugLogState {
+        if (clear) DebugLog.clear()
+        enabled?.let { DebugLog.setEnabled(it) }
+        return debugLog()
     }
 
     override fun exportSync(sections: List<String>): JSONObject = SyncData(SyncAdapter(), tvName).export(sections)

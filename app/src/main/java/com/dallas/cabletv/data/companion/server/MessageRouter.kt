@@ -3,6 +3,7 @@ package com.dallas.cabletv.data.companion.server
 import com.dallas.cabletv.data.companion.CompanionProtocol
 import com.dallas.cabletv.data.companion.CompanionProtocol.Errors
 import com.dallas.cabletv.data.companion.CompanionProtocol.Types
+import com.dallas.cabletv.data.DebugLog
 import com.dallas.cabletv.data.parseChannelLink
 import org.json.JSONArray
 import org.json.JSONObject
@@ -51,11 +52,14 @@ class MessageRouter(
                 Types.PUT_SETTINGS -> guarded(re, msg) { putSettings(re, msg) }
                 Types.EXPORT_SYNC -> guarded(re, msg) { exportSync(re, msg) }
                 Types.IMPORT_SYNC -> guarded(re, msg) { importSync(re, msg) }
+                Types.GET_DEBUG_LOG -> guarded(re, msg) { debugLogReply(re, backend.debugLog()) }
+                Types.SET_DEBUG_LOG -> guarded(re, msg) { setDebugLog(re, msg) }
                 else -> fail(re, Errors.BAD_REQUEST, "The TV does not know that request.")
             }
         } catch (e: CompanionException) {
             fail(re, e.code, e.message ?: "That did not work.")
         } catch (e: Exception) {
+            DebugLog.log("companion", "Request $type failed", e)
             fail(re, Errors.BUSY, "The TV could not do that just now.")
         }
     }
@@ -75,6 +79,7 @@ class MessageRouter(
         val name = cleanName(msg.optString("phone_name"))
         if (name.isEmpty()) return fail(re, Errors.BAD_REQUEST, "The phone needs a name.")
         pairing.start(conn.phoneKey, name)
+        DebugLog.log("companion", "A phone started pairing.")
         return CompanionProtocol.reply(re, Types.OK)
     }
 
@@ -84,6 +89,7 @@ class MessageRouter(
         return when (val result = pairing.finish(conn.phoneKey, proof, conn.tvFingerprint, conn.phoneFingerprint)) {
             is PairResult.Success -> {
                 backend.addPaired(PairedPhone(conn.phoneKey, result.phoneName, now()))
+                DebugLog.log("companion", "A phone paired.")
                 CompanionProtocol.reply(re, Types.PAIRED).put("tv_name", backend.tvName).put("tv_id", backend.tvId)
             }
             is PairResult.WrongCode ->
@@ -142,7 +148,18 @@ class MessageRouter(
             is PinResult.Wait -> fail(re, Errors.PIN_WAIT, "Too many tries. Wait ${check.seconds} seconds.")
         }
 
-    private fun fail(re: Int?, code: String, message: String): JSONObject = CompanionProtocol.error(re, code, message)
+    private fun debugLogReply(re: Int?, state: DebugLogState): JSONObject =
+        CompanionProtocol.reply(re, Types.DEBUG_LOG).put("enabled", state.enabled).put("log", state.log)
+
+    private fun setDebugLog(re: Int?, msg: JSONObject): JSONObject {
+        val enabled = if (msg.has("enabled") && !msg.isNull("enabled")) msg.optBoolean("enabled") else null
+        return debugLogReply(re, backend.changeDebugLog(enabled, msg.optBoolean("clear", false)))
+    }
+
+    private fun fail(re: Int?, code: String, message: String): JSONObject {
+        DebugLog.log("companion", "Refused with $code")
+        return CompanionProtocol.error(re, code, message)
+    }
 
     private fun reTag(json: JSONObject, re: Int?) {
         if (re != null) json.put("re", re)

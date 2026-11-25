@@ -37,6 +37,16 @@ object CompanionRequests {
     fun importSync(pin: String?, data: JSONObject): JSONObject =
         withPin(JSONObject().put("type", Types.IMPORT_SYNC).put("data", data), pin)
 
+    fun getDebugLog(pin: String?): JSONObject = withPin(JSONObject().put("type", Types.GET_DEBUG_LOG), pin)
+
+    /** Turns debug logging on or off when [enabled] is given, and empties the log when [clear] is true. */
+    fun setDebugLog(pin: String?, enabled: Boolean?, clear: Boolean): JSONObject {
+        val message = JSONObject().put("type", Types.SET_DEBUG_LOG)
+        if (enabled != null) message.put("enabled", enabled)
+        if (clear) message.put("clear", true)
+        return withPin(message, pin)
+    }
+
     private fun withPin(message: JSONObject, pin: String?): JSONObject {
         if (!pin.isNullOrEmpty()) message.put("pin", pin)
         return message

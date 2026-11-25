@@ -60,6 +60,9 @@ object CompanionProtocol {
         const val EXPORT_SYNC = "export_sync"
         const val SYNC_DATA = "sync_data"
         const val IMPORT_SYNC = "import_sync"
+        const val GET_DEBUG_LOG = "get_debug_log"
+        const val SET_DEBUG_LOG = "set_debug_log"
+        const val DEBUG_LOG = "debug_log"
 
         /** Types a phone may send before it has paired. */
         val BEFORE_PAIRING = setOf(HELLO, PAIR_START, PAIR_FINISH, PING)

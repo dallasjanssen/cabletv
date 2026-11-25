@@ -12,6 +12,7 @@ import com.dallas.cabletv.data.companion.client.PinCancelledException
 import com.dallas.cabletv.data.companion.client.RemoteKey
 import com.dallas.cabletv.data.companion.client.SavedReply
 import com.dallas.cabletv.data.companion.client.SessionStatus
+import com.dallas.cabletv.data.companion.client.TvDebugLog
 import com.dallas.cabletv.data.companion.client.TvSession
 import com.dallas.cabletv.data.companion.client.TvSettings
 import com.dallas.cabletv.data.companion.client.routeKey
@@ -37,6 +38,9 @@ sealed interface SettingsLoad {
 
 /** What one section's Save button last did. */
 data class SectionResult(val busy: Boolean = false, val messages: List<String> = emptyList(), val error: String? = null)
+
+/** The Debug tab's state: the last log the TV sent, and whether a request is running. */
+data class DebugLogLoad(val busy: Boolean = false, val log: TvDebugLog? = null, val error: String? = null)
 
 /** The dialog for pairing the Android TV remote (power and volume). */
 sealed interface AtvPairUi {
@@ -262,6 +266,35 @@ class TvScreenModel(private val tvId: String, private val app: CompanionModel) {
                 setSection(section, SectionResult(error = "Nothing was saved. The TV needs its PIN."))
             } catch (e: Exception) {
                 setSection(section, SectionResult(error = app.errorText(e)))
+            }
+        }
+    }
+
+    private val _debugLog = MutableStateFlow(DebugLogLoad())
+    val debugLog: StateFlow<DebugLogLoad> = _debugLog
+
+    /** Reads the TV's debug log. */
+    fun loadDebugLog() = debugRequest { pin -> session.request(CompanionRequests.getDebugLog(pin)) }
+
+    /** Turns the TV's debug logging on or off. */
+    fun setDebugLogging(enabled: Boolean) =
+        debugRequest { pin -> session.request(CompanionRequests.setDebugLog(pin, enabled, clear = false)) }
+
+    /** Empties the TV's debug log. */
+    fun clearDebugLog() = debugRequest { pin -> session.request(CompanionRequests.setDebugLog(pin, null, clear = true)) }
+
+    private fun debugRequest(block: suspend (String?) -> JSONObject) {
+        _debugLog.value = _debugLog.value.copy(busy = true, error = null)
+        scope.launch {
+            _debugLog.value = try {
+                val reply = withPin(tvId, app.pins, { app.askPin(tvNow().name, it) }) { pin -> block(pin) }
+                DebugLogLoad(log = TvDebugLog.fromJson(reply))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: PinCancelledException) {
+                DebugLogLoad(log = _debugLog.value.log, error = "The debug log needs the TV's PIN.")
+            } catch (e: Exception) {
+                DebugLogLoad(log = _debugLog.value.log, error = app.errorText(e))
             }
         }
     }

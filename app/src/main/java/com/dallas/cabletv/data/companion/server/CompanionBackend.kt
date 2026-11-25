@@ -9,6 +9,9 @@ class CompanionException(val code: String, message: String) : Exception(message)
 /** What `put_settings` answers with: the messages the TV would show, and the settings as they are now. */
 class PutResult(val messages: List<String>, val settings: JSONObject)
 
+/** The TV's debug log: whether debug logging is on, and the text recorded so far. */
+class DebugLogState(val enabled: Boolean, val log: String)
+
 /**
  * What the message router needs from the rest of the TV app. The real one reads Compose state on
  * the main thread and the saved stores. Tests use a fake. Every call may block, so the router
@@ -45,4 +48,10 @@ interface CompanionBackend {
 
     /** Applies a sync file and returns the messages to show. */
     fun importSync(data: JSONObject): List<String>
+
+    /** The debug log as it is now. */
+    fun debugLog(): DebugLogState
+
+    /** Turns debug logging on or off when [enabled] is given, and empties the log first when [clear] is true. */
+    fun changeDebugLog(enabled: Boolean?, clear: Boolean): DebugLogState
 }

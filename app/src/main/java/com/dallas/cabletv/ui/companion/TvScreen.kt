@@ -68,6 +68,8 @@ fun TvScreen(model: CompanionModel, tvId: String, onBack: () -> Unit) {
                 selectedContentColor = Tv.Accent, unselectedContentColor = Tv.Ink2)
             Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("Settings", style = TvType.BodyStrong) },
                 selectedContentColor = Tv.Accent, unselectedContentColor = Tv.Ink2)
+            Tab(selected = tab == 2, onClick = { tab = 2 }, text = { Text("Debug", style = TvType.BodyStrong) },
+                selectedContentColor = Tv.Accent, unselectedContentColor = Tv.Ink2)
         }
         val s = status
         Box(Modifier.weight(1f).fillMaxWidth()) {
@@ -85,8 +87,10 @@ fun TvScreen(model: CompanionModel, tvId: String, onBack: () -> Unit) {
                 }
             } else if (tab == 0) {
                 RemoteTab(m, tv)
-            } else {
+            } else if (tab == 1) {
                 SettingsTab(m)
+            } else {
+                DebugTab(m)
             }
         }
     }
