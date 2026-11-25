@@ -22,6 +22,7 @@ import com.dallas.cabletv.data.companion.client.TvDiscovery
 import com.dallas.cabletv.data.companion.client.TvPairing
 import com.dallas.cabletv.data.companion.client.TvRequester
 import com.dallas.cabletv.data.companion.client.pairingErrorText
+import org.json.JSONObject
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
