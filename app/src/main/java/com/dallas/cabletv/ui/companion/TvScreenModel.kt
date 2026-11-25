@@ -12,7 +12,14 @@ import com.dallas.cabletv.data.companion.client.PinCancelledException
 import com.dallas.cabletv.data.companion.client.RemoteKey
 import com.dallas.cabletv.data.companion.client.SavedReply
 import com.dallas.cabletv.data.companion.client.SessionStatus
+import com.dallas.cabletv.data.companion.client.BrowseProgram
+import com.dallas.cabletv.data.companion.client.GuideChannel
+import com.dallas.cabletv.data.companion.client.LibraryPage
+import com.dallas.cabletv.data.companion.client.ScheduleList
+import com.dallas.cabletv.data.companion.client.SearchResults
+import com.dallas.cabletv.data.companion.client.TitleItem
 import com.dallas.cabletv.data.companion.client.TvDebugLog
+import com.dallas.cabletv.data.companion.client.objects
 import com.dallas.cabletv.data.companion.client.TvSession
 import com.dallas.cabletv.data.companion.client.TvSettings
 import com.dallas.cabletv.data.companion.client.routeKey
@@ -41,6 +48,9 @@ data class SectionResult(val busy: Boolean = false, val messages: List<String> =
 
 /** The Debug tab's state: the last log the TV sent, and whether a request is running. */
 data class DebugLogLoad(val busy: Boolean = false, val log: TvDebugLog? = null, val error: String? = null)
+
+/** A browse tab's state: what the TV last sent, and whether a request is running. */
+data class BrowseLoad<T>(val busy: Boolean = false, val data: T? = null, val error: String? = null)
 
 /** The dialog for pairing the Android TV remote (power and volume). */
 sealed interface AtvPairUi {
@@ -295,6 +305,94 @@ class TvScreenModel(private val tvId: String, private val app: CompanionModel) {
                 DebugLogLoad(log = _debugLog.value.log, error = "The debug log needs the TV's PIN.")
             } catch (e: Exception) {
                 DebugLogLoad(log = _debugLog.value.log, error = app.errorText(e))
+            }
+        }
+    }
+
+    // Guide, search and library. Browsing only reads; nothing here changes what the TV shows.
+    private val pageSize = 50
+
+    private val _guide = MutableStateFlow(BrowseLoad<List<GuideChannel>>())
+    val guide: StateFlow<BrowseLoad<List<GuideChannel>>> = _guide
+    private val _schedule = MutableStateFlow(BrowseLoad<ScheduleList>())
+    val schedule: StateFlow<BrowseLoad<ScheduleList>> = _schedule
+    private val _searchResults = MutableStateFlow(BrowseLoad<SearchResults>())
+    val searchResults: StateFlow<BrowseLoad<SearchResults>> = _searchResults
+    private val _libraryPage = MutableStateFlow(BrowseLoad<LibraryPage>())
+    val libraryPage: StateFlow<BrowseLoad<LibraryPage>> = _libraryPage
+    private val _libraryMovies = MutableStateFlow(true)
+    val libraryMovies: StateFlow<Boolean> = _libraryMovies
+
+    fun loadGuide() = browse(_guide, { session.request(CompanionRequests.getGuide()) }) { r ->
+        r.optJSONArray("channels").objects { GuideChannel.fromJson(it) }
+    }
+
+    fun loadSchedule(channelId: String) =
+        browse(_schedule, { session.request(CompanionRequests.getSchedule(channelId)) }) { r ->
+            ScheduleList(channelId, r.optJSONArray("programs").objects { BrowseProgram.fromJson(it) })
+        }
+
+    fun search(query: String) = browse(_searchResults, { session.request(CompanionRequests.search(query.trim())) }) { r ->
+        SearchResults(
+            channels = r.optJSONArray("channels").objects { GuideChannel.fromJson(it) },
+            titles = r.optJSONArray("titles").objects { TitleItem.fromJson(it) }
+        )
+    }
+
+    /** Shows the first page of movies or of shows. */
+    fun loadLibrary(movies: Boolean) {
+        _libraryMovies.value = movies
+        _libraryPage.value = BrowseLoad()
+        browse(_libraryPage, { session.request(CompanionRequests.getLibrary(movies, 0, pageSize)) }) { r ->
+            LibraryPage(r.optJSONArray("items").objects { TitleItem.fromJson(it) }, r.optInt("total"))
+        }
+    }
+
+    /** Adds the next page to the library list, when the TV has more. */
+    fun loadMoreLibrary() {
+        val current = _libraryPage.value.data ?: return
+        if (_libraryPage.value.busy || current.items.size >= current.total) return
+        browse(_libraryPage, { session.request(CompanionRequests.getLibrary(_libraryMovies.value, current.items.size, pageSize)) }) { r ->
+            LibraryPage(current.items + r.optJSONArray("items").objects { TitleItem.fromJson(it) }, r.optInt("total"))
+        }
+    }
+
+    /** Tunes the TV to a channel, the same as choosing it in the guide. */
+    fun watchChannel(channelId: String) = sendToTv("Tuning the TV to this channel.") {
+        session.request(CompanionRequests.open(CompanionRequests.channelLink(channelId)))
+    }
+
+    /** Opens a movie or show on the TV. The TV asks for its PIN there when the title is locked. */
+    fun openTitleOnTv(item: TitleItem) = sendToTv("Opening it on the TV.") {
+        session.request(CompanionRequests.openTitle(item))
+    }
+
+    private fun <T> browse(flow: MutableStateFlow<BrowseLoad<T>>, request: suspend () -> JSONObject, parse: (JSONObject) -> T) {
+        flow.value = flow.value.copy(busy = true, error = null)
+        scope.launch {
+            flow.value = try {
+                BrowseLoad(data = parse(request()))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                BrowseLoad(data = flow.value.data, error = app.errorText(e))
+            }
+        }
+    }
+
+    private fun sendToTv(done: String, request: suspend () -> JSONObject) {
+        if (status.value !is SessionStatus.Online) {
+            _message.value = "The TV is not connected."
+            return
+        }
+        scope.launch {
+            try {
+                request()
+                _message.value = done
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _message.value = app.errorText(e)
             }
         }
     }

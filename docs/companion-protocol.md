@@ -100,6 +100,11 @@ Every message has a `type`. Requests from the phone also have `id`.
 | `import_sync` `{pin?, data}` | `saved` `{messages}` or `error` | PIN rules apply. |
 | `get_debug_log` `{pin?}` | `debug_log` `{enabled, log}` | PIN rules apply. See Debug log. |
 | `set_debug_log` `{pin?, enabled?, clear?}` | `debug_log` `{enabled, log}` | PIN rules apply. `enabled` turns logging on or off. `clear` empties the log first. |
+| `get_guide` | `guide` `{channels}` | Browsing, no PIN. See Browsing the TV. |
+| `get_schedule` `{channel_id}` | `schedule` `{channel, programs}` | Browsing, no PIN. Programmes for the next 12 hours. |
+| `search` `{query}` | `results` `{channels, titles}` | Browsing, no PIN. Up to 40 of each. |
+| `get_library` `{kind, offset?, limit?}` | `library` `{items, total}` | Browsing, no PIN. `kind` is `movies` or `series`. Up to 100 per page. |
+| `open_title` `{source, media_type, id}` | `ok` | Opens a movie or show on the TV. The TV asks for its PIN when the title is locked. |
 
 Every message except `hello`, `pair_start`, `pair_finish` and `ping` answers `not_paired` until the
 phone has paired.
@@ -184,6 +189,24 @@ other. Each part is a key under `sections`:
 
 Never part of sync: the Home Assistant webhook, the last channel, recents, resume points, track
 choices, reminders, recordings and paired phones. They belong to one TV.
+
+### Browsing the TV
+
+The phone's Guide, Search and Library tabs read the TV's own lists. Browsing never changes what the
+TV shows. Only a choice does: `open` with a channel link tunes the TV, and `open_title` opens a
+movie or show the way choosing it in On Demand does.
+
+- `guide` answers `channels`: each `{id, number, name, locked, now?, next?}`. `now` and `next` are
+  programmes `{title, start, end, desc?, on_now}`, with times as ISO 8601 text.
+- `schedule` answers `channel` (the same shape as a guide channel) and `programs`, the programmes
+  that are on now or start in the next 12 hours, oldest first.
+- `results` answers `channels` (guide channels) and `titles`: each `{id, source, media_type, name,
+  year?, locked}`.
+- `library` answers `items` (titles, sorted by name) and `total`. Ask for the next page with
+  `offset`.
+- `locked` is set when the TV's lock would ask for the PIN. The browse messages never need the PIN,
+  because they only list names. Playing or opening a locked channel or title still asks for the PIN
+  on the TV screen, as it always does.
 
 ### Debug log
 

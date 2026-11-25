@@ -47,6 +47,27 @@ object CompanionRequests {
         return withPin(message, pin)
     }
 
+    fun getGuide(): JSONObject = JSONObject().put("type", Types.GET_GUIDE)
+
+    fun getSchedule(channelId: String): JSONObject =
+        JSONObject().put("type", Types.GET_SCHEDULE).put("channel_id", channelId)
+
+    fun search(query: String): JSONObject = JSONObject().put("type", Types.SEARCH).put("query", query)
+
+    fun getLibrary(movies: Boolean, offset: Int, limit: Int): JSONObject =
+        JSONObject()
+            .put("type", Types.GET_LIBRARY)
+            .put("kind", if (movies) "movies" else "series")
+            .put("offset", offset)
+            .put("limit", limit)
+
+    fun openTitle(item: TitleItem): JSONObject =
+        JSONObject()
+            .put("type", Types.OPEN_TITLE)
+            .put("source", item.source)
+            .put("media_type", item.mediaType)
+            .put("id", item.id)
+
     private fun withPin(message: JSONObject, pin: String?): JSONObject {
         if (!pin.isNullOrEmpty()) message.put("pin", pin)
         return message

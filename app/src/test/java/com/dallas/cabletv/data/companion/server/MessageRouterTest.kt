@@ -35,6 +35,11 @@ private class FakeBackend : CompanionBackend {
     override fun importSync(data: JSONObject): List<String> = listOf("Done.")
     override fun debugLog() = DebugLogState(enabled = false, log = "")
     override fun changeDebugLog(enabled: Boolean?, clear: Boolean) = DebugLogState(enabled = enabled ?: false, log = "")
+    override fun guide(): JSONArray = JSONArray()
+    override fun schedule(channelId: String): ScheduleView? = null
+    override fun search(query: String) = SearchView(JSONArray(), JSONArray())
+    override fun library(movies: Boolean, offset: Int, limit: Int) = LibraryView(JSONArray(), 0)
+    override fun openTitle(source: String, mediaType: String, id: String) = false
 }
 
 class MessageRouterTest {

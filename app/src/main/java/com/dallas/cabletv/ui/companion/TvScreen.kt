@@ -7,8 +7,8 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.ScrollableTabRow
 import androidx.compose.material3.Tab
-import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -28,7 +28,10 @@ import com.dallas.cabletv.ui.StatusChip
 import com.dallas.cabletv.ui.Tv
 import com.dallas.cabletv.ui.TvType
 
-/** One TV's screen, with Remote and Settings tabs. The connection lives while this screen is open. */
+/** The tabs on one TV's screen, in order. The body below switches on the same positions. */
+private val tabNames = listOf("Remote", "Guide", "Search", "Library", "Settings", "Debug")
+
+/** One TV's screen: Remote, the guide, search, the library, settings and the debug log. The connection lives while this screen is open. */
 @Composable
 fun TvScreen(model: CompanionModel, tvId: String, onBack: () -> Unit) {
     val tvs by model.tvs.collectAsState()
@@ -59,17 +62,21 @@ fun TvScreen(model: CompanionModel, tvId: String, onBack: () -> Unit) {
                 else -> StatusChip("Not connected", false)
             }
         }
-        TabRow(
+        ScrollableTabRow(
             selectedTabIndex = tab,
             containerColor = Tv.Bg,
-            contentColor = Tv.Accent
+            contentColor = Tv.Accent,
+            edgePadding = 8.dp
         ) {
-            Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("Remote", style = TvType.BodyStrong) },
-                selectedContentColor = Tv.Accent, unselectedContentColor = Tv.Ink2)
-            Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("Settings", style = TvType.BodyStrong) },
-                selectedContentColor = Tv.Accent, unselectedContentColor = Tv.Ink2)
-            Tab(selected = tab == 2, onClick = { tab = 2 }, text = { Text("Debug", style = TvType.BodyStrong) },
-                selectedContentColor = Tv.Accent, unselectedContentColor = Tv.Ink2)
+            tabNames.forEachIndexed { index, label ->
+                Tab(
+                    selected = tab == index,
+                    onClick = { tab = index },
+                    text = { Text(label, style = TvType.BodyStrong) },
+                    selectedContentColor = Tv.Accent,
+                    unselectedContentColor = Tv.Ink2
+                )
+            }
         }
         val s = status
         Box(Modifier.weight(1f).fillMaxWidth()) {
@@ -85,12 +92,13 @@ fun TvScreen(model: CompanionModel, tvId: String, onBack: () -> Unit) {
                         )
                     }
                 }
-            } else if (tab == 0) {
-                RemoteTab(m, tv)
-            } else if (tab == 1) {
-                SettingsTab(m)
-            } else {
-                DebugTab(m)
+            } else when (tab) {
+                0 -> RemoteTab(m, tv)
+                1 -> GuideTab(m)
+                2 -> SearchTab(m)
+                3 -> LibraryTab(m)
+                4 -> SettingsTab(m)
+                else -> DebugTab(m)
             }
         }
     }

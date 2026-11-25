@@ -930,6 +930,18 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
     // the same way the guide does, so a locked channel still asks for the PIN. A link sent from a
     // paired phone is held here and handled the same way. The link from outside the app goes first.
     var companionLink by remember { mutableStateOf<String?>(null) }
+    // A movie or show the phone asked to open. It goes through the same lock and detail page as On Demand.
+    var companionTitle by remember { mutableStateOf<VodItem?>(null) }
+    LaunchedEffect(companionTitle) {
+        val item = companionTitle ?: return@LaunchedEffect
+        companionTitle = null
+        fun openItem() {
+            vodOrigin = Screen.Home
+            pendingVod = item
+            go(Screen.OnDemand)
+        }
+        if (vodLocked(item)) askContentPin { openItem() } else openItem()
+    }
     val pendingLink = link ?: companionLink
     LaunchedEffect(pendingLink, loadedChannels, channelsLoading, channelError, settings.hasLiveSource) {
         val text = pendingLink ?: return@LaunchedEffect
@@ -1044,6 +1056,8 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
             hiddenTerms = hiddenTermsOf(userState.hiddenFilters() ?: settings.hiddenFilters)
         }
         companionHooks.openLink = { companionLink = it }
+        companionHooks.vodCatalog = { shelves.movies to shelves.series }
+        companionHooks.openTitle = { companionTitle = it }
         companionHooks.showToast = showToast
     }
     DisposableEffect(lifecycle, companionServer) {

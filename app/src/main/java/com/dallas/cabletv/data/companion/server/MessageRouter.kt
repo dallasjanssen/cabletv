@@ -54,6 +54,11 @@ class MessageRouter(
                 Types.IMPORT_SYNC -> guarded(re, msg) { importSync(re, msg) }
                 Types.GET_DEBUG_LOG -> guarded(re, msg) { debugLogReply(re, backend.debugLog()) }
                 Types.SET_DEBUG_LOG -> guarded(re, msg) { setDebugLog(re, msg) }
+                Types.GET_GUIDE -> CompanionProtocol.reply(re, Types.GUIDE).put("channels", backend.guide())
+                Types.GET_SCHEDULE -> schedule(re, msg)
+                Types.SEARCH -> search(re, msg)
+                Types.GET_LIBRARY -> library(re, msg)
+                Types.OPEN_TITLE -> openTitle(re, msg)
                 else -> fail(re, Errors.BAD_REQUEST, "The TV does not know that request.")
             }
         } catch (e: CompanionException) {
@@ -148,6 +153,44 @@ class MessageRouter(
             is PinResult.Wait -> fail(re, Errors.PIN_WAIT, "Too many tries. Wait ${check.seconds} seconds.")
         }
 
+    private fun schedule(re: Int?, msg: JSONObject): JSONObject {
+        val id = msg.optString("channel_id").takeIf { it.isNotEmpty() }
+            ?: return fail(re, Errors.BAD_REQUEST, "Choose a channel.")
+        val view = backend.schedule(id) ?: return fail(re, Errors.BAD_REQUEST, "The TV does not have that channel.")
+        return CompanionProtocol.reply(re, Types.SCHEDULE)
+            .put("channel", view.channel)
+            .put("programs", view.programs)
+    }
+
+    private fun search(re: Int?, msg: JSONObject): JSONObject {
+        val query = msg.optString("query").trim()
+        if (query.isEmpty() || query.length > MAX_QUERY) return fail(re, Errors.BAD_REQUEST, "Type a name to search for.")
+        val view = backend.search(query)
+        return CompanionProtocol.reply(re, Types.RESULTS)
+            .put("channels", view.channels)
+            .put("titles", view.titles)
+    }
+
+    private fun library(re: Int?, msg: JSONObject): JSONObject {
+        val movies = when (msg.optString("kind")) {
+            "movies" -> true
+            "series" -> false
+            else -> return fail(re, Errors.BAD_REQUEST, "Choose movies or shows.")
+        }
+        val view = backend.library(movies, msg.optInt("offset", 0), msg.optInt("limit", BrowseJson.LIBRARY_PAGE_MAX))
+        return CompanionProtocol.reply(re, Types.LIBRARY)
+            .put("items", view.items)
+            .put("total", view.total)
+    }
+
+    private fun openTitle(re: Int?, msg: JSONObject): JSONObject {
+        val id = msg.optString("id")
+        if (id.isEmpty()) return fail(re, Errors.BAD_REQUEST, "That title is not known.")
+        val found = backend.openTitle(msg.optString("source"), msg.optString("media_type"), id)
+        if (!found) return fail(re, Errors.BAD_REQUEST, "That title is not on the TV any more.")
+        return CompanionProtocol.reply(re, Types.OK)
+    }
+
     private fun debugLogReply(re: Int?, state: DebugLogState): JSONObject =
         CompanionProtocol.reply(re, Types.DEBUG_LOG).put("enabled", state.enabled).put("log", state.log)
 
@@ -171,5 +214,6 @@ class MessageRouter(
 
     companion object {
         const val MAX_NAME = 40
+        const val MAX_QUERY = 100
     }
 }

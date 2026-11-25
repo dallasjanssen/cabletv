@@ -7,6 +7,10 @@ import android.view.KeyEvent
 import androidx.activity.ComponentActivity
 import com.dallas.cabletv.BuildConfig
 import com.dallas.cabletv.data.DebugLog
+import com.dallas.cabletv.data.EpgCache
+import com.dallas.cabletv.data.LiveChannel
+import com.dallas.cabletv.data.VodItem
+import com.dallas.cabletv.data.isLocked
 import com.dallas.cabletv.data.HomeAssistantReporter
 import com.dallas.cabletv.data.Profile
 import com.dallas.cabletv.data.ProfileStore
@@ -93,6 +97,59 @@ class AppCompanionBackend(
         }
         return PutResult(change.messages, json)
     }
+
+    override fun guide(): JSONArray {
+        val now = System.currentTimeMillis()
+        val channels = main.call { hooks.channels() }
+        val locks = locks()
+        return JSONArray(channels.map { BrowseJson.channel(it, locks.channel(it), EpgCache.nowNext(it.epgId, it.name), now) })
+    }
+
+    override fun schedule(channelId: String): ScheduleView? {
+        val ch = main.call { hooks.channels() }.firstOrNull { it.id == channelId } ?: return null
+        val now = System.currentTimeMillis()
+        val programs = BrowseJson.scheduleWindow(EpgCache.schedule(ch.epgId, ch.name), now).map { BrowseJson.program(it, now) }
+        val channel = BrowseJson.channel(ch, locks().channel(ch), EpgCache.nowNext(ch.epgId, ch.name), now)
+        return ScheduleView(channel, JSONArray(programs))
+    }
+
+    override fun search(query: String): SearchView {
+        val now = System.currentTimeMillis()
+        val channels = BrowseJson.matchingChannels(main.call { hooks.channels() }, query)
+        val (movies, shows) = main.call { hooks.vodCatalog() }
+        val titles = BrowseJson.matchingTitles(movies + shows, query)
+        val locks = locks()
+        return SearchView(
+            JSONArray(channels.map { BrowseJson.channel(it, locks.channel(it), EpgCache.nowNext(it.epgId, it.name), now) }),
+            JSONArray(titles.map { BrowseJson.title(it, locks.title(it)) })
+        )
+    }
+
+    override fun library(movies: Boolean, offset: Int, limit: Int): LibraryView {
+        val (films, shows) = main.call { hooks.vodCatalog() }
+        val all = if (movies) films else shows
+        val locks = locks()
+        val page = BrowseJson.libraryPage(all, offset, limit)
+        return LibraryView(JSONArray(page.map { BrowseJson.title(it, locks.title(it)) }), all.size)
+    }
+
+    override fun openTitle(source: String, mediaType: String, id: String): Boolean {
+        val (films, shows) = main.call { hooks.vodCatalog() }
+        val item = (films + shows).firstOrNull { it.source == source && it.type == mediaType && it.id == id } ?: return false
+        main.call { hooks.openTitle(item) }
+        return true
+    }
+
+    /** The PIN lock terms and whether a PIN is set, read once for a whole list. */
+    private inner class Locks(private val terms: List<String>, private val pinSet: Boolean) {
+        fun channel(ch: LiveChannel): Boolean = isLocked(ch.name, ch.group, terms, pinSet)
+
+        fun title(item: VodItem): Boolean =
+            isLocked(item.name, item.category, terms, pinSet) ||
+                item.seriesName?.let { isLocked(it, item.category, terms, pinSet) } == true
+    }
+
+    private fun locks(): Locks = Locks(main.call { hooks.settings().lockedTerms }, settingsStore.hasPin())
 
     override fun debugLog(): DebugLogState = DebugLogState(DebugLog.enabled(), DebugLog.read())
 

@@ -2,6 +2,7 @@ package com.dallas.cabletv.data.companion.server
 
 import com.dallas.cabletv.data.LiveChannel
 import com.dallas.cabletv.data.Settings
+import com.dallas.cabletv.data.VodItem
 import com.dallas.cabletv.data.companion.CompanionProtocol
 import kotlinx.coroutines.flow.MutableStateFlow
 
@@ -41,6 +42,12 @@ class CompanionHooks {
 
     /** Handles a cabletv: link exactly as one from Home Assistant. */
     @Volatile var openLink: (String) -> Unit = { notReady() }
+
+    /** The movies and the shows the TV has loaded, as On Demand lists them. */
+    @Volatile var vodCatalog: () -> Pair<List<VodItem>, List<VodItem>> = { notReady() }
+
+    /** Opens a movie or show the way choosing it in On Demand does, asking for the PIN when it is locked. */
+    @Volatile var openTitle: (VodItem) -> Unit = { notReady() }
 
     /** A short message on the TV screen. */
     @Volatile var showToast: (String) -> Unit = { }

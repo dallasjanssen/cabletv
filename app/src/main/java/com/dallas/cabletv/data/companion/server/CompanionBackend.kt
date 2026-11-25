@@ -12,6 +12,15 @@ class PutResult(val messages: List<String>, val settings: JSONObject)
 /** The TV's debug log: whether debug logging is on, and the text recorded so far. */
 class DebugLogState(val enabled: Boolean, val log: String)
 
+/** What `get_schedule` answers with: the channel as the guide lists it, and its programmes for the next hours. */
+class ScheduleView(val channel: JSONObject, val programs: JSONArray)
+
+/** What `search` answers with: matching channels and matching movies or shows. */
+class SearchView(val channels: JSONArray, val titles: JSONArray)
+
+/** One page of the library, and how many movies or shows there are in all. */
+class LibraryView(val items: JSONArray, val total: Int)
+
 /**
  * What the message router needs from the rest of the TV app. The real one reads Compose state on
  * the main thread and the saved stores. Tests use a fake. Every call may block, so the router
@@ -54,4 +63,19 @@ interface CompanionBackend {
 
     /** Turns debug logging on or off when [enabled] is given, and empties the log first when [clear] is true. */
     fun changeDebugLog(enabled: Boolean?, clear: Boolean): DebugLogState
+
+    /** Every channel in the list, with what is on now and next. */
+    fun guide(): JSONArray
+
+    /** A channel's programmes for the next hours, or null when the TV has no channel with that id. */
+    fun schedule(channelId: String): ScheduleView?
+
+    /** Channels and movies or shows whose name matches [query]. */
+    fun search(query: String): SearchView
+
+    /** A page of movies, or of shows, sorted by name. */
+    fun library(movies: Boolean, offset: Int, limit: Int): LibraryView
+
+    /** Opens a movie or show on the TV, as choosing it in On Demand does. False when the TV does not have it. */
+    fun openTitle(source: String, mediaType: String, id: String): Boolean
 }

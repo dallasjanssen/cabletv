@@ -63,6 +63,15 @@ object CompanionProtocol {
         const val GET_DEBUG_LOG = "get_debug_log"
         const val SET_DEBUG_LOG = "set_debug_log"
         const val DEBUG_LOG = "debug_log"
+        const val GET_GUIDE = "get_guide"
+        const val GUIDE = "guide"
+        const val GET_SCHEDULE = "get_schedule"
+        const val SCHEDULE = "schedule"
+        const val SEARCH = "search"
+        const val RESULTS = "results"
+        const val GET_LIBRARY = "get_library"
+        const val LIBRARY = "library"
+        const val OPEN_TITLE = "open_title"
 
         /** Types a phone may send before it has paired. */
         val BEFORE_PAIRING = setOf(HELLO, PAIR_START, PAIR_FINISH, PING)
