@@ -346,10 +346,9 @@ class TvScreenModel(private val tvId: String, private val app: CompanionModel) {
         setSection("copy", SectionResult(busy = true))
         scope.launch {
             try {
-                val reply = withPin(tvId, app.pins, { app.askPin(tvNow().name, it) }) { pin ->
-                    session.request(CompanionRequests.importSync(pin, saved.data))
-                }
-                val messages = reply.stringList("messages").ifEmpty { listOf("Copy restored to the TV.") }
+                val sections = saved.data.optJSONObject("sections")?.keys()?.asSequence()?.toList().orEmpty()
+                val target = tvNow()
+                val messages = app.startSync(saved.data, target, sections, "Restore copy to ${target.name}")
                 // Logins and channel settings may have changed, so the Settings tab reloads them.
                 _settings.value = SettingsLoad.Idle
                 setSection("copy", SectionResult(messages = messages))

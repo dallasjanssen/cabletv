@@ -118,7 +118,8 @@ fun SyncScreen(model: CompanionModel, onBack: () -> Unit) {
                     scope.launch {
                         outcome = try {
                             val messages = model.sync(source, target, sections)
-                            SyncOutcome("Copied to ${target.name}.", messages, error = false)
+                            val title = if (model.syncReview.value != null) "Review the differences for ${target.name}." else "Copied to ${target.name}."
+                            SyncOutcome(title, messages, error = false)
                         } catch (e: CancellationException) {
                             throw e
                         } catch (e: Exception) {

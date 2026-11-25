@@ -57,6 +57,8 @@ fun CompanionApp(onWatchOnPhone: () -> Unit) {
 
     PairingDialogs(model)
     PinDialog(model)
+    val review by model.syncReview.collectAsState()
+    review?.let { SyncReviewDialog(model, it) }
 }
 
 /** The dialogs for pairing a TV: connecting, the code, and a failure. */

@@ -29,6 +29,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -61,6 +62,11 @@ class CompanionModel(context: Context, private val scope: CoroutineScope) {
     /** This phone's copies of each TV's setup. */
     val copies = TvCopyStore(appContext)
     private val discovery = TvDiscovery(appContext)
+
+    private val _syncReview = MutableStateFlow<SyncPlan?>(null)
+
+    /** A sync waiting for the person to choose which differing settings to keep. */
+    val syncReview: StateFlow<SyncPlan?> = _syncReview.asStateFlow()
 
     /** The parental PIN of each TV, until the app closes. */
     val pins = PinMemory()
@@ -261,10 +267,35 @@ class CompanionModel(context: Context, private val scope: CoroutineScope) {
      * its PIN when it has one.
      */
     suspend fun sync(from: PairedTv, to: PairedTv, sections: List<String>): List<String> {
-        val runner = SyncRunner(pins) { id, wasWrong ->
-            askPin(store.find(id)?.name ?: "this TV", wasWrong)
-        }
-        return withTv(from) { source -> withTv(to) { target -> runner.copy(from, source, to, target, sections) } }
+        require(from.id != to.id) { "Choose two different TVs." }
+        val data = withTv(from) { runner().exportFrom(from, it, sections) }
+        return startSync(data, to, sections, "Copy to ${to.name}")
+    }
+
+    /**
+     * Copies [data] to [to]. When the TV already has different values for some of it, the copy waits
+     * in [syncReview] so the person can choose. Otherwise it is applied straight away.
+     */
+    suspend fun startSync(data: JSONObject, to: PairedTv, sections: List<String>, title: String): List<String> {
+        require(sections.isNotEmpty()) { "Choose what to copy." }
+        val current = withTv(to) { runner().exportFrom(to, it, sections) }
+        val plan = SyncPlan.build(title, to, data, current)
+        if (plan.conflicts.isEmpty()) return applySync(plan, emptySet())
+        _syncReview.value = plan
+        return listOf("Some settings differ. Review them to finish.")
+    }
+
+    /** Applies [plan] with the settings in [keepTvIds] kept from the TV. The review stays open until it is closed. */
+    suspend fun applySync(plan: SyncPlan, keepTvIds: Set<String>): List<String> =
+        withTv(plan.target) { runner().importInto(plan.target, it, plan.merged(keepTvIds)) }
+
+    /** Closes the review without changing anything more. */
+    fun dismissSyncReview() {
+        _syncReview.value = null
+    }
+
+    private fun runner() = SyncRunner(pins) { id, wasWrong ->
+        askPin(store.find(id)?.name ?: "this TV", wasWrong)
     }
 
     /** What to show for a failed call. A cancelled PIN dialog says nothing worth showing. */

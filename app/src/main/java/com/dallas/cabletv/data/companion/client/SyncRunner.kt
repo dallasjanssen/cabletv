@@ -2,6 +2,7 @@ package com.dallas.cabletv.data.companion.client
 
 import com.dallas.cabletv.data.companion.CompanionProtocol.Sections
 import com.dallas.cabletv.data.companion.CompanionProtocol.Types
+import org.json.JSONObject
 
 /** One sync choice: the section key and the words the person sees. */
 data class SyncChoice(val key: String, val label: String) {
@@ -37,12 +38,22 @@ class SyncRunner(
         sections: List<String>
     ): List<String> {
         require(from.id != to.id) { "Choose two different TVs." }
+        val data = exportFrom(from, fromTv, sections)
+        return importInto(to, toTv, data)
+    }
+
+    /** The sync file for [sections] as [from] has it now. */
+    suspend fun exportFrom(from: PairedTv, fromTv: TvRequester, sections: List<String>): JSONObject {
         require(sections.isNotEmpty()) { "Choose what to copy." }
         val exported = withPin(from.id, memory, { askPin(from.id, it) }) { pin ->
             fromTv.request(CompanionRequests.exportSync(pin, sections))
         }
-        val data = exported.optJSONObject("data")
+        return exported.optJSONObject("data")
             ?: throw CompanionException(CompanionException.Kind.PROTOCOL, "${from.name} sent no data to copy.")
+    }
+
+    /** Applies [data] to [to] and returns the messages the TV sends back. */
+    suspend fun importInto(to: PairedTv, toTv: TvRequester, data: JSONObject): List<String> {
         val saved = withPin(to.id, memory, { askPin(to.id, it) }) { pin ->
             toTv.request(CompanionRequests.importSync(pin, data))
         }

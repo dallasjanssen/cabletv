@@ -201,6 +201,12 @@ A phone can keep a copy of a TV's setup: it asks for `export_sync` with every se
 sync file encrypted on the phone, one copy per TV. Restoring sends that file back with `import_sync`.
 No new message is needed for this, and the TV keeps nothing extra.
 
+Every sync, including a restore, reads what the target TV has for the same sections first, with
+`export_sync`. Settings that exist on both sides with different values are shown to the person, who
+chooses the copy's value or the TV's for each one. The chosen file is then sent with `import_sync`.
+Settings that only one side has are never treated as differences. This review is done on the
+phone, so the TV needs no new message.
+
 Never part of sync: the Home Assistant webhook, the last channel, recents, resume points, track
 choices, reminders, recordings and paired phones. They belong to one TV.
 
