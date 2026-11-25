@@ -166,10 +166,10 @@ class PinAndSyncTest {
     }
 
     @Test
-    fun allFourChoicesAreOfferedInTheDocumentedOrder() {
-        assertEquals(listOf("logins", "channels", "favorites", "lock"), SyncChoice.ALL.map { it.key })
+    fun allFiveChoicesAreOfferedInTheDocumentedOrder() {
+        assertEquals(listOf("logins", "channels", "favorites", "lock", "lineup"), SyncChoice.ALL.map { it.key })
         assertEquals(
-            listOf("Logins", "Channel customizations", "Favorites", "Parental lock"),
+            listOf("Logins", "Channel customizations", "Favorites", "Parental lock", "Channel lineup"),
             SyncChoice.ALL.map { it.label }
         )
     }
