@@ -45,6 +45,7 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.Font
@@ -57,7 +58,11 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import com.dallas.cabletv.R
+import com.dallas.cabletv.data.LOGO_EPG
+import com.dallas.cabletv.data.LOGO_FOLDER
 import com.dallas.cabletv.data.LiveChannel
+import com.dallas.cabletv.data.LogoFiles
+import com.dallas.cabletv.data.PlayerOptionsStore
 import com.dallas.cabletv.data.Program
 import kotlinx.coroutines.delay
 import java.text.SimpleDateFormat
@@ -326,11 +331,23 @@ fun hueOf(name: String): Float = (name.hashCode().absoluteValue % 360).toFloat()
 /**
  * A channel's logo. Provider logos sit on a neutral tile. Channels without one, or whose logo fails
  * to load, get a colored tile with the name set in two lines.
+ * A folder picture is tried when the viewer asked for one. A file that is missing or will not load
+ * falls through to the next picture, then to the colored tile.
  */
 @Composable
 fun ChannelLogo(ch: LiveChannel, modifier: Modifier = Modifier, compact: Boolean = false) {
-    var failed by remember(ch.logo) { mutableStateOf(false) }
-    val hasLogo = !ch.logo.isNullOrBlank() && !failed
+    val options = PlayerOptionsStore(LocalContext.current).load()
+    // A bad folder must not take the tile down. The letter tile is the last step.
+    val folderLogo = remember(options.logoFolder, ch.name) {
+        runCatching { LogoFiles.find(options.logoFolder, ch.name)?.toURI()?.toString() }.getOrNull()
+    }
+    val models = remember(options.logoPriority, ch.logo, folderLogo) {
+        logoModels(options.logoPriority, ch.logo, folderLogo)
+    }
+    var index by remember(models) { mutableIntStateOf(0) }
+    var failed by remember(models) { mutableStateOf(false) }
+    val model = models.getOrNull(index)
+    val hasLogo = model != null && !failed
     val hue = remember(ch.name) { hueOf(ch.name) }
     Box(
         modifier
@@ -346,10 +363,12 @@ fun ChannelLogo(ch: LiveChannel, modifier: Modifier = Modifier, compact: Boolean
     ) {
         if (hasLogo) {
             AsyncImage(
-                model = ch.logo,
+                model = model,
                 contentDescription = ch.name,
                 contentScale = ContentScale.Fit,
-                onError = { failed = true },
+                onError = {
+                    if (index < models.lastIndex) index++ else failed = true
+                },
                 modifier = Modifier.fillMaxSize().padding(if (compact) 3.dp else 8.dp)
             )
         } else {
@@ -377,6 +396,20 @@ fun ChannelLogo(ch: LiveChannel, modifier: Modifier = Modifier, compact: Boolean
                 }
             }
         }
+    }
+}
+
+/**
+ * Pictures to try, first choice first. The guide does not keep a separate programme picture, so the
+ * EPG choice uses the logo already on the channel, then the folder. A missing file is left out.
+ */
+private fun logoModels(priority: String, channelLogo: String?, folderLogo: String?): List<String> {
+    val remote = channelLogo?.takeIf { it.isNotBlank() }
+    val folder = folderLogo?.takeIf { it.isNotBlank() }
+    return when (priority) {
+        LOGO_FOLDER -> listOfNotNull(folder, remote)
+        LOGO_EPG -> listOfNotNull(remote, folder)
+        else -> listOfNotNull(remote, folder)
     }
 }
 

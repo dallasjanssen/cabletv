@@ -21,7 +21,8 @@ import java.util.zip.GZIPInputStream
 /**
  * The programme schedule from XMLTV feeds, kept in the guide database (see [GuideDatabase]). The feeds
  * come from the Xtream login, the guide link inside an M3U playlist, or a Guide URL. Programmes from
- * about two days behind to two days ahead are kept, so catch-up has something to show. Channels are
+ * about two days behind to two days ahead are kept, so catch-up has something to show. When the viewer
+ * sets past days above zero, that many days are kept instead of two. Channels are
  * matched by their epg_channel_id or the playlist's tvg-id, ignoring case and punctuation. A channel
  * name can also match the guide's display name.
  *
@@ -43,6 +44,16 @@ object EpgCache {
     @Volatile
     private var store: GuideDatabase? = null
 
+    /** Kept so guide choices can be read on the download thread. Set in [open]. */
+    @Volatile
+    private var appContext: Context? = null
+
+    private val refreshGate = Any()
+    /** Set by a hand refresh so the next download is not treated as the automatic one. */
+    private var manualRefreshArmed = false
+    /** The first download after process start is the one [PlayerOptions.epgUpdateOnStart] can skip. */
+    private var startupRefreshPending = true
+
     /** Now and next for each channel, per minute, so a screen that asks again does not reread the database. */
     private val nowNextMemo = object : LinkedHashMap<String, NowNext?>(256, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, NowNext?>?): Boolean =
@@ -57,6 +68,7 @@ object EpgCache {
     /** Opens the guide database. Call once at startup, before the guide is read. */
     fun open(context: Context) {
         val app = context.applicationContext
+        appContext = app
         // The copy kept as a file before the database existed is no longer read.
         File(app.cacheDir, "guide/listings.bin").delete()
         synchronized(writeLock) {
@@ -82,18 +94,43 @@ object EpgCache {
     }
 
     /**
+     * The next [refreshAll] was asked for by hand. The automatic start and the hourly loop do not
+     * call this, so a fresh guide can still be downloaded when the viewer presses Refresh.
+     * Call this from the manual refresh path before the download starts.
+     */
+    fun noteManualRefresh() {
+        synchronized(refreshGate) { manualRefreshArmed = true }
+    }
+
+    /**
      * Downloads every guide and replaces the saved listings with what loaded. [key] says which logins the
      * feeds belong to (see [guideCacheKey]). A feed that fails is left out and reported. A feed cut off part
      * way is used, and its channels keep their earlier listings only when [key] is the same logins as before.
-     * Returns the addresses that did not load.
+     * Returns the addresses that did not load. An automatic download that is still too recent returns an
+     * empty list and leaves the saved guide alone.
      */
     fun refreshAll(urls: List<String>, key: String): List<String> {
         val unique = urls.distinct()
+        val (manual, startup) = takeRefreshKind()
         val s = store ?: return unique
+        val options = playerOptions()
+        // The screen already retries every hour. This only skips a download that would be too soon.
+        // It does not start another timer. A hand refresh is never skipped.
+        if (shouldSkipGuideRefresh(
+                manual = manual,
+                updateOnStart = options.epgUpdateOnStart,
+                updateHours = options.epgUpdateHours,
+                savedAtMs = savedAt(key),
+                nowMs = System.currentTimeMillis(),
+                firstAutomatic = startup && !manual
+            )
+        ) {
+            return emptyList()
+        }
         synchronized(writeLock) {
             val db = s.writableDatabase
             val now = System.currentTimeMillis()
-            val from = now - BEHIND_MS
+            val from = now - behindMs()
             val to = now + AHEAD_MS
             val names = mutableListOf<Pair<String, String>>()
             val failed = mutableListOf<String>()
@@ -154,7 +191,9 @@ object EpgCache {
     /** Now and next for a channel from the saved schedule, or null when the guide has nothing for it. */
     fun nowNext(epgId: String?, name: String? = null): NowNext? {
         val now = System.currentTimeMillis()
-        val memoKey = "${epgId.orEmpty()}\u0000${name.orEmpty()}\u0000${now / 60_000L}"
+        val options = playerOptions()
+        // Offset and past days are part of the key so a change is not stuck on the previous minute's answer.
+        val memoKey = "${epgId.orEmpty()}\u0000${name.orEmpty()}\u0000${now / 60_000L}\u0000${options.epgOffsetMinutes}\u0000${options.epgPastDays}"
         synchronized(memoLock) {
             if (nowNextMemo.containsKey(memoKey)) return nowNextMemo[memoKey]
         }
@@ -171,13 +210,15 @@ object EpgCache {
      */
     fun schedule(epgId: String?, name: String? = null, withDesc: Boolean = false): List<Program> {
         val now = System.currentTimeMillis()
-        return read(emptyList()) { db -> chosenListings(db, epgId, name, now, withDesc)?.rows.orEmpty() }
+        return read(emptyList()) { db -> shown(chosenListings(db, epgId, name, now, withDesc)?.rows.orEmpty()) }
     }
 
     /** The description of the programme that starts at [start] on this channel, or empty when there is none. */
     fun descriptionFor(epgId: String?, name: String?, start: Long): String = read("") { db ->
+        // The guide asks with the time on screen. The row is stored at the provider's time.
+        val stored = storedGuideInstant(start, guideOffsetMinutes())
         listOfNotNull(keyFor(db, epgId), keyFor(db, name))
-            .firstNotNullOfOrNull { key -> descriptionOf(db, key, start)?.takeIf { it.isNotEmpty() } }
+            .firstNotNullOfOrNull { key -> descriptionOf(db, key, stored)?.takeIf { it.isNotEmpty() } }
             .orEmpty()
     }
 
@@ -344,7 +385,7 @@ object EpgCache {
         } else {
             "SELECT start, stop, title FROM program WHERE ch = ? AND stop > ? AND start < ? ORDER BY start"
         }
-        val args = arrayOf(key, (now - BEHIND_MS).toString(), (now + AHEAD_MS).toString())
+        val args = arrayOf(key, (now - behindMs()).toString(), (now + AHEAD_MS).toString())
         return db.rawQuery(sql, args).use { c ->
             val out = ArrayList<Program>(c.count)
             while (c.moveToNext()) {
@@ -368,14 +409,19 @@ object EpgCache {
         val nameKey = keyFor(db, name)
         val byId = idKey?.let { windowRows(db, it, now, withDesc) }.orEmpty()
         val byName = nameKey?.let { windowRows(db, it, now, withDesc) }.orEmpty()
-        val useId = chooseListings(byId, byName, now) === byId
+        // Which source covers "now" is decided on the provider clock, so the shifted grid and now/next
+        // still come from the listings that are actually on.
+        val storedNow = storedGuideInstant(now, guideOffsetMinutes())
+        val useId = chooseListings(byId, byName, storedNow) === byId
         val key = (if (useId) idKey else nameKey) ?: return null
         return Chosen(key, if (useId) byId else byName)
     }
 
     private fun nowNextIn(db: SQLiteDatabase, epgId: String?, name: String?, now: Long): NowNext? {
         val chosen = chosenListings(db, epgId, name, now, false) ?: return null
-        val list = chosen.rows
+        // Shift once, then pick now and next. Doing it the other way round would name a show
+        // that the grid, which uses the same shifted times, does not have under the now line.
+        val list = shown(chosen.rows)
         val current = list.firstOrNull { now >= it.start && now < it.end }
         val next = list.firstOrNull { it.start > now }
         if (current == null && next == null) return null
@@ -386,8 +432,51 @@ object EpgCache {
     }
 
     private fun withDescription(db: SQLiteDatabase, key: String, p: Program): Program {
-        val text = descriptionOf(db, key, p.start) ?: return p
+        val text = descriptionOf(db, key, storedGuideInstant(p.start, guideOffsetMinutes())) ?: return p
         return p.copy(desc = text)
+    }
+
+    /**
+     * The only shift applied to listings read from the database. [schedule] and [nowNext] both use it,
+     * so the grid and now/next cannot move a programme by different amounts. An offset of 0 returns
+     * the same list.
+     */
+    private fun shown(rows: List<Program>): List<Program> = applyGuideOffset(rows, guideOffsetMinutes())
+
+    /** Listings from outside the database, such as the provider's short now-and-next, use the same shift. */
+    fun forDisplay(programs: List<Program>): List<Program> = shown(programs)
+
+    fun forDisplay(listing: NowNext): NowNext {
+        val offset = guideOffsetMinutes()
+        if (offset == 0) return listing
+        return NowNext(
+            listing.now?.let { shiftProgram(it, offset) },
+            listing.next?.let { shiftProgram(it, offset) }
+        )
+    }
+
+    /** How far behind now old programmes are kept and shown. Zero past-days leaves the usual two days. */
+    fun retainedBehindMs(): Long = behindMs()
+
+    private fun guideOffsetMinutes(): Int = playerOptions().epgOffsetMinutes
+
+    private fun behindMs(): Long {
+        val days = playerOptions().epgPastDays
+        if (days <= 0) return BEHIND_MS
+        return days.coerceAtMost(14) * DAY_MS
+    }
+
+    private fun playerOptions(): PlayerOptions {
+        val ctx = appContext ?: return PlayerOptions()
+        return runCatching { PlayerOptionsStore(ctx).load() }.getOrDefault(PlayerOptions())
+    }
+
+    private fun takeRefreshKind(): Pair<Boolean, Boolean> = synchronized(refreshGate) {
+        val manual = manualRefreshArmed
+        manualRefreshArmed = false
+        val startup = startupRefreshPending
+        startupRefreshPending = false
+        manual to startup
     }
 
     /**
@@ -520,6 +609,46 @@ internal fun clipDesc(raw: String): String {
     val text = raw.trim()
     return if (text.length <= MAX_DESC) text else text.take(MAX_DESC).trimEnd() + "…"
 }
+
+/**
+ * True when an automatic guide download should wait. A hand refresh is never skipped.
+ * [updateHours] of 0 does not invent a new timer: only the automatic download at start can be skipped,
+ * and only when the viewer turned that off. A positive hour count skips while the last full save is newer.
+ */
+fun shouldSkipGuideRefresh(
+    manual: Boolean,
+    updateOnStart: Boolean,
+    updateHours: Int,
+    savedAtMs: Long?,
+    nowMs: Long,
+    firstAutomatic: Boolean
+): Boolean {
+    if (manual) return false
+    if (firstAutomatic && !updateOnStart) return true
+    if (updateHours <= 0) return false
+    if (savedAtMs == null) return false
+    val age = nowMs - savedAtMs
+    if (age < 0L) return false
+    return age < updateHours * 3_600_000L
+}
+
+/** Moves guide times by the viewer's offset. Zero returns the same list, so today's guide is unchanged. */
+internal fun applyGuideOffset(programs: List<Program>, offsetMinutes: Int): List<Program> {
+    if (offsetMinutes == 0 || programs.isEmpty()) return programs
+    return programs.map { shiftProgram(it, offsetMinutes) }
+}
+
+internal fun shiftProgram(program: Program, offsetMinutes: Int): Program {
+    if (offsetMinutes == 0) return program
+    return program.copy(
+        start = shiftGuideTime(program.start, offsetMinutes),
+        end = shiftGuideTime(program.end, offsetMinutes)
+    )
+}
+
+/** The time stored in the database for a time the guide is showing. */
+internal fun storedGuideInstant(displayMs: Long, offsetMinutes: Int): Long =
+    if (offsetMinutes == 0) displayMs else displayMs - offsetMinutes * 60_000L
 
 /**
  * Whether [incoming] should replace [kept] when both start at the same time on one channel. A copy with a

@@ -152,6 +152,27 @@ private val countryPrefix = Regex("^([A-Za-z]{2})\\s*[|:\\-]")
 fun countryPrefixOf(name: String): String? =
     countryPrefix.find(name.trim())?.groupValues?.get(1)?.uppercase()
 
+/**
+ * The channel list the guide and the player show. Hidden groups, channels hidden one by one,
+ * renamed titles, a hand-picked guide id, and a saved order are applied here.
+ */
+fun presentedChannels(
+    channels: List<LiveChannel>,
+    hiddenTerms: List<String>,
+    stripPrefixes: Boolean,
+    options: PlayerOptions
+): List<LiveChannel> {
+    val renamed = channels
+        .distinctBy { it.id }
+        .filterNot { isHidden(it, hiddenTerms) || it.id in options.hiddenIds }
+        .map { ch ->
+            val name = tidyChannelName(ch.name, stripPrefixes, options.namePrefixes, options.nameSuffixes)
+            val epgId = options.epgIdFor(ch.id, ch.epgId)
+            if (name == ch.name && epgId == ch.epgId) ch else ch.copy(name = name, epgId = epgId)
+        }
+    return orderChannels(renamed, options.channelOrder)
+}
+
 /** A channel name without its country prefix, for display. Names without one are returned unchanged. */
 fun displayName(name: String): String {
     val match = countryPrefix.find(name.trim()) ?: return name

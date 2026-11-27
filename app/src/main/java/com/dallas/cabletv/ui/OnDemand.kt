@@ -628,7 +628,8 @@ private fun EpisodeRow(ep: VodItem, resumed: Boolean, watched: Boolean, modifier
  * Full-screen playback with the app's own controls. Any key shows them, and so does a tap on a
  * phone. OK pauses, left and right skip ten seconds, and Audio and captions picks language,
  * subtitles and picture size. Playback starts where it stopped last time, saves its place,
- * reports to Jellyfin, and plays the next episode by itself. One instance plays one title.
+ * reports to Jellyfin, and plays the next episode by itself when that list is already loaded
+ * and the viewer did not stop this one. One instance plays one title.
  */
 @Composable
 private fun VodPlayer(
@@ -658,6 +659,8 @@ private fun VodPlayer(
     val latestOnNext by rememberUpdatedState(onPlayNext)
     val latestExit by rememberUpdatedState(onExit)
     var pendingNext by remember { mutableStateOf<VodItem?>(null) }
+    // Set when the viewer pauses, stops, or cancels the next episode. Finishing on its own leaves this false.
+    val viewerStopped = remember { mutableStateOf(false) }
     LaunchedEffect(pendingNext?.id) {
         val next = pendingNext ?: return@LaunchedEffect
         delay(10_000)
@@ -689,11 +692,16 @@ private fun VodPlayer(
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (playbackState == Player.STATE_ENDED) {
                     val next = latestNext
-                    if (next != null) {
+                    if (next != null && !viewerStopped.value) {
+                        // The episode list was already loaded, so the next one follows on its own.
                         // The countdown takes over the screen, and its buttons take the remote.
                         tracks = false
                         controls = false
                         pendingNext = next
+                    } else if (next != null) {
+                        // The viewer stopped this one, so the next episode stays where it is.
+                        controls = true
+                        pendingNext = null
                     } else {
                         latestExit()
                     }
@@ -845,6 +853,7 @@ private fun VodPlayer(
     }
 
     fun resume() {
+        viewerStopped.value = false
         // A title that has ended starts again from the beginning.
         if (player.playbackState == Player.STATE_ENDED) player.seekTo(0)
         player.play()
@@ -854,7 +863,12 @@ private fun VodPlayer(
         // While the next episode counts down, the one that ended stays ended.
         if (pendingNext != null) return
         lastKey = System.currentTimeMillis()
-        if (player.isPlaying) player.pause() else resume()
+        if (player.isPlaying) {
+            viewerStopped.value = true
+            player.pause()
+        } else {
+            resume()
+        }
     }
 
     BackHandler(enabled = !tracks && controls && pendingNext == null) { controls = false }
@@ -872,8 +886,15 @@ private fun VodPlayer(
                 val code = ev.nativeKeyEvent.keyCode
                 if (pendingNext != null) {
                     // The countdown's buttons take the arrows and OK. Media keys do nothing, so the
-                    // episode that ended does not start again.
+                    // episode that ended does not start again. Stop cancels the next episode.
                     return@onPreviewKeyEvent when (code) {
+                        KeyEvent.KEYCODE_MEDIA_STOP -> {
+                            viewerStopped.value = true
+                            pendingNext = null
+                            controls = true
+                            lastKey = System.currentTimeMillis()
+                            true
+                        }
                         KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, KeyEvent.KEYCODE_MEDIA_PLAY, KeyEvent.KEYCODE_MEDIA_PAUSE,
                         KeyEvent.KEYCODE_MEDIA_FAST_FORWARD, KeyEvent.KEYCODE_MEDIA_REWIND -> true
                         else -> false
@@ -882,7 +903,8 @@ private fun VodPlayer(
                 when (code) {
                     KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> { togglePause(); controls = true; return@onPreviewKeyEvent true }
                     KeyEvent.KEYCODE_MEDIA_PLAY -> { resume(); return@onPreviewKeyEvent true }
-                    KeyEvent.KEYCODE_MEDIA_PAUSE -> { player.pause(); controls = true; return@onPreviewKeyEvent true }
+                    KeyEvent.KEYCODE_MEDIA_PAUSE -> { viewerStopped.value = true; player.pause(); controls = true; return@onPreviewKeyEvent true }
+                    KeyEvent.KEYCODE_MEDIA_STOP -> { viewerStopped.value = true; player.pause(); controls = true; return@onPreviewKeyEvent true }
                     KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> { skip(30_000); controls = true; return@onPreviewKeyEvent true }
                     KeyEvent.KEYCODE_MEDIA_REWIND -> { skip(-10_000); controls = true; return@onPreviewKeyEvent true }
                 }
@@ -997,6 +1019,8 @@ private fun VodPlayer(
                     PillButton("Play now", { latestOnNext(next) }, icon = TvIcons.Play, modifier = Modifier.focusRequester(playNow))
                     // Cancel stops the countdown only. The player stays, with its controls showing.
                     PillButton("Cancel", {
+                        // Cancelling means the viewer stopped the hand-off, so a later end event does not start it again.
+                        viewerStopped.value = true
                         pendingNext = null
                         controls = true
                         lastKey = System.currentTimeMillis()

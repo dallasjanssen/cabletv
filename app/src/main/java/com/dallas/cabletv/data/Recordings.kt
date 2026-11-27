@@ -1,5 +1,6 @@
 package com.dallas.cabletv.data
 
+import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -24,9 +25,14 @@ data class ScheduledRecording(
     val end: Long
 )
 
-/** The recordings folder and the schedule, both next to the app's files. */
+/**
+ * The recordings folder and the schedule.
+ * A folder from player options is used when it is set and that directory can be created,
+ * or already exists, and a file can be written there. Anything else stays in the private
+ * recordings folder under [root]. Callers pass the app's files directory as [root].
+ */
 class RecordingStore(private val root: File) {
-    private val dir = File(root, "recordings").apply { mkdirs() }
+    private val dir = resolveRecordingsDir(root)
     private val index = File(dir, "index.json")
     private val scheduleFile = File(dir, "schedule.json")
 
@@ -124,3 +130,72 @@ class RecordingStore(private val root: File) {
 /** A scheduled showing that should be recording at [nowMs] and is not already done. */
 fun dueSchedule(items: List<ScheduledRecording>, nowMs: Long, finished: Set<String>): List<ScheduledRecording> =
     items.filter { it.id !in finished && nowMs >= it.start && nowMs < it.end }
+
+/**
+ * Player options keep the folder next to the app's files. Callers only pass that files
+ * directory, so the store reads the option itself. When the application object cannot be
+ * asked, which is how unit tests run, the same preference file is tried, then no folder.
+ */
+private fun recordingsFolderFromOptions(filesDir: File): String {
+    val fromStore = runCatching { folderFromPlayerOptions() }
+    if (fromStore.isSuccess) return fromStore.getOrThrow().trim()
+    return folderFromPrefsFile(filesDir).trim()
+}
+
+private fun folderFromPlayerOptions(): String {
+    val app = Class.forName("android.app.ActivityThread")
+        .getMethod("currentApplication")
+        .invoke(null) as? Context
+        ?: error("no application")
+    return PlayerOptionsStore(app).load().recordingsFolder
+}
+
+/** The same preference, read from disk when the application object is not available yet. */
+private fun folderFromPrefsFile(filesDir: File): String {
+    val parent = filesDir.parentFile ?: return ""
+    val prefs = File(parent, "shared_prefs/cabletv_player_options.xml")
+    if (!prefs.isFile) return ""
+    return runCatching {
+        val raw = REC_FOLDER_XML.find(prefs.readText())?.groupValues?.getOrNull(1) ?: return ""
+        unescapeXml(raw)
+    }.getOrDefault("")
+}
+
+private fun unescapeXml(raw: String): String =
+    raw.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+
+/**
+ * [custom] when that path can be created, or already exists and can be written.
+ * A bad path returns null so the caller keeps the private folder. Nothing here throws.
+ */
+private fun writableDirectory(custom: String): File? = try {
+    if (custom.isEmpty()) {
+        null
+    } else {
+        val dir = File(custom)
+        if (!dir.exists()) {
+            if (dir.mkdirs() && dir.isDirectory) dir else null
+        } else if (dir.isDirectory && dir.canWrite()) {
+            dir
+        } else {
+            null
+        }
+    }
+} catch (e: Exception) {
+    null
+}
+
+private fun resolveRecordingsDir(root: File): File {
+    val fallback = File(root, "recordings")
+    val chosen = writableDirectory(recordingsFolderFromOptions(root))
+    if (chosen != null) return chosen
+    runCatching { fallback.mkdirs() }
+    return fallback
+}
+
+/** Name used by PlayerOptionsStore for the recordings folder. */
+private val REC_FOLDER_XML = Regex("""<string name="rec_folder">([^<]*)</string>""")

@@ -94,8 +94,13 @@ import com.dallas.cabletv.data.companion.server.PairedPhone
 import com.dallas.cabletv.data.companion.server.PairingManager
 import com.dallas.cabletv.data.companion.server.PinGate
 import com.dallas.cabletv.data.companion.server.SettingsUpdater
-import com.dallas.cabletv.data.displayName
+import com.dallas.cabletv.data.PIN_GRACE_NONE
+import com.dallas.cabletv.data.PlayerOptionsStore
 import com.dallas.cabletv.data.dueReminders
+import com.dallas.cabletv.data.pinGraceCovers
+import com.dallas.cabletv.data.presentedChannels
+import com.dallas.cabletv.data.recordingWindow
+import com.dallas.cabletv.data.reminderLeadMs
 import com.dallas.cabletv.data.dueSchedule
 import com.dallas.cabletv.data.isHidden
 import com.dallas.cabletv.data.isLocked
@@ -170,6 +175,8 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var settings by remember { mutableStateOf(store.load()) }
+    val playerOptionsStore = remember { PlayerOptionsStore(context) }
+    var playerOptions by remember { mutableStateOf(playerOptionsStore.load()) }
 
     // ------------------------------------------------------------ Profiles
     val profileStore = remember { ProfileStore(context) }
@@ -184,10 +191,14 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
         mutableStateOf(
             when {
                 !settings.hasLiveSource && !settings.hasJellyfin -> Screen.Welcome
-                settings.hasLiveSource && lastChannelId != null -> Screen.Live
+                settings.hasLiveSource && lastChannelId != null && playerOptions.openLastChannel -> Screen.Live
                 else -> Screen.Home
             }
         )
+    }
+    // Picture and guide choices are saved on their own screen, so reload them whenever that screen closes.
+    LaunchedEffect(screen) {
+        if (screen != Screen.Settings) playerOptions = playerOptionsStore.load()
     }
     // Where a movie page was opened from, so Back returns there.
     var vodOrigin by remember { mutableStateOf(Screen.OnDemand) }
@@ -226,15 +237,14 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
     var loadedChannels by remember { mutableStateOf<List<LiveChannel>>(emptyList()) }
     var hiddenTerms by remember { mutableStateOf(settings.hiddenTerms) }
     var contentUnlocked by remember { mutableStateOf(false) }
+    var pinUnlockedAt by remember { mutableLongStateOf(0L) }
+    var pinUnlockedChannel by remember { mutableStateOf<String?>(null) }
     var pinSet by remember { mutableStateOf(store.hasPin()) }
     var pinPurpose by remember { mutableStateOf(PinPurpose.NONE) }
     var pinError by remember { mutableStateOf<String?>(null) }
     var afterUnlock by remember { mutableStateOf<(() -> Unit)?>(null) }
-    val channels = remember(loadedChannels, hiddenTerms, settings.stripPrefixes) {
-        loadedChannels
-            .distinctBy { it.id }
-            .filterNot { isHidden(it, hiddenTerms) }
-            .map { if (settings.stripPrefixes) it.copy(name = displayName(it.name)) else it }
+    val channels = remember(loadedChannels, hiddenTerms, settings.stripPrefixes, playerOptions) {
+        presentedChannels(loadedChannels, hiddenTerms, settings.stripPrefixes, playerOptions)
     }
     var channelsLoading by remember { mutableStateOf(false) }
     var channelError by remember { mutableStateOf<String?>(null) }
@@ -328,7 +338,13 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
                 runCatching {
                     val urls = ChannelSource.guideUrls(s)
                     // The database keeps the listings, and only records the save time when at least one guide loaded in full.
-                    val failed = if (urls.isEmpty()) emptyList() else EpgCache.refreshAll(urls, key)
+                    // A refresh the viewer asked for, including the one in Settings, is not skipped for being recent.
+                    val failed = if (urls.isEmpty()) {
+                        emptyList()
+                    } else {
+                        if (manual) EpgCache.noteManualRefresh()
+                        EpgCache.refreshAll(urls, key)
+                    }
                     urls.size to failed
                 }
             }
@@ -400,6 +416,8 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
         }
         profileId = id
         contentUnlocked = false
+        pinUnlockedAt = 0L
+        pinUnlockedChannel = null
     }
     LaunchedEffect(userState, settings.hiddenFilters) {
         val raw = userState.hiddenFilters() ?: settings.hiddenFilters
@@ -416,6 +434,17 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
     // before the player, because effects are disposed in reverse order.
     val nowPlaying = remember { NowPlayingSession(context, "live", live.exo) }
     DisposableEffect(Unit) { onDispose { nowPlaying.release() } }
+    // Buffer, decoders, the user agent, and audio offset are fixed when the player is built.
+    // Leaving Settings reloads the saved choices, and a change starts the current stream again.
+    LaunchedEffect(playerOptions.engineSignature()) {
+        val retired = live.replaceEngine() ?: return@LaunchedEffect
+        nowPlaying.attach(live.exo)
+        try {
+            withFrameNanos { }
+        } finally {
+            retired.release()
+        }
+    }
     DisposableEffect(lifecycle) {
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
@@ -445,8 +474,16 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
     val liveActive = settings.hasLiveSource && screen in setOf(Screen.Live, Screen.Home, Screen.Guide)
 
     // True when a channel needs the PIN and it has not been entered yet.
-    fun lockedNow(ch: LiveChannel): Boolean =
-        isLocked(ch.name, ch.group, settings.lockedTerms, pinSet) && !contentUnlocked
+    fun lockedNow(ch: LiveChannel): Boolean {
+        val byGroup = isLocked(ch.name, ch.group, settings.lockedTerms, pinSet)
+        val byChannel = pinSet && ch.id in playerOptions.blockedIds
+        if (!byGroup && !byChannel) return false
+        if (contentUnlocked && playerOptions.pinGrace == PIN_GRACE_NONE) return false
+        if (pinGraceCovers(playerOptions.pinGrace, pinUnlockedAt, System.currentTimeMillis(), pinUnlockedChannel, ch.id)) {
+            return false
+        }
+        return true
+    }
 
     // A title is locked by its own name, its category, or the show it belongs to.
     fun vodLocked(item: VodItem): Boolean {
@@ -473,7 +510,7 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
             return@LaunchedEffect
         }
         // A short wait means holding a key only loads the channel you stop on.
-        delay(250)
+        delay(playerOptions.zapDelayMs.coerceIn(0, 5_000).toLong())
         val ch = current
         if (replay == null && ch?.origin == "stalker") {
             // The portal gives each channel a fresh address. The old channel stops meanwhile, so it
@@ -666,10 +703,11 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
         val storeFiles = RecordingStore(context.filesDir)
         fun startWith(url: String) {
             val nowMs = System.currentTimeMillis()
-            if (program.start > nowMs + 20_000) {
-                storeFiles.addSchedule(ScheduledRecording(id, ch.id, ch.name, program.title, url, program.start, program.end))
+            val (start, end) = recordingWindow(program.start, program.end, playerOptions.recordPadStartMin, playerOptions.recordPadEndMin)
+            if (start > nowMs + 20_000) {
+                storeFiles.addSchedule(ScheduledRecording(id, ch.id, ch.name, program.title, url, start, end))
                 showToast("Will record ${program.title}. Leave the app open until it starts. This uses another connection.")
-            } else if (RecordingService.start(context, id, url, program.title, ch.name, program.end)) {
+            } else if (RecordingService.start(context, id, url, program.title, ch.name, end)) {
                 showToast("Recording ${program.title}. This uses another connection.")
             } else {
                 showToast("The recording could not start. Check free space.")
@@ -837,7 +875,8 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
     LaunchedEffect(profileId) {
         firedReminders = emptySet()
         while (true) {
-            dueReminder = dueReminders(reminderStore.reminders(), System.currentTimeMillis(), firedReminders).firstOrNull()
+            val lead = reminderLeadMs(playerOptionsStore.load().remindLeadMin)
+            dueReminder = dueReminders(reminderStore.reminders(), System.currentTimeMillis(), firedReminders, lead).firstOrNull()
             delay(15_000)
         }
     }
@@ -1104,11 +1143,19 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
     val pairedPhonesFlow = remember(companionPrefs) { companionPrefs?.pairedPhones ?: MutableStateFlow(emptyList<PairedPhone>()) }
     val pairedPhones by pairedPhonesFlow.collectAsState()
 
+    var exitAt by remember { mutableLongStateOf(0L) }
     val nav = NavActions(
         select = { tab -> go(tab.toScreen()) },
         back = {
-            // Live TV returns here. A second Back leaves the app instead of bouncing back to the picture.
-            if (screen != Screen.Home) go(Screen.Home) else (context as? Activity)?.finish()
+            // Live TV returns here. Leaving the app can ask for a second Back, so one press does not close it.
+            if (screen != Screen.Home) {
+                go(Screen.Home)
+            } else if (!playerOptions.doubleBackToExit || SystemClock.elapsedRealtime() - exitAt < 2_000L) {
+                (context as? Activity)?.finish()
+            } else {
+                exitAt = SystemClock.elapsedRealtime()
+                showToast("Press Back again to exit")
+            }
         },
         profileName = profileName,
         onProfile = { showProfiles = true }
@@ -1396,7 +1443,11 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
                         store.clearProfileJellyfin(id)
                         profiles = profileStore.profiles()
                         profileId = profileStore.active()
-                        if (wasActive) contentUnlocked = false
+                        if (wasActive) {
+                            contentUnlocked = false
+                            pinUnlockedAt = 0L
+                            pinUnlockedChannel = null
+                        }
                     },
                     pinSet = pinSet,
                     onSetPin = {
@@ -1508,6 +1559,8 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
                     onComplete = { entered ->
                         if (pinMatches(entered)) {
                             contentUnlocked = true
+                            pinUnlockedAt = System.currentTimeMillis()
+                            pinUnlockedChannel = current?.id
                             pinPurpose = PinPurpose.NONE
                             val next = afterUnlock
                             afterUnlock = null
@@ -1598,21 +1651,50 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
 
 /**
  * A programme the viewer asked to be reminded about is starting. Watch takes focus, Back dismisses,
- * and it goes by itself after a minute or once the showing is two minutes in.
+ * and it goes by itself after the number of seconds chosen in player options. Thirty is the usual length.
+ * Reminders are only checked while the app is open, so this does not schedule an alarm.
+ * When the viewer asked the reminder to wake the device, a partial wake lock is held only while
+ * this popup is on screen, then released.
  */
 @Composable
 private fun ReminderPopup(reminder: Reminder, onWatch: () -> Unit, onDismiss: () -> Unit, modifier: Modifier = Modifier) {
+    val context = LocalContext.current
     val dismiss by rememberUpdatedState(onDismiss)
     val watch = remember { FocusRequester() }
+    val options = remember(reminder) {
+        runCatching { PlayerOptionsStore(context).load() }.getOrNull()
+    }
+    val popupMs = ((options?.reminderPopupSec ?: 30).coerceIn(5, 120)) * 1_000L
+    val wakeDevice = options?.reminderWakesDevice == true
     BackHandler { dismiss() }
     LaunchedEffect(reminder) {
         withFrameNanos { }
         runCatching { watch.requestFocus() }
     }
     LaunchedEffect(reminder) {
-        val wait = minOf(60_000L, reminder.start + 2 * 60_000L - System.currentTimeMillis())
-        delay(wait.coerceAtLeast(0L))
+        delay(popupMs)
         dismiss()
+    }
+    DisposableEffect(reminder) {
+        val lock = if (!wakeDevice) {
+            null
+        } else {
+            runCatching {
+                val power = context.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+                if (power == null) {
+                    null
+                } else {
+                    power.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "cabletv:reminder").apply {
+                        setReferenceCounted(false)
+                        // A timeout so a missed dispose cannot hold the processor open.
+                        acquire(popupMs + 5_000L)
+                    }
+                }
+            }.getOrNull()
+        }
+        onDispose {
+            runCatching { if (lock?.isHeld == true) lock.release() }
+        }
     }
     Column(
         modifier

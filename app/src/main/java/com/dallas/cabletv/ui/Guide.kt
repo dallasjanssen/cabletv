@@ -36,10 +36,13 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.platform.LocalContext
 import com.dallas.cabletv.data.EpgCache
 import com.dallas.cabletv.data.GuideSelection
 import com.dallas.cabletv.data.LiveChannel
+import com.dallas.cabletv.data.PlayerOptionsStore
 import com.dallas.cabletv.data.Program
+import com.dallas.cabletv.data.WatchStats
 import com.dallas.cabletv.data.guideSelection
 import kotlinx.coroutines.delay
 import java.util.TimeZone
@@ -63,13 +66,35 @@ private data class ProgramChoice(val channel: LiveChannel, val program: Program,
 
 private fun groupOf(ch: LiveChannel) = ch.group.ifBlank { "Other" }
 
-private fun rowsFor(group: String, channels: List<LiveChannel>, favorites: Set<String>, recents: List<String>): List<LiveChannel> =
-    when (group) {
-        GROUP_ALL -> channels
-        GROUP_FAVORITES -> channels.filter { it.id in favorites }
-        GROUP_RECENT -> recents.mapNotNull { id -> channels.firstOrNull { it.id == id } }
-        else -> channels.filter { groupOf(it) == group }
+private fun rowsFor(
+    group: String,
+    channels: List<LiveChannel>,
+    favorites: Set<String>,
+    recents: List<String>,
+    custom: Map<String, List<String>> = emptyMap()
+): List<LiveChannel> = when (group) {
+    GROUP_ALL -> channels
+    GROUP_FAVORITES -> channels.filter { it.id in favorites }
+    GROUP_RECENT -> recents.mapNotNull { id -> channels.firstOrNull { it.id == id } }
+    else -> {
+        // A custom group wins over a provider category of the same name, and stays in the saved order.
+        val ids = custom[group]
+        if (ids != null) {
+            val byId = channels.associateBy { it.id }
+            ids.mapNotNull { byId[it] }
+        } else {
+            channels.filter { groupOf(it) == group }
+        }
     }
+}
+
+/** Watched channels first. A tie keeps the order the list already had, including a custom group's order. */
+internal fun sortGuideRows(channels: List<LiveChannel>, counts: Map<String, Int>): List<LiveChannel> {
+    if (counts.isEmpty() || channels.size < 2) return channels
+    return channels.withIndex().sortedWith(
+        compareByDescending<IndexedValue<LiveChannel>> { counts[it.value.id] ?: 0 }.thenBy { it.index }
+    ).map { it.value }
+}
 
 /** The channel with this number. When two share it, the one in the category on screen wins. */
 private fun channelForNumber(typed: String, channels: List<LiveChannel>, rows: List<LiveChannel>): LiveChannel? =
@@ -102,13 +127,26 @@ fun GuideScreen(
     guideRefreshing: Boolean,
     onRefreshGuide: () -> Unit
 ) {
+    val context = LocalContext.current
+    // Read on each pass so a choice changed in Settings shows the next time the guide draws.
+    val options = PlayerOptionsStore(context).load()
+    val customGroups = options.customGroupMap()
+    val watchCounts = remember(options.sortByWatchTime, channels) {
+        if (options.sortByWatchTime) runCatching { WatchStats.counts(context) }.getOrElse { emptyMap() } else emptyMap()
+    }
     val groups = remember(channels) { groupsOf(channels) }
-    LaunchedEffect(groups) {
+    LaunchedEffect(groups, customGroups) {
         // While channels are still loading there are no groups yet, so a category the viewer picked is kept.
         if (channels.isEmpty()) return@LaunchedEffect
-        if (group != GROUP_ALL && group != GROUP_FAVORITES && group != GROUP_RECENT && group !in groups) onGroupChange(GROUP_ALL)
+        if (group != GROUP_ALL && group != GROUP_FAVORITES && group != GROUP_RECENT && group !in groups && group !in customGroups) {
+            onGroupChange(GROUP_ALL)
+        }
     }
-    val rows = remember(channels, group, favorites, recents) { rowsFor(group, channels, favorites, recents) }
+    val rows = remember(channels, group, favorites, recents, customGroups, options.sortByWatchTime, watchCounts) {
+        val filtered = rowsFor(group, channels, favorites, recents, customGroups)
+        // Watch time is applied after the category, so a custom group keeps its members and then reorders them.
+        if (options.sortByWatchTime) sortGuideRows(filtered, watchCounts) else filtered
+    }
     @Suppress("UNUSED_VARIABLE") val epgVersion = guide.version
     // Entries that end before they start turn up in real feeds. They are skipped so cells never get a negative width.
     fun programsOf(ch: LiveChannel): List<Program> = guide.schedule(ch).filter { it.end > it.start }.ifEmpty { listOf(NO_INFO) }
@@ -117,7 +155,8 @@ fun GuideScreen(
     val now = rememberNow(30_000L)
     // Half hours on the local clock, so a zone 45 minutes off the hour still reads :00 and :30.
     val firstWindow = localSlotStart(now, TimeZone.getDefault().getOffset(now).toLong())
-    val earliest = firstWindow - EpgCache.BEHIND_MS
+    // A past-days choice widens how far the grid can move back. Zero keeps the cache's usual window.
+    val earliest = firstWindow - EpgCache.retainedBehindMs()
     val lastWindow = firstWindow + EpgCache.AHEAD_MS
     var windowStart by remember { mutableLongStateOf(firstWindow) }
     var anchor by remember { mutableLongStateOf(now) }
@@ -384,7 +423,14 @@ fun GuideScreen(
                 val headProgram = headCh?.let { c -> programsOf(c).firstOrNull { it.start == focus.start } ?: guide.nowNext(c)?.now }
                 Row(Modifier.fillMaxWidth().height(if (narrow) 96.dp else 130.dp).padding(horizontal = side).padding(top = 6.dp)) {
                     Column(Modifier.weight(1f).fillMaxHeight(), verticalArrangement = Arrangement.Center) {
-                        if (headCh != null) GuideDetails(headCh, headProgram?.takeIf { it !== NO_INFO }, now, narrow)
+                        if (headCh != null) GuideDetails(
+                            headCh,
+                            headProgram?.takeIf { it !== NO_INFO },
+                            now,
+                            narrow,
+                            showNumbers = options.showChannelNumbers,
+                            twoTitles = options.twoLineTitles
+                        )
                     }
                     if (!narrow) {
                         Spacer(Modifier.width(24.dp))
@@ -399,8 +445,13 @@ fun GuideScreen(
                             )
                             Spacer(Modifier.height(3.dp))
                             val playing = channels.firstOrNull { it.id == currentId }
+                            val watchingLabel = when {
+                                playing == null -> "Nothing playing"
+                                options.showChannelNumbers -> "Watching ${playing.number} · ${playing.name}"
+                                else -> "Watching ${playing.name}"
+                            }
                             Text(
-                                if (playing != null) "Watching ${playing.number} · ${playing.name}" else "Nothing playing",
+                                watchingLabel,
                                 style = TvType.Caption,
                                 color = Tv.Ink3,
                                 maxLines = 1,
@@ -415,7 +466,11 @@ fun GuideScreen(
                 Row(Modifier.fillMaxWidth().padding(horizontal = side).padding(top = 4.dp), horizontalArrangement = Arrangement.End) {
                     PillButton(
                         if (guideRefreshing) "Refreshing" else "Refresh guide",
-                        onRefreshGuide,
+                        {
+                            // A hand refresh still downloads, even when an automatic one would wait.
+                            EpgCache.noteManualRefresh()
+                            onRefreshGuide()
+                        },
                         modifier = Modifier
                             .focusRequester(refreshButton)
                             .onPreviewKeyEvent { ev ->
@@ -511,10 +566,10 @@ fun GuideScreen(
                         )
                         rows.isEmpty() -> EmptyState(
                             title = if (group == GROUP_FAVORITES) "No favorites yet" else "Nothing here yet",
-                            body = if (group == GROUP_FAVORITES) {
-                                "Pick All channels, press OK on a channel name, then choose Add to favorites."
-                            } else {
-                                "Channels you watch show up here."
+                            body = when {
+                                group == GROUP_FAVORITES -> "Pick All channels, press OK on a channel name, then choose Add to favorites."
+                                group in customGroups -> "None of the channels in this group are in the current list."
+                                else -> "Channels you watch show up here."
                             },
                             modifier = Modifier.align(Alignment.Center)
                         )
@@ -544,6 +599,10 @@ fun GuideScreen(
                                     watching = ch.id == currentId,
                                     favorite = ch.id in favorites,
                                     compact = narrow,
+                                    showNumbers = options.showChannelNumbers,
+                                    twoNames = options.twoLineNames,
+                                    twoTitles = options.twoLineTitles,
+                                    showCatchupMark = options.showCatchupMark,
                                     onChannel = {
                                         focus = GuideFocus(i, null)
                                         gridOwnsFocus = false
@@ -592,16 +651,16 @@ fun GuideScreen(
             exit = slideOutHorizontally { -it } + fadeOut(),
             modifier = Modifier.align(Alignment.CenterStart)
         ) {
-            val items = (listOf(GROUP_FAVORITES, GROUP_RECENT, GROUP_ALL) + groups).distinct()
+            val items = (listOf(GROUP_FAVORITES, GROUP_RECENT, GROUP_ALL) + customGroups.keys + groups).distinct()
             CategoryPanel(
                 title = "Show in the guide",
                 items = items,
                 selected = group,
-                countOf = { g -> rowsFor(g, channels, favorites, recents).size },
+                countOf = { g -> rowsFor(g, channels, favorites, recents, customGroups).size },
                 onPick = { g ->
                     onGroupChange(g)
                     showCategories = false
-                    val list = rowsFor(g, channels, favorites, recents)
+                    val list = rowsFor(g, channels, favorites, recents, customGroups)
                     // The picked category puts the highlight on its first row, so the "rows arrived" step leaves it there.
                     hadRows = list.isNotEmpty()
                     anchor = maxOf(now, windowStart)
@@ -658,6 +717,7 @@ fun GuideScreen(
             ChannelMenu(
                 channel = ch,
                 favorite = ch.id in favorites,
+                showNumbers = options.showChannelNumbers,
                 onWatch = {
                     menuFor = null
                     onWatch(ch)
@@ -679,18 +739,25 @@ fun GuideScreen(
 private fun windowEnd(start: Long, narrow: Boolean) = start + (if (narrow) 2 else 4) * SLOT
 
 @Composable
-private fun GuideDetails(ch: LiveChannel, p: Program?, now: Long, narrow: Boolean) {
+private fun GuideDetails(ch: LiveChannel, p: Program?, now: Long, narrow: Boolean, showNumbers: Boolean, twoTitles: Boolean) {
     val live = p != null && isOnNow(p, now)
     Text(
         p?.title ?: ch.name,
         style = if (narrow) TvType.Title else TvType.Headline,
-        maxLines = 1,
+        maxLines = if (twoTitles && p != null) 2 else 1,
         overflow = TextOverflow.Ellipsis
     )
     Spacer(Modifier.height(6.dp))
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         if (live) LivePill()
-        Text("${ch.number} · ${ch.name}", style = TvType.Small, color = Tv.Ink2, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+        Text(
+            if (showNumbers) "${ch.number} · ${ch.name}" else ch.name,
+            style = TvType.Small,
+            color = Tv.Ink2,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f, fill = false)
+        )
         if (p != null) Text(formatRange(p), style = TvType.Small, color = Tv.Ink2, maxLines = 1)
         if (live && p != null && !narrow) {
             ProgressBar(progressOf(p, now), Modifier.width(110.dp))
@@ -724,6 +791,10 @@ private fun GuideRow(
     watching: Boolean,
     favorite: Boolean,
     compact: Boolean,
+    showNumbers: Boolean,
+    twoNames: Boolean,
+    twoTitles: Boolean,
+    showCatchupMark: Boolean,
     onChannel: () -> Unit,
     onProgram: (Program) -> Unit,
     onFocused: (Long?) -> Unit,
@@ -744,13 +815,15 @@ private fun GuideRow(
             contentAlignment = Alignment.CenterStart
         ) {
             Row(Modifier.padding(start = 4.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    ch.number.toString(),
-                    style = TvType.CaptionStrong,
-                    color = if (LocalFocused.current) Tv.FocusInk else if (watching) Tv.Accent else Tv.Ink3,
-                    maxLines = 1,
-                    modifier = Modifier.width(if (compact) 26.dp else 30.dp)
-                )
+                if (showNumbers) {
+                    Text(
+                        ch.number.toString(),
+                        style = TvType.CaptionStrong,
+                        color = if (LocalFocused.current) Tv.FocusInk else if (watching) Tv.Accent else Tv.Ink3,
+                        maxLines = 1,
+                        modifier = Modifier.width(if (compact) 26.dp else 30.dp)
+                    )
+                }
                 if (!compact) {
                     ChannelLogo(ch, Modifier.size(44.dp, 26.dp), compact = true)
                     Spacer(Modifier.width(8.dp))
@@ -758,7 +831,7 @@ private fun GuideRow(
                 Text(
                     ch.name,
                     style = TvType.SmallStrong.copy(lineHeight = TvType.SmallStrong.fontSize * 1.15f),
-                    maxLines = 2,
+                    maxLines = if (twoNames) 2 else 1,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f)
                 )
@@ -791,6 +864,8 @@ private fun GuideRow(
                         val isTarget = focus.row == rowIndex && focus.start == p.start
                         if (isTarget) HoldsTarget(targetHolders)
                         val wide = right - left > 46.dp
+                        // The mark is only a picture. OK still plays catch-up when the mark is hidden.
+                        val catchupMark = showCatchupMark && ch.catchup && p !== NO_INFO && p.start <= now
                         Focusable(
                             onClick = { onProgram(p) },
                             modifier = Modifier
@@ -805,17 +880,32 @@ private fun GuideRow(
                             contentAlignment = Alignment.CenterStart
                         ) {
                             if (wide) {
-                                Column(Modifier.padding(horizontal = 10.dp)) {
-                                    Text(
-                                        (if (p.start < windowStart && p !== NO_INFO) "‹ " else "") + p.title,
-                                        style = TvType.SmallStrong,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                    if (p !== NO_INFO) {
+                                Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp)) {
+                                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                        Text(
+                                            (if (p.start < windowStart && p !== NO_INFO) "‹ " else "") + p.title,
+                                            style = TvType.SmallStrong,
+                                            maxLines = if (twoTitles) 2 else 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        if (catchupMark) {
+                                            Spacer(Modifier.width(4.dp))
+                                            Icon(TvIcons.Replay, contentDescription = "Catch-up", tint = ink3, modifier = Modifier.size(12.dp))
+                                        }
+                                    }
+                                    // A second title line already fills the row, so the clock time stays in the details above.
+                                    if (p !== NO_INFO && !twoTitles) {
                                         Text(formatTime(p.start), style = TvType.Caption, color = ink3, maxLines = 1)
                                     }
                                 }
+                            } else if (catchupMark) {
+                                Icon(
+                                    TvIcons.Replay,
+                                    contentDescription = "Catch-up",
+                                    tint = ink3,
+                                    modifier = Modifier.padding(start = 6.dp).size(12.dp)
+                                )
                             }
                         }
                     }
@@ -918,8 +1008,13 @@ internal fun digitOf(keyCode: Int): Int? = when (keyCode) {
 }
 
 /** The channels in a category, in list order. */
-fun channelsIn(group: String, channels: List<LiveChannel>, favorites: Set<String>, recents: List<String>): List<LiveChannel> =
-    rowsFor(group, channels, favorites, recents)
+fun channelsIn(
+    group: String,
+    channels: List<LiveChannel>,
+    favorites: Set<String>,
+    recents: List<String>,
+    custom: Map<String, List<String>> = emptyMap()
+): List<LiveChannel> = rowsFor(group, channels, favorites, recents, custom)
 
 @Composable
 fun CategoryPanel(
@@ -980,6 +1075,7 @@ fun CategoryPanel(
 private fun ChannelMenu(
     channel: LiveChannel,
     favorite: Boolean,
+    showNumbers: Boolean,
     onWatch: () -> Unit,
     onFavorite: () -> Unit,
     modifier: Modifier = Modifier
@@ -1004,7 +1100,7 @@ private fun ChannelMenu(
                 Spacer(Modifier.width(12.dp))
                 Column {
                     Text(channel.name, style = TvType.Section, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    Text("Channel ${channel.number}", style = TvType.Caption, color = Tv.Ink3)
+                    if (showNumbers) Text("Channel ${channel.number}", style = TvType.Caption, color = Tv.Ink3)
                 }
             }
             Spacer(Modifier.height(2.dp))

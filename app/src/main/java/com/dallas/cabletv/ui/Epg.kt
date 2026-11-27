@@ -92,7 +92,11 @@ class GuideData(private val scope: CoroutineScope) {
     /** What is on now from data already downloaded. Never asks the provider, so it is safe for long lists. */
     fun peekNow(ch: LiveChannel): Program? {
         @Suppress("UNUSED_VARIABLE") val v = version
-        return EpgCache.nowNext(ch.epgId, ch.name)?.now ?: short[ch.id]?.second?.now
+        EpgCache.nowNext(ch.epgId, ch.name)?.now?.let { return it }
+        val raw = short[ch.id]?.second?.now ?: return null
+        // The short listing is not in the guide database, so it is shifted on the way out. The database
+        // path already shifted, and this does not shift that programme again.
+        return EpgCache.forDisplay(listOf(raw)).first()
     }
 
     /** Every known programme for a channel, oldest first. */
@@ -111,14 +115,17 @@ class GuideData(private val scope: CoroutineScope) {
     private fun shortListing(ch: LiveChannel): NowNext? {
         val cached = short[ch.id]
         val now = System.currentTimeMillis()
+        // Stale is judged on the time the viewer sees, which may differ from the provider's clock.
+        val displayEnd = cached?.second?.now?.let { EpgCache.forDisplay(listOf(it)).first().end } ?: Long.MAX_VALUE
         // The short listing only covers now and next, so it is fetched again once "now" has ended.
-        val stale = cached == null || now - cached.first > 15 * 60_000L || (cached.second.now?.end ?: Long.MAX_VALUE) < now
+        val stale = cached == null || now - cached.first > 15 * 60_000L || displayEnd < now
         if (stale) {
             // Reading this ties the row to the on-screen check below.
             @Suppress("UNUSED_VARIABLE") val check = onScreenCheck
             request(ch)
         }
-        return cached?.second
+        val raw = cached?.second ?: return null
+        return EpgCache.forDisplay(raw)
     }
 
     private fun canAsk(ch: LiveChannel): Boolean = when (ch.origin) {

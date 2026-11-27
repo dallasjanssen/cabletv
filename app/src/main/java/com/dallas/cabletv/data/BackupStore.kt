@@ -3,8 +3,11 @@ package com.dallas.cabletv.data
 import android.content.Context
 import android.content.SharedPreferences
 import android.net.Uri
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.TimeUnit
 
 /**
  * Full settings backup and restore, including encrypted logins, profile setup,
@@ -36,6 +39,44 @@ class BackupStore(
 
     fun restoreBackup(json: String) {
         importJson(json)
+    }
+
+    /**
+     * Downloads a backup and applies it. Only http and https are accepted, so a file
+     * or other link cannot be fetched by mistake. The download uses a short-lived client.
+     */
+    fun restoreFromUrl(url: String) {
+        val trimmed = url.trim()
+        if (!trimmed.regionMatches(0, "http://", 0, 7, ignoreCase = true) &&
+            !trimmed.regionMatches(0, "https://", 0, 8, ignoreCase = true)
+        ) {
+            throw IllegalArgumentException("The backup link needs to start with http:// or https://")
+        }
+        val json = try {
+            downloadBackup(trimmed)
+        } catch (e: IllegalArgumentException) {
+            throw e
+        } catch (e: Exception) {
+            throw IllegalArgumentException("Could not download that backup.")
+        }
+        restoreBackup(json)
+    }
+
+    private fun downloadBackup(url: String): String {
+        val http = OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .build()
+        val request = try {
+            Request.Builder().url(url).header("User-Agent", "CableTV/1.0").build()
+        } catch (e: IllegalArgumentException) {
+            throw IllegalArgumentException("Could not download that backup.")
+        }
+        http.newCall(request).execute().use { resp ->
+            if (!resp.isSuccessful) throw IllegalArgumentException("Could not download that backup.")
+            return resp.body?.string()?.takeIf { it.isNotBlank() }
+                ?: throw IllegalArgumentException("Could not download that backup.")
+        }
     }
 
     private fun exportJson(): String {

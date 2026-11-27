@@ -10,6 +10,7 @@ import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -62,19 +63,25 @@ import com.dallas.cabletv.data.companion.server.PairedPhone
 import com.dallas.cabletv.data.ChannelFilter
 import com.dallas.cabletv.data.Recording
 import com.dallas.cabletv.data.channelFilters
+import com.dallas.cabletv.data.channelMatches
 import com.dallas.cabletv.data.normalizeStalkerMac
 import com.dallas.cabletv.data.xtreamLoginFields
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.util.concurrent.TimeUnit
 
 enum class SettingsPane(val label: String, val icon: ImageVector) {
     Phone("Set up with your phone", TvIcons.Phone),
     Live("Live TV", TvIcons.Tv),
+    Picture("Picture & sound", TvIcons.Tv),
     Library("Movies & Shows", TvIcons.Film),
     Channels("Channel list", TvIcons.Eye),
     Profiles("Profiles", TvIcons.People),
@@ -461,6 +468,43 @@ fun SettingsScreen(
         }
     }
 
+    // A link is refused here, before any request, so a bad address is a message rather than a crash.
+    fun restoreFromLink(raw: String) {
+        if (backupBusy) return
+        val normalized = backupHttpUrl(raw.trim())
+        if (normalized == null) {
+            backupMessage = "The backup link needs to start with http:// or https://."
+            return
+        }
+        scope.launch {
+            backupBusy = true
+            backupMessage = "Downloading backup"
+            suppressUnsavedNotice = true
+            val downloaded = withContext(Dispatchers.IO) { runCatching { downloadBackup(normalized) } }
+            val downloadError = downloaded.exceptionOrNull()
+            if (downloadError is CancellationException) throw downloadError
+            if (downloadError != null) {
+                backupBusy = false
+                suppressUnsavedNotice = false
+                backupMessage = "Download failed. ${friendlyError(downloadError)}"
+                return@launch
+            }
+            val restored = withContext(Dispatchers.IO) {
+                runCatching { onBackupRestoreJson(downloaded.getOrThrow()) }
+            }
+            val restoreError = restored.exceptionOrNull()
+            if (restoreError is CancellationException) throw restoreError
+            backupBusy = false
+            if (restoreError == null) {
+                backupMessage = "Backup restored. Reopening the app."
+                (context as? Activity)?.recreate()
+            } else {
+                suppressUnsavedNotice = false
+                backupMessage = "Restore failed. ${(restoreError.message ?: "Try another link").trimEnd('.')}."
+            }
+        }
+    }
+
     fun phoneValues(): Map<String, String> = mapOf(
         "xs" to latest.xtreamServer,
         "xu" to latest.xtreamUser,
@@ -485,10 +529,16 @@ fun SettingsScreen(
 
     // These panes can list thousands of groups, so they scroll as lazy lists of their own.
     val lazyPane = pane == SettingsPane.Channels || pane == SettingsPane.Lock
+    // Back leaves one channel's settings before it leaves the page.
+    var arrangingChannel by remember { mutableStateOf(false) }
+    LaunchedEffect(pane) {
+        if (pane != SettingsPane.Channels) arrangingChannel = false
+    }
 
-    TabScaffold(Tab.Settings, nav, modifier = Modifier.background(Tv.Bg), backEnabled = !narrowOpen) { narrow ->
+    TabScaffold(Tab.Settings, nav, modifier = Modifier.background(Tv.Bg), backEnabled = !narrowOpen && !arrangingChannel) { narrow ->
         val side = gutter(narrow)
         BackHandler(enabled = narrow && narrowOpen) { narrowOpen = false }
+        BackHandler(enabled = arrangingChannel) { arrangingChannel = false }
 
         val paneContent: @Composable ColumnScope.() -> Unit = {
             when (pane) {
@@ -500,6 +550,7 @@ fun SettingsScreen(
                     pairedPhones = pairedPhones,
                     onRemovePhone = onRemovePhone
                 )
+                SettingsPane.Picture -> PicturePane()
                 SettingsPane.Live -> LivePane(settings, channelCount, drafts, liveBusy, liveMessage, guideRefreshing, onRefreshGuide, onSave = { saveLive() }, onSignOut = {
                     onSave(settings.copy(xtreamServer = "", xtreamUser = "", xtreamPass = "", m3uUrl = "", epgUrl = "", stalkerUrl = "", stalkerMac = "", subscriptionExpiryMs = 0L))
                     drafts.xs = ""; drafts.xu = ""; drafts.xp = ""; drafts.m3u = ""; drafts.epg = ""; drafts.su = ""; drafts.sm = ""
@@ -509,7 +560,9 @@ fun SettingsScreen(
                     onJellyfinSave(settings.copy(jellyfinToken = "", jellyfinUserId = ""))
                     libraryMessage = "Signed out of Jellyfin for this profile."
                 })
-                SettingsPane.Channels -> ChannelsPane(settings, allChannels, hiddenFilters, onHiddenFilters, onSave)
+                SettingsPane.Channels -> ChannelsPane(
+                    settings, allChannels, hiddenFilters, onHiddenFilters, onSave, arrangingChannel
+                ) { arrangingChannel = it }
                 SettingsPane.Profiles -> ProfilesPane(profiles, activeProfileId, onSwitchProfile, onAddProfile, onRemoveProfile, showToast)
                 SettingsPane.Lock -> LockPane(pinSet, onSetPin, onRemovePin, settings, allChannels, vodCategories, onSave)
                 SettingsPane.Recordings -> RecordingsPane(listRequesters.getValue(SettingsPane.Recordings))
@@ -518,7 +571,8 @@ fun SettingsScreen(
                     busy = backupBusy,
                     message = backupMessage,
                     onBackup = { if (!backupBusy) createBackup.launch(backupName()) },
-                    onRestore = { if (!backupBusy) restoreBackup.launch(arrayOf("application/json", "text/plain", "*/*")) }
+                    onRestore = { if (!backupBusy) restoreBackup.launch(arrayOf("application/json", "text/plain", "*/*")) },
+                    onRestoreLink = { restoreFromLink(it) }
                 )
                 SettingsPane.Updates -> UpdatesPane(update, updateMessage, updateBusy, onCheckUpdate, onInstallUpdate, lastCrash, onClearCrash)
             }
@@ -612,7 +666,7 @@ private fun PaneListItem(p: SettingsPane, selected: Boolean, modifier: Modifier,
 }
 
 @Composable
-private fun PaneTitle(title: String, lead: String) {
+internal fun PaneTitle(title: String, lead: String) {
     Text(title, style = TvType.Headline)
     Spacer(Modifier.height(4.dp))
     Text(lead, style = TvType.Small, color = Tv.Ink2, modifier = Modifier.widthIn(max = 560.dp))
@@ -785,8 +839,17 @@ private fun ChannelsPane(
     allChannels: List<LiveChannel>,
     hiddenFilters: String,
     onHiddenFilters: (String) -> Unit,
-    onSave: (Settings) -> Unit
+    onSave: (Settings) -> Unit,
+    arranging: Boolean,
+    onArranging: (Boolean) -> Unit
 ) {
+    val player = rememberPlayerOptionsEditor()
+    var query by rememberSaveable { mutableStateOf("") }
+    var pickedId by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(arranging) {
+        if (!arranging) pickedId = null
+    }
+    val picked = allChannels.firstOrNull { it.id == pickedId }
     val hidden = remember(hiddenFilters) { hiddenFilters.split(',').map { it.trim().uppercase() }.filter { it.isNotEmpty() }.toSet() }
     fun toggle(term: String) {
         val set = hidden.toMutableSet()
@@ -802,12 +865,108 @@ private fun ChannelsPane(
     val (prefixes, categories) = filters
     // A lazy list, so a provider with a thousand groups does not compose them all at once.
     LazyColumn(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(6.dp), contentPadding = PaddingValues(bottom = 24.dp)) {
+        val open = picked
+        if (open != null) {
+            item(key = "one-channel") {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    PaneTitle("One channel", "Hide it, block it, move it, put it in a group, or give it a guide id.")
+                    ChannelEditor(open, allChannels, player) { onArranging(false) }
+                }
+            }
+            return@LazyColumn
+        }
         item(key = "title") {
             Column { PaneTitle("Channel list", "Hidden groups are for this profile. A new profile starts from the list saved here the first time.") }
+        }
+        item(key = "find") {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                SectionLabel("One channel", Modifier.padding(top = 4.dp, bottom = 2.dp))
+                if (allChannels.isEmpty()) {
+                    SettingsNote("Connect live TV to hide, block, move, or group one channel.")
+                } else {
+                    SettingsNote("Type a name, a group, or a channel number.")
+                    SettingsField("Find a channel", query, placeholder = "Name, group, or number") { query = it }
+                }
+            }
+        }
+        if (allChannels.isNotEmpty()) {
+            val trimmed = query.trim()
+            val tooShort = trimmed.isNotEmpty() && trimmed.length < 2 && trimmed.toIntOrNull() == null
+            val matches = channelMatches(allChannels, query, 41)
+            val shown = matches.take(40)
+            if (tooShort) {
+                item(key = "find-short") { Message("Type at least two letters, or a channel number.") }
+            } else if (trimmed.isNotEmpty() && shown.isEmpty()) {
+                item(key = "find-none") { Message("No channel matches.") }
+            }
+            itemsIndexed(shown, key = { index, ch -> "find:$index:${ch.id}" }) { _, ch ->
+                ChannelPickRow(ch, ch.id in player.options.hiddenIds, ch.id in player.options.blockedIds) {
+                    pickedId = ch.id
+                    onArranging(true)
+                }
+            }
+            if (matches.size > 40) {
+                item(key = "find-more") { Message("Keep typing to see a shorter list.") }
+            }
         }
         item(key = "strip") {
             SwitchRow("Show names without country codes", "UK| News becomes News", settings.stripPrefixes) {
                 onSave(settings.copy(stripPrefixes = !settings.stripPrefixes))
+            }
+        }
+        item(key = "player") {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                SectionLabel("Names", Modifier.padding(top = 12.dp, bottom = 2.dp))
+                SettingsNote("Extra prefixes and suffixes to remove, separated by commas.")
+                SettingsField("Extra prefixes", player.options.namePrefixes, placeholder = "US:, UK:") { text ->
+                    player.update { it.copy(namePrefixes = text) }
+                }
+                SettingsField("Extra suffixes", player.options.nameSuffixes, placeholder = "| HD, | FHD") { text ->
+                    player.update { it.copy(nameSuffixes = text) }
+                }
+                SectionLabel("Logos", Modifier.padding(top = 12.dp, bottom = 2.dp))
+                SettingsField("Logos folder", player.options.logoFolder, placeholder = "Folder of picture files") { text ->
+                    player.update { it.copy(logoFolder = text) }
+                }
+                LogoPriorityRow(player.options.logoPriority) { priority ->
+                    player.update { it.copy(logoPriority = priority) }
+                }
+                SectionLabel("Guide", Modifier.padding(top = 12.dp, bottom = 2.dp))
+                SettingsNote("The offset is in minutes, up to 12 hours either way. A negative number means the guide is ahead. 0 days or 0 hours means automatic.")
+                IntSetting("Guide time offset", player.options.epgOffsetMinutes, "Minutes", -720..720) { n ->
+                    player.update { it.copy(epgOffsetMinutes = n) }
+                }
+                IntSetting("Days to keep", player.options.epgPastDays, "0 means automatic", 0..14) { n ->
+                    player.update { it.copy(epgPastDays = n) }
+                }
+                IntSetting("Update every", player.options.epgUpdateHours, "Hours. 0 means automatic", 0..168) { n ->
+                    player.update { it.copy(epgUpdateHours = n) }
+                }
+                SwitchRow("Update the guide when the app opens", null, player.options.epgUpdateOnStart) {
+                    player.update { it.copy(epgUpdateOnStart = !it.epgUpdateOnStart) }
+                }
+                SectionLabel("On screen", Modifier.padding(top = 12.dp, bottom = 2.dp))
+                SwitchRow("Open the last channel", null, player.options.openLastChannel) {
+                    player.update { it.copy(openLastChannel = !it.openLastChannel) }
+                }
+                SwitchRow("Show channel numbers", null, player.options.showChannelNumbers) {
+                    player.update { it.copy(showChannelNumbers = !it.showChannelNumbers) }
+                }
+                SwitchRow("Show channel names", null, player.options.showChannelNames) {
+                    player.update { it.copy(showChannelNames = !it.showChannelNames) }
+                }
+                SwitchRow("Show the catch-up mark", null, player.options.showCatchupMark) {
+                    player.update { it.copy(showCatchupMark = !it.showCatchupMark) }
+                }
+                SwitchRow("Two-line names", null, player.options.twoLineNames) {
+                    player.update { it.copy(twoLineNames = !it.twoLineNames) }
+                }
+                SwitchRow("Two-line programme titles", null, player.options.twoLineTitles) {
+                    player.update { it.copy(twoLineTitles = !it.twoLineTitles) }
+                }
+                SwitchRow("Sort channels by how often they are watched", null, player.options.sortByWatchTime) {
+                    player.update { it.copy(sortByWatchTime = !it.sortByWatchTime) }
+                }
             }
         }
         if (allChannels.isEmpty()) {
@@ -824,6 +983,33 @@ private fun ChannelsPane(
                 items(categories, key = { "g:" + it.term }) { f ->
                     SwitchRow(f.label, channelCount(f.count), f.term !in hidden) { toggle(f.term) }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ChannelPickRow(channel: LiveChannel, hidden: Boolean, blocked: Boolean, onPick: () -> Unit) {
+    val marks = listOfNotNull(if (hidden) "Hidden" else null, if (blocked) "Blocked" else null).joinToString(", ")
+    Focusable(
+        onClick = onPick,
+        modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp),
+        shape = RoundedCornerShape(10.dp),
+        color = Tv.Surface,
+        contentAlignment = Alignment.CenterStart
+    ) {
+        Row(Modifier.padding(horizontal = 14.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text("${channel.number}", style = TvType.SmallStrong, modifier = Modifier.width(52.dp), maxLines = 1)
+            Text(
+                channel.name,
+                style = TvType.BodyStrong,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f)
+            )
+            if (marks.isNotEmpty()) {
+                Spacer(Modifier.width(12.dp))
+                Text(marks, style = TvType.Caption, color = ink3, maxLines = 1)
             }
         }
     }
@@ -928,13 +1114,14 @@ private fun LockPane(
     vodCategories: List<String>,
     onSave: (Settings) -> Unit
 ) {
+    val player = rememberPlayerOptionsEditor()
     val locked = settings.lockedTerms.toSet()
     val groups = remember(allChannels, vodCategories) { lockGroups(allChannels, vodCategories) }
     // A lazy list, so a provider with a thousand groups does not compose them all at once.
     LazyColumn(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(6.dp), contentPadding = PaddingValues(bottom = 24.dp)) {
         item(key = "head") {
             Column {
-                PaneTitle("Parental lock", "The PIN opens Settings. Groups marked below also need it before they play. One correct PIN unlocks them until you switch profile.")
+                PaneTitle("Parental lock", "The PIN opens Settings. Groups marked below also need it before they play. Choose how long one correct PIN keeps them open.")
                 if (pinSet) StatusChip("On. Settings and locked groups need the PIN.", ok = true) else StatusChip("Off. Anyone can open Settings.", ok = false)
                 Spacer(Modifier.height(14.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -944,6 +1131,10 @@ private fun LockPane(
                     } else {
                         PillButton("Set a PIN", onSetPin, icon = TvIcons.Lock)
                     }
+                }
+                Spacer(Modifier.height(14.dp))
+                PinGraceRow(player.options.pinGrace) { grace ->
+                    player.update { it.copy(pinGrace = grace) }
                 }
             }
         }
@@ -965,8 +1156,10 @@ private fun BackupPane(
     busy: Boolean,
     message: String?,
     onBackup: () -> Unit,
-    onRestore: () -> Unit
+    onRestore: () -> Unit,
+    onRestoreLink: (String) -> Unit
 ) {
+    var link by rememberSaveable { mutableStateOf("") }
     PaneTitle(
         "Backup & restore",
         "Save all settings to a file and bring them back later, including logins, profiles, favorites and resume points."
@@ -982,12 +1175,41 @@ private fun BackupPane(
         PillButton(if (busy) "Working" else "Backup now", onBackup, icon = TvIcons.Download, enabled = !busy)
         PillButton(if (busy) "Working" else "Restore backup", onRestore, icon = TvIcons.Check, enabled = !busy)
     }
+    Spacer(Modifier.height(14.dp))
+    SettingsNote("Paste a link that starts with http:// or https://. The backup is downloaded and restored here.")
+    Spacer(Modifier.height(8.dp))
+    SettingsField("Backup link", link, placeholder = "https://example.com/backup.json") { link = it }
+    Spacer(Modifier.height(10.dp))
+    PillButton(if (busy) "Working" else "Restore from link", { onRestoreLink(link) }, icon = TvIcons.Download, enabled = !busy)
     Message(message)
+}
+
+/** http:// or https://, with the scheme in lower case. Anything else is refused. */
+private fun backupHttpUrl(url: String): String? = when {
+    url.startsWith("https://", ignoreCase = true) -> "https://" + url.substring(8)
+    url.startsWith("http://", ignoreCase = true) -> "http://" + url.substring(7)
+    else -> null
+}
+
+private fun downloadBackup(url: String): String {
+    val http = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .callTimeout(60, TimeUnit.SECONDS)
+        .build()
+    val request = Request.Builder().url(url).header("User-Agent", "CableTV").build()
+    http.newCall(request).execute().use { response ->
+        if (!response.isSuccessful) error("The link answered with error ${response.code}.")
+        val text = response.body?.string().orEmpty()
+        if (text.isBlank()) error("The link did not include a backup.")
+        return text
+    }
 }
 
 @Composable
 private fun RecordingsPane(fallbackFocus: FocusRequester) {
     val context = LocalContext.current
+    val player = rememberPlayerOptionsEditor()
     // A damaged recordings file must not take the pane down with it.
     fun load(): List<Recording> = runCatching { RecordingStore(context.filesDir).list() }.getOrDefault(emptyList())
     var items by remember { mutableStateOf(load()) }
@@ -1022,6 +1244,32 @@ private fun RecordingsPane(fallbackFocus: FocusRequester) {
             PillButton("Stop recording", { RecordingService.stop(context) }, onFocus = { stopFocused = it })
         }
         Spacer(Modifier.height(14.dp))
+    }
+    Column(Modifier.padding(bottom = 14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        SectionLabel("Timing")
+        SettingsNote("Minutes. Starting early can be up to 30, and stopping late up to 60. A blank folder uses the app's private folder. A recording still needs the app open.")
+        IntSetting("Start early", player.options.recordPadStartMin, "Minutes", 0..30) { n ->
+            player.update { it.copy(recordPadStartMin = n) }
+        }
+        IntSetting("Stop late", player.options.recordPadEndMin, "Minutes", 0..60) { n ->
+            player.update { it.copy(recordPadEndMin = n) }
+        }
+        SettingsField("Recordings folder", player.options.recordingsFolder, placeholder = "App's private folder") { text ->
+            player.update { it.copy(recordingsFolder = text) }
+        }
+    }
+    Column(Modifier.padding(bottom = 14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        SectionLabel("Reminders")
+        SettingsNote("A reminder only appears while the app is open. Waking the device keeps the box from sleeping while the reminder is on screen.")
+        IntSetting("Remind before", player.options.remindLeadMin, "Minutes", 1..120) { n ->
+            player.update { it.copy(remindLeadMin = n) }
+        }
+        IntSetting("Reminder stays", player.options.reminderPopupSec, "Seconds", 5..120) { n ->
+            player.update { it.copy(reminderPopupSec = n) }
+        }
+        SwitchRow("Keep the box awake", "While the reminder is showing", player.options.reminderWakesDevice) {
+            player.update { it.copy(reminderWakesDevice = !it.reminderWakesDevice) }
+        }
     }
     if (items.isEmpty()) {
         if (!recordingNow) Message("Nothing recorded yet. Pick a show in the guide and choose Record.")
@@ -1251,6 +1499,7 @@ fun SettingsField(
     value: String,
     secret: Boolean = false,
     placeholder: String = "",
+    onEditingFinished: (() -> Unit)? = null,
     onChange: (String) -> Unit
 ) {
     var editing by remember { mutableStateOf(false) }
@@ -1259,6 +1508,7 @@ fun SettingsField(
     val scope = rememberCoroutineScope()
 
     fun finish() {
+        onEditingFinished?.invoke()
         editing = false
         scope.launch {
             withFrameNanos { }

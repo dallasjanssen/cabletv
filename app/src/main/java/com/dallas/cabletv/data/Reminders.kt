@@ -8,11 +8,19 @@ data class Reminder(
     val start: Long
 )
 
-/** Due when the showing starts within the next minute, or started less than two minutes ago. */
-fun dueReminders(reminders: List<Reminder>, nowMs: Long, fired: Set<String>): List<Reminder> =
+/**
+ * Due once the showing is inside the lead window, or started less than two minutes ago.
+ * The lead defaults to a minute, which is how reminders behaved before it could be chosen.
+ */
+fun dueReminders(
+    reminders: List<Reminder>,
+    nowMs: Long,
+    fired: Set<String>,
+    leadMs: Long = 60_000L
+): List<Reminder> =
     reminders.filter { reminder ->
         val key = reminderKey(reminder)
-        key !in fired && nowMs >= reminder.start - 60_000L && nowMs < reminder.start + 2 * 60_000L
+        key !in fired && nowMs >= reminder.start - leadMs && nowMs < reminder.start + 2 * 60_000L
     }
 
 fun reminderKey(reminder: Reminder): String = "${reminder.channelId}@${reminder.start}"

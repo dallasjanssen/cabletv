@@ -1,6 +1,7 @@
 package com.dallas.cabletv
 
 import android.content.Intent
+import android.os.Build
 import android.os.Bundle
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
@@ -12,11 +13,14 @@ import com.dallas.cabletv.data.CHANNEL_LINK_SCHEME
 import com.dallas.cabletv.data.CrashLog
 import com.dallas.cabletv.data.EpgCache
 import com.dallas.cabletv.data.DebugLog
+import com.dallas.cabletv.data.PlayerOptionsStore
 import com.dallas.cabletv.data.SettingsStore
 import com.dallas.cabletv.data.companion.isTelevision
 import com.dallas.cabletv.ui.CableApp
 import com.dallas.cabletv.ui.TvTheme
 import com.dallas.cabletv.ui.companion.CompanionApp
+import com.dallas.cabletv.ui.enterPictureInPicture
+import com.dallas.cabletv.ui.supportsPictureInPicture
 
 class MainActivity : ComponentActivity() {
     /** A cabletv:// link waiting for the channel list, such as one sent by Home Assistant. */
@@ -72,6 +76,18 @@ class MainActivity : ComponentActivity() {
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
         outState.putBoolean(STATE_SHOW_CABLE, showCable)
+    }
+
+    /**
+     * Home, or leaving for another app, keeps the channel in a small window when that option is on.
+     * A device that cannot do it is left alone.
+     */
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        if (!showCable || !supportsPictureInPicture(this)) return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && isInPictureInPictureMode) return
+        if (!PlayerOptionsStore(this).load().pipOnHome) return
+        enterPictureInPicture(this)
     }
 
     /** A cable box never sleeps while you are watching. The companion screens let the phone sleep. */

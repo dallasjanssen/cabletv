@@ -30,6 +30,10 @@ class RecordingService : Service() {
     private val running = AtomicBoolean(false)
     private val stopRequested = AtomicBoolean(false)
     private var worker: Thread? = null
+    /** Where this recording's bytes go. Set from the store before the worker starts. */
+    private var outputDir: File? = null
+    /** Identity for this recording's requests. Blank in options keeps the usual player agent. */
+    private var streamAgent: String = PLAYER_USER_AGENT
     private val http = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
@@ -80,11 +84,16 @@ class RecordingService : Service() {
         currentTitle = title
         val started = System.currentTimeMillis()
         val safeId = id.replace(Regex("[^A-Za-z0-9_-]"), "_")
-        val file = File(RecordingStore(filesDir).directory(), "${safeId}_$started.ts")
+        // The store picks a custom folder when one is set and writable, otherwise the private one.
+        val store = RecordingStore(filesDir)
+        outputDir = store.directory()
+        streamAgent = runCatching {
+            playbackUserAgent(PlayerOptionsStore(this).load().userAgent)
+        }.getOrDefault(playbackUserAgent(""))
+        val file = File(outputDir, "${safeId}_$started.ts")
         val lock = acquireWakeLock(until)
         worker = Thread {
             try {
-                val store = RecordingStore(filesDir)
                 runCatching { store.deleteOrphans(file.name) }
                 try {
                     capture(url, file, until)
@@ -123,7 +132,7 @@ class RecordingService : Service() {
     private fun shouldContinue(until: Long): Boolean =
         !stopRequested.get() &&
             (until <= 0L || System.currentTimeMillis() < until) &&
-            filesDir.usableSpace >= MIN_RUN_SPACE
+            (outputDir ?: filesDir).usableSpace >= MIN_RUN_SPACE
 
     private fun capture(url: String, file: File, until: Long) {
         FileOutputStream(file).use { out ->
@@ -148,7 +157,7 @@ class RecordingService : Service() {
     }
 
     private fun copyOnce(url: String, out: FileOutputStream, until: Long): Long {
-        val req = Request.Builder().url(url).header("User-Agent", PLAYER_USER_AGENT).build()
+        val req = Request.Builder().url(url).header("User-Agent", streamAgent).build()
         var total = 0L
         http.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) throw IOException("HTTP ${resp.code}")
@@ -193,7 +202,7 @@ class RecordingService : Service() {
 
     /** The playlist text and the address it finally came from, after redirects. */
     private fun fetchPlaylist(url: String): Pair<String, String>? = retry {
-        val req = Request.Builder().url(url).header("User-Agent", PLAYER_USER_AGENT).build()
+        val req = Request.Builder().url(url).header("User-Agent", streamAgent).build()
         http.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) throw IOException("HTTP ${resp.code}")
             val text = resp.body?.string() ?: throw IOException("Empty playlist")
@@ -202,7 +211,7 @@ class RecordingService : Service() {
     }
 
     private fun fetchBytes(url: String): ByteArray? = retry {
-        val req = Request.Builder().url(url).header("User-Agent", PLAYER_USER_AGENT).build()
+        val req = Request.Builder().url(url).header("User-Agent", streamAgent).build()
         http.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) throw IOException("HTTP ${resp.code}")
             resp.body?.bytes() ?: throw IOException("Empty segment")
@@ -284,7 +293,10 @@ class RecordingService : Service() {
 
         /** Starts a recording. False when one is already running, space is low, or Android refuses. Never throws. */
         fun start(context: Context, id: String, url: String, title: String, channel: String, untilMs: Long): Boolean {
-            if (context.filesDir.usableSpace < MIN_START_SPACE) return false
+            // Space is judged on the folder the recording will actually use.
+            val room = runCatching { RecordingStore(context.filesDir).directory().usableSpace }
+                .getOrDefault(context.filesDir.usableSpace)
+            if (room < MIN_START_SPACE) return false
             if (!busy.compareAndSet(false, true)) return false
             val intent = Intent(context, RecordingService::class.java)
                 .setAction(ACTION_START)

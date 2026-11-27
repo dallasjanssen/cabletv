@@ -4,8 +4,12 @@ import android.content.Context
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
+import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.TrackSelectionParameters
+import androidx.media3.common.audio.AudioProcessor
+import androidx.media3.common.audio.BaseAudioProcessor
 import androidx.media3.common.util.Util
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DefaultDataSource
@@ -14,22 +18,32 @@ import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.audio.AudioSink
+import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.drm.DrmSessionManagerProvider
 import androidx.media3.exoplayer.hls.HlsMediaSource
 import androidx.media3.exoplayer.hls.DefaultHlsExtractorFactory
+import androidx.media3.exoplayer.mediacodec.MediaCodecInfo
+import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.source.MediaSource
+import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
 import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy
 import androidx.media3.extractor.DefaultExtractorsFactory
 import okhttp3.OkHttpClient
+import java.nio.ByteBuffer
 import java.util.concurrent.TimeUnit
+import kotlin.math.abs
 
 /** The most a live channel can be paused or rewound from what is already buffered. */
 const val LIVE_BUFFER_MS = 3 * 60_000
 
 /** The shortest rewind kept, even on a device with little memory. */
 private const val MIN_REWIND_MS = 45_000
+
+/** Same range PlayerOptionsStore writes. A larger value would be ignored on the next save. */
+internal const val MAX_AUDIO_OFFSET_MS = 2_000
 
 /** A busy HD channel, about 8 Mbps, used to turn a memory budget into seconds of rewind. */
 private const val HD_BYTES_PER_SECOND = 1_000_000L
@@ -128,12 +142,20 @@ private class LiveMediaSourceFactory(
 }
 
 /**
- * A player that sends the same client identity the provider API calls use.
- * [compact] keeps a small buffer and no rewind, for the two small pictures of Two channels.
- * Those two leave audio focus alone, because two players asking for it would pause each other.
+ * A player that sends the same client identity the provider API calls use, unless a user agent
+ * was saved. [compact] keeps a small buffer and no rewind, for the two small pictures of Two
+ * channels. Those two leave audio focus alone, because two players asking for it would pause
+ * each other.
+ *
+ * Saved picture choices are read here. Flags that are still at their defaults are left unset,
+ * so a fresh install builds the same player as before those choices existed.
  */
 fun newPlayer(context: Context, compact: Boolean = false): ExoPlayer {
-    val okHttp = OkHttpDataSource.Factory(playerHttp).setUserAgent(PLAYER_USER_AGENT)
+    val options = PlayerOptionsStore(context).load()
+    // The gate is only the cap. The screen that opens a stream acquires a slot; building a player does not.
+    ConnectionGate.setLimit(options.maxConnections)
+    val okHttp = OkHttpDataSource.Factory(playerHttp)
+        .setUserAgent(playbackUserAgent(options.userAgent))
     // The default wrapper keeps file and content URIs working next to http.
     val http = DefaultDataSource.Factory(context, okHttp)
     val policy = LiveLoadErrorPolicy()
@@ -143,28 +165,14 @@ fun newPlayer(context: Context, compact: Boolean = false): ExoPlayer {
         http,
         policy,
     )
-    val load = if (compact) {
-        DefaultLoadControl.Builder()
-            .setBufferDurationsMs(8_000, 15_000, 1_500, 4_000)
-            .setBackBuffer(0, false)
-            .setTargetBufferBytes(16 * 1024 * 1024)
-            .build()
-    } else {
-        // The size cap keeps a high bitrate stream from filling the memory before the time limit.
-        // The first 15 seconds still load past the cap, so the rewind buffer can never stall playback.
-        DefaultLoadControl.Builder()
-            .setBufferDurationsMs(15_000, LIVE_BUFFER_MS, 1_500, 5_000)
-            .setBackBuffer(rewindBufferMs(), true)
-            .setTargetBufferBytes(64 * 1024 * 1024)
-            .setPrioritizeTimeOverSizeThresholds(true)
-            .build()
-    }
+    // auto passes the memory-based rewind already computed for this device. Compact pictures
+    // ignore the preset inside bufferPlan, so four tiles stay small.
+    val load = loadControlFor(bufferPlan(options.bufferPreset, compact, rewindBufferMs()))
     val audio = AudioAttributes.Builder()
         .setUsage(C.USAGE_MEDIA)
         .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
         .build()
-    // If the preferred hardware decoder fails to start, try the next one instead of failing the channel.
-    val renderers = DefaultRenderersFactory(context).setEnableDecoderFallback(true)
+    val renderers = renderersFor(context, options)
     fun build(loadControl: DefaultLoadControl): ExoPlayer =
         ExoPlayer.Builder(context, renderers)
             .setLoadControl(loadControl)
@@ -172,7 +180,10 @@ fun newPlayer(context: Context, compact: Boolean = false): ExoPlayer {
             .setAudioAttributes(audio, !compact)
             .setHandleAudioBecomingNoisy(true)
             .build()
-            .also { TrackMemory.apply(context, it) }
+            .also { player ->
+                TrackMemory.apply(context, player)
+                applyStoredPlayback(player, options)
+            }
 
     return runCatching { build(load) }.getOrElse { first ->
         // Some devices fail to create codec state under pressure. Retry once with a lighter buffer.
@@ -186,6 +197,73 @@ fun newPlayer(context: Context, compact: Boolean = false): ExoPlayer {
             build(fallbackLoad)
         }.getOrElse { throw first }
     }
+}
+
+/**
+ * The byte cap still yields to the time targets when the plan says so, which keeps a high
+ * bitrate stream from filling memory before the time limit. The first seconds still load past
+ * the cap, so the rewind buffer cannot stall playback. A rewind window is kept from the previous
+ * keyframe so pause and rewind land on a picture.
+ */
+private fun loadControlFor(plan: BufferPlan): DefaultLoadControl =
+    DefaultLoadControl.Builder()
+        .setBufferDurationsMs(plan.minMs, plan.maxMs, plan.startMs, plan.rebufferMs)
+        .setBackBuffer(plan.backMs, plan.backMs > 0)
+        .setTargetBufferBytes(plan.byteCap)
+        .setPrioritizeTimeOverSizeThresholds(plan.prioritizeTime)
+        .build()
+
+/**
+ * Decoder fallback stays on, which is what lets the next decoder try when the first fails to start.
+ * A selector is installed only when a saved choice actually changes the order or the list.
+ */
+private fun renderersFor(context: Context, options: PlayerOptions): DefaultRenderersFactory {
+    val factory = PlaybackRenderersFactory(context, clampedAudioOffset(options.audioOffsetMs))
+        .setEnableDecoderFallback(true)
+    if (options.softwareVideoDecoder || options.softwareAudioDecoder || options.amlogicFix) {
+        factory.setMediaCodecSelector(
+            OptionCodecSelector(
+                preferSoftwareVideo = options.softwareVideoDecoder,
+                preferSoftwareAudio = options.softwareAudioDecoder,
+                dropAmlogic = options.amlogicFix,
+            )
+        )
+    }
+    return factory
+}
+
+/** The store clamps to this range on save. Clamp again so a hand-edited value cannot run past it. */
+internal fun clampedAudioOffset(offsetMs: Int): Int = offsetMs.coerceIn(-MAX_AUDIO_OFFSET_MS, MAX_AUDIO_OFFSET_MS)
+
+/**
+ * Offload and tunneling stay off unless the viewer turned them on.
+ *
+ * Media3 1.4.1 has no DefaultRenderersFactory.setEnableAudioOffload; that method was removed in
+ * 1.2. The public replacement is the track selector's audio offload preference, which asks the
+ * sink to offload when the device and the selected audio can do it. Tunneling is the same kind
+ * of public switch, [DefaultTrackSelector.Parameters.Builder.setTunnelingEnabled]. The selector
+ * only tunnels when the audio and video decoders support it, so nothing here reaches into a
+ * private codec API. Encoded passthrough that Media3 already attempts for AC3 and similar
+ * formats is left alone when the flag is off, because turning it off would change playback on
+ * a default install.
+ */
+private fun applyStoredPlayback(player: ExoPlayer, options: PlayerOptions) {
+    if (!options.audioPassthrough && !options.tunneledPlayback) return
+    val selector = player.trackSelector as? DefaultTrackSelector ?: return
+    val parameters = selector.buildUponParameters()
+    if (options.audioPassthrough) {
+        parameters.setAudioOffloadPreferences(
+            TrackSelectionParameters.AudioOffloadPreferences.Builder()
+                .setAudioOffloadMode(
+                    TrackSelectionParameters.AudioOffloadPreferences.AUDIO_OFFLOAD_MODE_ENABLED
+                )
+                .build()
+        )
+    }
+    if (options.tunneledPlayback) {
+        parameters.setTunnelingEnabled(true)
+    }
+    selector.setParameters(parameters)
 }
 
 /**
@@ -274,4 +352,180 @@ fun playbackHttpStatus(error: PlaybackException): Int? {
         cause = cause.cause
     }
     return if (error.errorCode == PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS) 400 else null
+}
+
+/**
+ * Software decoders from Google and Android's C2 software codecs. Hardware decoders stay in
+ * their original order behind these when the viewer prefers software.
+ */
+internal fun isSoftwareCodec(name: String): Boolean {
+    val lower = name.lowercase()
+    return "omx.google." in lower || "c2.android." in lower
+}
+
+/**
+ * Amlogic decoders stutter on some boxes. "omx.amlogic" is already covered by "amlogic";
+ * ".aml." catches the short vendor token those names also use.
+ */
+internal fun isAmlogicCodec(name: String): Boolean {
+    val lower = name.lowercase()
+    return "amlogic" in lower || "omx.amlogic" in lower || ".aml." in lower
+}
+
+/** Decoder names in the order the player should try them. */
+internal fun orderedDecoderNames(
+    names: List<String>,
+    preferSoftware: Boolean,
+    dropAmlogic: Boolean,
+): List<String> {
+    val kept = if (dropAmlogic) names.filterNot { isAmlogicCodec(it) } else names
+    if (!preferSoftware) return kept
+    // sortedBy is stable, so the hardware decoders keep Media3's order after the software ones.
+    return kept.sortedBy { if (isSoftwareCodec(it)) 0 else 1 }
+}
+
+/**
+ * Prefers a software video or audio decoder when that choice is on, and drops Amlogic codecs
+ * when that fix is on. Other tracks, and choices that are off, keep the list Media3 returned.
+ */
+private class OptionCodecSelector(
+    private val preferSoftwareVideo: Boolean,
+    private val preferSoftwareAudio: Boolean,
+    private val dropAmlogic: Boolean,
+) : MediaCodecSelector {
+    override fun getDecoderInfos(
+        mimeType: String,
+        requiresSecureDecoder: Boolean,
+        requiresTunnelingDecoder: Boolean,
+    ): List<MediaCodecInfo> {
+        val found = MediaCodecSelector.DEFAULT.getDecoderInfos(
+            mimeType,
+            requiresSecureDecoder,
+            requiresTunnelingDecoder,
+        )
+        val preferSoftware = when {
+            MimeTypes.isVideo(mimeType) -> preferSoftwareVideo
+            MimeTypes.isAudio(mimeType) -> preferSoftwareAudio
+            else -> false
+        }
+        val order = orderedDecoderNames(found.map { it.name }, preferSoftware, dropAmlogic)
+        if (order.size == found.size && order.indices.all { order[it] == found[it].name }) return found
+        val remaining = found.toMutableList()
+        return order.mapNotNull { name ->
+            val index = remaining.indexOfFirst { it.name == name }
+            if (index < 0) null else remaining.removeAt(index)
+        }
+    }
+}
+
+/**
+ * The default renderer factory, plus a PCM offset when the viewer asked for one.
+ * An offset of 0 does not add a processor, so the sink Media3 builds itself is unchanged.
+ */
+private class PlaybackRenderersFactory(
+    context: Context,
+    private val audioOffsetMs: Int,
+) : DefaultRenderersFactory(context) {
+    override fun buildAudioSink(
+        context: Context,
+        enableFloatOutput: Boolean,
+        enableAudioTrackPlaybackParams: Boolean,
+    ): AudioSink? {
+        if (audioOffsetMs == 0) {
+            return super.buildAudioSink(context, enableFloatOutput, enableAudioTrackPlaybackParams)
+        }
+        // Copy the sink the parent builds, then put the offset in front of it. Processors run
+        // only for decoded PCM, which is the path a delay or advance can actually shift.
+        return DefaultAudioSink.Builder(context)
+            .setEnableFloatOutput(enableFloatOutput)
+            .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
+            .setAudioProcessors(arrayOf(PcmOffsetProcessor(audioOffsetMs)))
+            .build()
+    }
+}
+
+/**
+ * Shifts decoded PCM against the picture. A positive offset writes silence first, so the sound
+ * reaches the speakers later than the picture. A negative offset discards the first samples, so
+ * the sound starts early. The track clock follows the samples that were actually written, which
+ * is what makes the picture and the sound drift apart by this amount. Zero is not constructed.
+ */
+private class PcmOffsetProcessor(offsetMs: Int) : BaseAudioProcessor() {
+    private val offsetMs = clampedAudioOffset(offsetMs)
+    private var dropBytes = 0
+    private var silenceBytes = 0
+    private var pendingDrop = 0
+    private var pendingSilence = 0
+
+    override fun onConfigure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
+        if (offsetMs == 0 || inputAudioFormat.bytesPerFrame <= 0 || inputAudioFormat.sampleRate <= 0) {
+            dropBytes = 0
+            silenceBytes = 0
+            return AudioProcessor.AudioFormat.NOT_SET
+        }
+        val frames = inputAudioFormat.sampleRate.toLong() * abs(offsetMs) / 1000L
+        val bytes = frames * inputAudioFormat.bytesPerFrame
+        if (bytes <= 0L || bytes > Int.MAX_VALUE) {
+            dropBytes = 0
+            silenceBytes = 0
+            return AudioProcessor.AudioFormat.NOT_SET
+        }
+        if (offsetMs > 0) {
+            silenceBytes = bytes.toInt()
+            dropBytes = 0
+        } else {
+            dropBytes = bytes.toInt()
+            silenceBytes = 0
+        }
+        return inputAudioFormat
+    }
+
+    override fun onFlush() {
+        pendingDrop = dropBytes
+        pendingSilence = silenceBytes
+    }
+
+    override fun onReset() {
+        dropBytes = 0
+        silenceBytes = 0
+        pendingDrop = 0
+        pendingSilence = 0
+    }
+
+    override fun queueInput(inputBuffer: ByteBuffer) {
+        if (pendingDrop > 0 && inputBuffer.hasRemaining()) {
+            val drop = minOf(pendingDrop, inputBuffer.remaining())
+            inputBuffer.position(inputBuffer.position() + drop)
+            pendingDrop -= drop
+        }
+        val incoming = inputBuffer.remaining()
+        if (incoming == 0 && pendingSilence == 0) return
+        val extra = pendingSilence
+        val out = replaceOutputBuffer(extra + incoming)
+        if (extra > 0) {
+            putZeros(out, extra)
+            pendingSilence = 0
+        }
+        if (incoming > 0) out.put(inputBuffer)
+        out.flip()
+    }
+
+    override fun onQueueEndOfStream() {
+        if (pendingSilence <= 0) return
+        val out = replaceOutputBuffer(pendingSilence)
+        putZeros(out, pendingSilence)
+        pendingSilence = 0
+        out.flip()
+    }
+}
+
+/** PCM silence is a run of zero bytes for both integer and float samples. */
+private fun putZeros(out: ByteBuffer, count: Int) {
+    val zeros = ByteArray(minOf(count, 8_192))
+    var left = count
+    while (left > 0) {
+        val n = minOf(left, zeros.size)
+        out.put(zeros, 0, n)
+        left -= n
+    }
 }

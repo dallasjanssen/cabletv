@@ -1,6 +1,8 @@
 package com.dallas.cabletv.ui
 
+import android.app.Activity
 import android.content.Context
+import android.content.ContextWrapper
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -49,10 +51,14 @@ import androidx.media3.common.Timeline
 import androidx.media3.common.VideoSize
 import androidx.media3.exoplayer.ExoPlayer
 import com.dallas.cabletv.data.liveMediaItem
+import com.dallas.cabletv.data.ConnectionGate
 import com.dallas.cabletv.data.DebugLog
+import com.dallas.cabletv.data.DisplaySync
+import com.dallas.cabletv.data.PlayerOptionsStore
 import com.dallas.cabletv.data.TrackMemory
 import com.dallas.cabletv.data.newPlayer
 import com.dallas.cabletv.data.playbackHttpStatus
+import com.dallas.cabletv.data.proxiedStreamUrl
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import com.dallas.cabletv.R
@@ -60,17 +66,31 @@ import com.dallas.cabletv.data.EpgCache
 import com.dallas.cabletv.data.LiveChannel
 import com.dallas.cabletv.data.NowNext
 import com.dallas.cabletv.data.Program
+import com.dallas.cabletv.data.WatchStats
 import kotlinx.coroutines.delay
 
 /**
  * The live TV player. It lives for the whole app, so Home and the guide can keep the channel
  * playing behind them, and coming back to full screen never reloads the stream.
  */
-class LivePlayer(context: Context) {
-    val exo: ExoPlayer = newPlayer(context)
+class LivePlayer(private val context: Context) {
+    private val optionsStore = PlayerOptionsStore(context)
+    var exo by mutableStateOf(newPlayer(context))
+        private set
+    /** Picture choices the current player was built with. A change means it has to be built again. */
+    private var builtEngine = optionsStore.load().engineSignature()
     var buffering by mutableStateOf(false)
         private set
     var failed by mutableStateOf(false)
+        private set
+    /** True when the failure is the provider's stream cap, not a missing signal. */
+    var limited by mutableStateOf(false)
+        private set
+    /**
+     * Covers the previous picture while a new channel is resolving or buffering.
+     * Stays false when that option is off, so the last frame remains.
+     */
+    var zapBlack by mutableStateOf(false)
         private set
     /** False once the viewer pauses. It follows playWhenReady, so it stays true while the stream buffers. */
     var playing by mutableStateOf(true)
@@ -94,6 +114,9 @@ class LivePlayer(context: Context) {
     private var played = false
     private var retries = 0
     private var replay = false
+    /** This player is counting against the provider's stream cap. */
+    private var holdsConnection = false
+    private var lastFrameRate = 0f
     // A live stream that keeps ending soon after it starts is counted, so it ends in No signal
     // instead of being loaded again forever.
     private var readyAt = 0L
@@ -141,7 +164,9 @@ class LivePlayer(context: Context) {
                 played = true
                 retries = 0
                 failed = false
+                zapBlack = false
                 readyAt = SystemClock.elapsedRealtime()
+                reportFrameRate()
             }
             if (playbackState == Player.STATE_ENDED) {
                 // A replay that finished goes back to live. A live stream that the provider closed loads again.
@@ -149,13 +174,19 @@ class LivePlayer(context: Context) {
                     replayEnds++
                 } else {
                     quickEnds = if (SystemClock.elapsedRealtime() - readyAt < QUICK_END_MS) quickEnds + 1 else 0
-                    if (quickEnds >= MAX_QUICK_ENDS) failed = true else retryLater(reload = true)
+                    if (quickEnds >= MAX_QUICK_ENDS) {
+                        zapBlack = false
+                        failed = true
+                    } else {
+                        retryLater(reload = true)
+                    }
                 }
             }
         }
 
         override fun onVideoSizeChanged(videoSize: VideoSize) {
             DebugLog.log("live", "Picture ${videoSize.width}x${videoSize.height}")
+            reportFrameRate()
         }
 
         override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
@@ -167,11 +198,38 @@ class LivePlayer(context: Context) {
 
     init {
         exo.addListener(listener)
+        SleepTimer.attach { stop() }
+        ConnectionGate.setLimit(optionsStore.load().maxConnections)
+    }
+
+    /**
+     * Builds a new player when buffer size, decoders, the user agent, audio offset, passthrough,
+     * or tunneling changed. Those are fixed at creation. The stream that was on is loaded again.
+     * The old player is returned so the caller can drop it after the picture has moved across.
+     */
+    fun replaceEngine(): ExoPlayer? {
+        val next = optionsStore.load().engineSignature()
+        if (next == builtEngine) return null
+        val resume = url
+        val wasPlaying = playing
+        exo.removeListener(listener)
+        val retired = exo
+        val created = newPlayer(context)
+        exo = created
+        builtEngine = next
+        created.addListener(listener)
+        lastFrameRate = 0f
+        if (resume != null) {
+            load(resume)
+            if (!wasPlaying) created.pause()
+        }
+        return retired
     }
 
     // Most failures are brief, so retry a few times before saying there is no signal.
     private fun retryLater(reload: Boolean) {
         if (retries >= MAX_RETRIES) {
+            zapBlack = false
             failed = true
             return
         }
@@ -184,6 +242,7 @@ class LivePlayer(context: Context) {
                 exo.playWhenReady = true
             }.onFailure {
                 buffering = false
+                zapBlack = false
                 failed = true
             }
         }, 2000)
@@ -195,13 +254,32 @@ class LivePlayer(context: Context) {
      * [replay] true, so the end of a replay returns to live instead of loading it again.
      */
     fun play(newUrl: String, fallbackUrl: String? = null, replay: Boolean = false) {
-        if (newUrl == requested) return
-        requested = newUrl
-        fallback = fallbackUrl
+        val options = optionsStore.load()
+        val target = proxiedStreamUrl(newUrl, options.udpProxy)
+        val alt = fallbackUrl?.let { proxiedStreamUrl(it, options.udpProxy) }
+        ConnectionGate.setLimit(options.maxConnections)
+        // A cap of zero is unlimited and must not be counted, or a later release would free someone else's stream.
+        if (options.maxConnections <= 0) {
+            releaseConnection()
+        } else if (!holdsConnection) {
+            if (!ConnectionGate.tryAcquire()) {
+                halt()
+                limited = true
+                failed = true
+                return
+            }
+            holdsConnection = true
+        }
+        limited = false
+        // Same length keeps the clock. Zero turns it off. A channel that is already playing does not restart it.
+        SleepTimer.onPlaybackStarted(options.sleepTimerMinutes)
+        if (target == requested) return
+        requested = target
+        fallback = alt
         this.replay = replay
-        val known = fallbackFor[newUrl]
+        val known = fallbackFor[target]
         triedFallback = known != null
-        load(known ?: newUrl)
+        load(known ?: target)
     }
 
     private fun load(target: String) {
@@ -213,6 +291,9 @@ class LivePlayer(context: Context) {
         retries = 0
         quickEnds = 0
         behindLive = false
+        lastFrameRate = 0f
+        // Hide the previous picture only for this load. A later rebuffer of the same stream does not.
+        zapBlack = optionsStore.load().blackFrameOnZap
         // A track picked on the previous channel must not stick. The saved language still applies.
         runCatching {
             exo.trackSelectionParameters = exo.trackSelectionParameters.buildUpon().clearOverrides().build()
@@ -221,6 +302,7 @@ class LivePlayer(context: Context) {
             exo.playWhenReady = true
         }.onFailure {
             buffering = false
+            zapBlack = false
             failed = true
         }
     }
@@ -246,6 +328,7 @@ class LivePlayer(context: Context) {
             exo.playWhenReady = true
         }.onFailure {
             buffering = false
+            zapBlack = false
             failed = true
         }
     }
@@ -310,30 +393,57 @@ class LivePlayer(context: Context) {
 
     /** Stops and lets go of the provider connection, for example while a movie plays. */
     fun stop() {
-        handler.removeCallbacksAndMessages(null)
-        requested = null
-        url = null
-        buffering = false
-        failed = false
-        exo.stop()
+        releaseConnection()
+        halt()
     }
 
     /** Stops the previous channel while the next one's address is looked up, and shows Loading. */
     fun resolving() {
-        stop()
+        val black = optionsStore.load().blackFrameOnZap
+        // Keep the stream slot. The address lookup is about to play another channel on this same player.
+        halt()
         buffering = true
+        zapBlack = black
     }
 
     /** Stops the previous channel and shows the no-signal message, for a channel whose address was not found. */
     fun fail() {
-        stop()
+        releaseConnection()
+        halt()
         failed = true
     }
 
     fun release() {
         handler.removeCallbacksAndMessages(null)
+        releaseConnection()
         exo.removeListener(listener)
         exo.release()
+    }
+
+    private fun halt() {
+        handler.removeCallbacksAndMessages(null)
+        requested = null
+        url = null
+        buffering = false
+        failed = false
+        limited = false
+        zapBlack = false
+        exo.stop()
+    }
+
+    private fun releaseConnection() {
+        if (!holdsConnection) return
+        holdsConnection = false
+        ConnectionGate.release()
+    }
+
+    /** The panel follows the video rate once the player actually reports one. */
+    private fun reportFrameRate() {
+        val rate = exo.videoFormat?.frameRate ?: return
+        if (rate <= 0f || !rate.isFinite() || rate == lastFrameRate) return
+        lastFrameRate = rate
+        val activity = context.findActivity() ?: return
+        DisplaySync.apply(activity, rate, optionsStore.load())
     }
 
     private companion object {
@@ -343,18 +453,38 @@ class LivePlayer(context: Context) {
     }
 }
 
+private fun Context.findActivity(): Activity? {
+    var current = this
+    while (current is ContextWrapper) {
+        if (current is Activity) return current
+        current = current.baseContext
+    }
+    return null
+}
+
 /** The live picture. The app places it full screen, or in the guide's corner preview. */
 @Composable
 fun LiveVideo(player: LivePlayer, modifier: Modifier = Modifier) {
     val resize = player.resizeMode
-    AndroidView(
-        factory = { ctx ->
-            (LayoutInflater.from(ctx).inflate(R.layout.live_player_view, null) as PlayerView).also { it.player = player.exo }
-        },
-        update = { it.resizeMode = resize },
-        onRelease = { it.player = null },
-        modifier = modifier
-    )
+    val cover = player.zapBlack
+    val engine = player.exo
+    Box(modifier) {
+        AndroidView(
+            factory = { ctx ->
+                (LayoutInflater.from(ctx).inflate(R.layout.live_player_view, null) as PlayerView).also { it.player = engine }
+            },
+            update = { view ->
+                if (view.player !== engine) view.player = engine
+                view.resizeMode = resize
+            },
+            onRelease = { it.player = null },
+            modifier = Modifier.fillMaxSize()
+        )
+        if (cover) {
+            // The new channel is not on screen yet. The previous frame stays when this is off.
+            Box(Modifier.fillMaxSize().background(Color.Black))
+        }
+    }
 }
 
 private enum class LivePanel { None, Options, Channels, Replay, Tracks }
@@ -403,11 +533,21 @@ fun LiveTvScreen(
     val context = LocalContext.current
     val current = channels.getOrNull(index)
     val nn = current?.let { guide.nowNext(it) }
+    val optionsStore = remember { PlayerOptionsStore(context) }
+    var options by remember { mutableStateOf(optionsStore.load()) }
     var panel by remember { mutableStateOf(LivePanel.None) }
     var bannerTick by remember { mutableIntStateOf(1) }
     var showBanner by remember { mutableStateOf(false) }
     var digits by remember { mutableStateOf("") }
     var lastKey by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    var exitHint by remember { mutableStateOf(false) }
+    var exitAt by remember { mutableLongStateOf(0L) }
+    // OK waits for key-up when a long press is mapped, so the short action does not also run.
+    var okPending by remember { mutableStateOf(false) }
+    var okWasLong by remember { mutableStateOf(false) }
+    var consumeBackUp by remember { mutableStateOf(false) }
+    // A long Back is not also the short Back that follows it on key-up.
+    var suppressBackUntil by remember { mutableLongStateOf(0L) }
     val rootFocus = remember { FocusRequester() }
     val emptyAction = remember { FocusRequester() }
     // With no channels to show, Try again and Settings take the remote instead of the screen.
@@ -445,7 +585,104 @@ fun LiveTvScreen(
         }
     }
 
-    BackHandler(enabled = panel == LivePanel.None) { if (replaying) onReturnToLive() else onExit() }
+    fun pipIfHome() {
+        if (options.pipOnHome) (context as? Activity)?.let { enterPictureInPicture(it) }
+    }
+
+    /** False when this screen does not know the action, so the key keeps what it already did. */
+    fun runRemote(action: String): Boolean {
+        when (action) {
+            "none" -> Unit
+            "guide" -> onOpenGuide()
+            "channel_list" -> {
+                showBanner = false
+                panel = LivePanel.Channels
+            }
+            "info" -> {
+                panel = LivePanel.None
+                bannerTick++
+            }
+            "previous_channel" -> {
+                panel = LivePanel.None
+                onLastChannel()
+                bannerTick++
+            }
+            "next_channel" -> {
+                panel = LivePanel.None
+                step(1)
+            }
+            "rewind" -> {
+                player.seekBy(-options.skipBackSec * 1000L)
+                bannerTick++
+            }
+            "favorites" -> {
+                val ch = current ?: return true
+                val adding = ch.id !in favorites
+                onToggleFavorite(ch)
+                showToast(if (adding) "Added ${ch.name} to favorites" else "Removed ${ch.name} from favorites")
+            }
+            "search" -> onOpenSearch()
+            "home" -> {
+                pipIfHome()
+                onOpenHome()
+            }
+            "pip" -> {
+                (context as? Activity)?.let { enterPictureInPicture(it) }
+            }
+            "tracks" -> {
+                showBanner = false
+                panel = LivePanel.Tracks
+            }
+            "multiview" -> onMultiView()
+            else -> return false
+        }
+        return true
+    }
+
+    fun takeMapped(key: String): Boolean {
+        val action = RemoteActions.actionFor(key, options) ?: return false
+        return runRemote(action)
+    }
+
+    fun leave() {
+        pipIfHome()
+        onExit()
+    }
+
+    // The first Back only warns. The second, inside two seconds, is the one that leaves.
+    fun confirmLeave() {
+        if (!options.doubleBackToExit) {
+            leave()
+            return
+        }
+        val now = SystemClock.elapsedRealtime()
+        if (exitHint && now - exitAt < 2_000L) {
+            exitHint = false
+            leave()
+        } else {
+            exitAt = now
+            exitHint = true
+        }
+    }
+
+    fun cycleSleep() {
+        val next = nextSleepMinutes(options.sleepTimerMinutes)
+        val updated = options.copy(sleepTimerMinutes = next)
+        options = updated
+        optionsStore.save(updated)
+        SleepTimer.choose(next)
+    }
+
+    // Leaving is the Back that has nothing left to close. A panel's Back stays a single press.
+    BackHandler(enabled = panel == LivePanel.None) {
+        if (SystemClock.elapsedRealtime() < suppressBackUntil) return@BackHandler
+        val action = RemoteActions.actionFor("back", options)
+        if (action != null) {
+            if (action != "none") runRemote(action)
+            return@BackHandler
+        }
+        if (replaying) onReturnToLive() else confirmLeave()
+    }
     BackHandler(enabled = panel != LivePanel.None) { close() }
 
     // With no panel open, the screen itself holds focus so it receives the remote's keys. This runs
@@ -458,15 +695,29 @@ fun LiveTvScreen(
         if (emptyActions) runCatching { emptyAction.requestFocus() } else runCatching { rootFocus.requestFocus() }
     }
 
-    LaunchedEffect(bannerTick) {
+    LaunchedEffect(bannerTick, options.infoTimeoutSec) {
         showBanner = true
-        delay(4500)
+        delay(options.infoTimeoutSec.coerceAtLeast(1) * 1000L)
         showBanner = false
     }
 
+    LaunchedEffect(exitHint) {
+        if (!exitHint) return@LaunchedEffect
+        delay(2_000)
+        exitHint = false
+    }
+
+    // The same wait used before a channel counts as recently watched.
+    LaunchedEffect(current?.id) {
+        val id = current?.id ?: return@LaunchedEffect
+        delay(600)
+        WatchStats.record(context, id)
+    }
+
     // A dead channel is tried again every so often, so a short network drop recovers by itself.
-    LaunchedEffect(player.failed) {
-        if (!player.failed) return@LaunchedEffect
+    LaunchedEffect(player.failed, player.limited) {
+        // A full connection cap stays on screen until OK. A dead channel is tried again by itself.
+        if (!player.failed || player.limited) return@LaunchedEffect
         delay(15_000)
         if (player.failed) player.retry()
     }
@@ -493,9 +744,47 @@ fun LiveTvScreen(
         Modifier
             .fillMaxSize()
             .onPreviewKeyEvent { ev ->
-                if (ev.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                val native = ev.nativeKeyEvent
+                val code = native.keyCode
+                val down = ev.type == KeyEventType.KeyDown
+                val up = ev.type == KeyEventType.KeyUp
+                if (!down && !up) return@onPreviewKeyEvent false
+                val ok = code == KeyEvent.KEYCODE_DPAD_CENTER || code == KeyEvent.KEYCODE_ENTER || code == KeyEvent.KEYCODE_NUMPAD_ENTER
+                // Back that only closes a panel is left for that panel. A mapped Back applies when nothing is open.
+                if (code == KeyEvent.KEYCODE_BACK) {
+                    if (panel != LivePanel.None) return@onPreviewKeyEvent false
+                    if (up && consumeBackUp) {
+                        consumeBackUp = false
+                        return@onPreviewKeyEvent true
+                    }
+                    if (down && native.isLongPress) {
+                        val action = RemoteActions.actionFor("long_back", options)
+                        if (action != null) {
+                            consumeBackUp = true
+                            suppressBackUntil = SystemClock.elapsedRealtime() + 600L
+                            return@onPreviewKeyEvent runRemote(action)
+                        }
+                    }
+                    return@onPreviewKeyEvent false
+                }
+                if (up) {
+                    if (!(okPending && ok)) return@onPreviewKeyEvent false
+                    okPending = false
+                    if (okWasLong) {
+                        okWasLong = false
+                        return@onPreviewKeyEvent true
+                    }
+                    val action = RemoteActions.actionFor("ok", options)
+                    if (action != null && runRemote(action)) return@onPreviewKeyEvent true
+                    showBanner = false
+                    panel = LivePanel.Options
+                    return@onPreviewKeyEvent true
+                }
                 lastKey = System.currentTimeMillis()
-                val code = ev.nativeKeyEvent.keyCode
+                if (okPending && !ok) {
+                    okPending = false
+                    okWasLong = false
+                }
                 val digit = when (code) {
                     in KeyEvent.KEYCODE_0..KeyEvent.KEYCODE_9 -> code - KeyEvent.KEYCODE_0
                     in KeyEvent.KEYCODE_NUMPAD_0..KeyEvent.KEYCODE_NUMPAD_9 -> code - KeyEvent.KEYCODE_NUMPAD_0
@@ -506,9 +795,18 @@ fun LiveTvScreen(
                     if (digits.length == 4) confirmDigits()
                     return@onPreviewKeyEvent true
                 }
-                val ok = code == KeyEvent.KEYCODE_DPAD_CENTER || code == KeyEvent.KEYCODE_ENTER || code == KeyEvent.KEYCODE_NUMPAD_ENTER
                 if (ok && digits.isNotEmpty()) {
                     confirmDigits()
+                    return@onPreviewKeyEvent true
+                }
+                if (native.repeatCount > 0 && okPending && ok) {
+                    if (native.isLongPress) {
+                        val action = RemoteActions.actionFor("long_ok", options)
+                        if (action != null) {
+                            okWasLong = runRemote(action)
+                            return@onPreviewKeyEvent true
+                        }
+                    }
                     return@onPreviewKeyEvent true
                 }
                 when (code) {
@@ -517,6 +815,8 @@ fun LiveTvScreen(
                     KeyEvent.KEYCODE_GUIDE -> { onOpenGuide(); return@onPreviewKeyEvent true }
                     KeyEvent.KEYCODE_LAST_CHANNEL -> { panel = LivePanel.None; onLastChannel(); return@onPreviewKeyEvent true }
                     KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
+                        val action = RemoteActions.actionFor("play_pause", options)
+                        if (action != null && runRemote(action)) return@onPreviewKeyEvent true
                         player.togglePause()
                         return@onPreviewKeyEvent true
                     }
@@ -530,7 +830,7 @@ fun LiveTvScreen(
                     }
                     KeyEvent.KEYCODE_MEDIA_REWIND -> {
                         if (replaying || !player.atLiveEdge()) {
-                            player.seekBy(-10_000)
+                            player.seekBy(-options.skipBackSec * 1000L)
                             bannerTick++
                             return@onPreviewKeyEvent true
                         }
@@ -538,7 +838,7 @@ fun LiveTvScreen(
                     }
                     KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> {
                         if (replaying || !player.atLiveEdge()) {
-                            player.seekBy(30_000)
+                            player.seekBy(options.skipForwardSec * 1000L)
                             bannerTick++
                             return@onPreviewKeyEvent true
                         }
@@ -551,6 +851,7 @@ fun LiveTvScreen(
                     close()
                     return@onPreviewKeyEvent true
                 }
+                // An open panel keeps arrows, OK and Back. Number entry already ran above.
                 if (panel != LivePanel.None) return@onPreviewKeyEvent false
                 if (locked && ok) {
                     onUnlock()
@@ -562,11 +863,12 @@ fun LiveTvScreen(
                 }
                 val skipping = !locked && !player.failed && (replaying || !player.atLiveEdge())
                 when (code) {
-                    KeyEvent.KEYCODE_DPAD_UP -> { step(1); true }
-                    KeyEvent.KEYCODE_DPAD_DOWN -> { step(-1); true }
+                    KeyEvent.KEYCODE_DPAD_UP -> if (takeMapped("up")) true else { step(1); true }
+                    KeyEvent.KEYCODE_DPAD_DOWN -> if (takeMapped("down")) true else { step(-1); true }
                     KeyEvent.KEYCODE_DPAD_LEFT -> {
+                        if (takeMapped("left")) return@onPreviewKeyEvent true
                         if (skipping) {
-                            player.seekBy(-10_000)
+                            player.seekBy(-options.skipBackSec * 1000L)
                             bannerTick++
                         } else {
                             panel = LivePanel.Channels
@@ -574,12 +876,20 @@ fun LiveTvScreen(
                         true
                     }
                     KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                        if (skipping) player.seekBy(30_000)
+                        if (takeMapped("right")) return@onPreviewKeyEvent true
+                        if (skipping) player.seekBy(options.skipForwardSec * 1000L)
                         bannerTick++
                         true
                     }
                     KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER,
                     KeyEvent.KEYCODE_MENU, KeyEvent.KEYCODE_INFO -> {
+                        // Menu and Info stay "open options". OK can be held when a long press is mapped.
+                        if (ok && RemoteActions.actionFor("long_ok", options) != null) {
+                            okPending = true
+                            okWasLong = false
+                            return@onPreviewKeyEvent true
+                        }
+                        if (ok && takeMapped("ok")) return@onPreviewKeyEvent true
                         showBanner = false
                         panel = LivePanel.Options
                         true
@@ -641,6 +951,11 @@ fun LiveTvScreen(
                             title = "The replay did not start",
                             body = "The provider did not send this replay. OK tries again. Back returns to live."
                         )
+                    } else if (player.limited) {
+                        EmptyState(
+                            title = "Too many streams for this provider",
+                            body = "Stop a recording or another picture, then OK tries again."
+                        )
                     } else {
                         EmptyState(
                             title = "No signal on ${current?.name ?: "this channel"}",
@@ -682,9 +997,34 @@ fun LiveTvScreen(
             }
         }
 
-        // Paused, or watching behind live after a pause or a rewind.
+        if (exitHint) {
+            Text(
+                "Press Back again to exit",
+                style = TvType.SmallStrong,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 28.dp)
+                    .clip(RoundedCornerShape(999.dp))
+                    .background(Tv.Scrim)
+                    .padding(horizontal = 16.dp, vertical = 8.dp)
+            )
+        }
+
+        SleepTimer.message?.let { line ->
+            Text(
+                line,
+                style = TvType.Title,
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(Tv.Scrim)
+                    .padding(horizontal = 18.dp, vertical = 10.dp)
+            )
+        }
+
+        // Paused, or watching behind live after a pause or a rewind. Sleep has its own line.
         val paused = !player.playing
-        if (!replaying && !locked && !player.failed && current != null && panel == LivePanel.None &&
+        if (SleepTimer.message == null && !replaying && !locked && !player.failed && current != null && panel == LivePanel.None &&
             (paused || (player.behindLive && !player.atLiveEdge()))
         ) {
             Row(
@@ -727,12 +1067,14 @@ fun LiveTvScreen(
             exit = fadeOut(),
             modifier = Modifier.align(Alignment.BottomStart)
         ) {
-            if (current != null) ChannelBanner(current, nn, current.id in favorites, replaying)
+            if (current != null) ChannelBanner(current, nn, current.id in favorites, replaying, options.infoTransparency)
         }
 
         if (replaying && panel == LivePanel.None) {
             ReplayTransport(
                 player = player,
+                backSec = options.barBackSec,
+                forwardSec = options.barForwardSec,
                 onReturnToLive = onReturnToLive,
                 modifier = Modifier.align(Alignment.BottomCenter)
             )
@@ -747,7 +1089,10 @@ fun LiveTvScreen(
                 replaying = replaying,
                 playing = player.playing,
                 onGuide = onOpenGuide,
-                onHome = onOpenHome,
+                onHome = {
+                    pipIfHome()
+                    onOpenHome()
+                },
                 onSearch = onOpenSearch,
                 onChannels = { panel = LivePanel.Channels },
                 behind = !replaying && !player.atLiveEdge(),
@@ -771,6 +1116,16 @@ fun LiveTvScreen(
                 },
                 onReplay = { panel = LivePanel.Replay },
                 onTracks = { panel = LivePanel.Tracks },
+                transparency = options.infoTransparency,
+                backSec = options.barBackSec,
+                forwardSec = options.barForwardSec,
+                multiLabel = when (options.multiviewSlots.coerceIn(2, 4)) {
+                    3 -> "Three channels"
+                    4 -> "Four channels"
+                    else -> "Two channels"
+                },
+                sleepLabel = if (options.sleepTimerMinutes <= 0) "Sleep" else "Sleep ${options.sleepTimerMinutes} min",
+                onSleep = { cycleSleep() },
                 modifier = Modifier.align(Alignment.BottomCenter)
             )
         }
@@ -823,9 +1178,15 @@ fun LiveTvScreen(
     }
 }
 
-/** Pause and skip for a replay. Left and right on the remote do the same thing. */
+/** Pause and skip for a replay. Left and right on the remote use the skip distances, not these. */
 @Composable
-private fun ReplayTransport(player: LivePlayer, onReturnToLive: () -> Unit, modifier: Modifier = Modifier) {
+private fun ReplayTransport(
+    player: LivePlayer,
+    backSec: Int,
+    forwardSec: Int,
+    onReturnToLive: () -> Unit,
+    modifier: Modifier = Modifier
+) {
     var position by remember { mutableLongStateOf(0L) }
     var duration by remember { mutableLongStateOf(0L) }
     LaunchedEffect(player) {
@@ -854,23 +1215,39 @@ private fun ReplayTransport(player: LivePlayer, onReturnToLive: () -> Unit, modi
         Spacer(Modifier.height(8.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             PillButton(if (player.playing) "Pause" else "Play", { player.togglePause() }, icon = if (player.playing) TvIcons.Pause else TvIcons.Play)
-            PillButton("Back 10 seconds", { player.seekBy(-10_000) }, icon = TvIcons.Back)
-            PillButton("Forward 30 seconds", { player.seekBy(30_000) }, icon = TvIcons.Next)
+            PillButton("Back $backSec seconds", { player.seekBy(-backSec * 1000L) }, icon = TvIcons.Back)
+            PillButton("Forward $forwardSec seconds", { player.seekBy(forwardSec * 1000L) }, icon = TvIcons.Next)
             PillButton("Back to live", onReturnToLive, icon = TvIcons.Replay)
         }
     }
 }
 
+/**
+ * 0 leaves the panel color unchanged. Higher values let the picture show through the scrim only.
+ * Focused buttons keep their own fill, so their text stays readable.
+ */
+private fun withInfoTransparency(color: Color, transparency: Int): Color {
+    if (transparency <= 0) return color
+    val keep = 1f - transparency.coerceIn(0, 100) / 100f
+    return color.copy(alpha = color.alpha * keep)
+}
+
 /** Shown for a few seconds after each channel change. */
 @Composable
-private fun ChannelBanner(channel: LiveChannel, nn: NowNext?, isFavorite: Boolean, replaying: Boolean) {
+private fun ChannelBanner(
+    channel: LiveChannel,
+    nn: NowNext?,
+    isFavorite: Boolean,
+    replaying: Boolean,
+    transparency: Int
+) {
     val now = nn?.now
     Column(
         Modifier
             .padding(start = 40.dp, bottom = if (replaying) 136.dp else 28.dp, end = 40.dp)
             .widthIn(max = 540.dp)
             .clip(RoundedCornerShape(14.dp))
-            .background(Tv.Scrim)
+            .background(withInfoTransparency(Tv.Scrim, transparency))
             .padding(horizontal = 16.dp, vertical = 14.dp)
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -940,6 +1317,12 @@ private fun OptionsBar(
     onMultiView: () -> Unit,
     onRecord: () -> Unit,
     onTracks: () -> Unit,
+    transparency: Int,
+    backSec: Int,
+    forwardSec: Int,
+    multiLabel: String,
+    sleepLabel: String,
+    onSleep: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val first = remember { FocusRequester() }
@@ -952,7 +1335,15 @@ private fun OptionsBar(
     BoxWithConstraints(
         modifier
             .fillMaxWidth()
-            .background(Brush.verticalGradient(listOf(Color.Transparent, Color(0xE60D0F13), Color(0xF80D0F13))))
+            .background(
+                Brush.verticalGradient(
+                    listOf(
+                        Color.Transparent,
+                        withInfoTransparency(Color(0xE60D0F13), transparency),
+                        withInfoTransparency(Color(0xF80D0F13), transparency)
+                    )
+                )
+            )
     ) {
         val side = if (maxWidth < 600.dp) 16.dp else 40.dp
         val wide = maxWidth >= 700.dp
@@ -1020,16 +1411,17 @@ private fun OptionsBar(
                 )
                 if (replaying || behind) {
                     PillButton(if (playing) "Pause" else "Play", onPause, icon = if (playing) TvIcons.Pause else TvIcons.Play)
-                    PillButton("Back 10 seconds", { onSeek(-10_000) }, icon = TvIcons.Back)
-                    PillButton("Forward 30 seconds", { onSeek(30_000) }, icon = TvIcons.Next)
+                    PillButton("Back $backSec seconds", { onSeek(-backSec * 1000L) }, icon = TvIcons.Back)
+                    PillButton("Forward $forwardSec seconds", { onSeek(forwardSec * 1000L) }, icon = TvIcons.Next)
                     PillButton("Back to live", if (replaying) onReturnToLive else onJumpLive, icon = TvIcons.Replay)
                 } else {
                     PillButton(if (playing) "Pause" else "Play", onPause, icon = if (playing) TvIcons.Pause else TvIcons.Play)
                     if (canReplay) PillButton("Watch from the start", onReplay, icon = TvIcons.Replay)
                 }
                 PillButton("Record", onRecord, icon = TvIcons.Play)
-                PillButton("Two channels", onMultiView, icon = TvIcons.Tv)
+                PillButton(multiLabel, onMultiView, icon = TvIcons.Tv)
                 PillButton("Audio and captions", onTracks, icon = TvIcons.Captions)
+                PillButton(sleepLabel, onSleep)
             }
         }
     }

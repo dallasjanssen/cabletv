@@ -26,7 +26,7 @@ private const val ART_PX = 320
  * It is only active while [show] has something, so nothing can start playback while the app is
  * off screen. Only used on the main thread.
  */
-class NowPlayingSession(context: Context, tag: String, private val player: Player) {
+class NowPlayingSession(context: Context, tag: String, private var player: Player) {
     private val appContext = context.applicationContext
     private val session = MediaSession(appContext, "CableTV-$tag")
     private val scope = MainScope()
@@ -84,6 +84,18 @@ class NowPlayingSession(context: Context, tag: String, private val player: Playe
         })
         player.addListener(listener)
         publishState()
+    }
+
+    /** Follows a rebuilt player. The previous one is left for the caller to release. */
+    fun attach(next: Player) {
+        if (next === player) return
+        player.removeListener(listener)
+        player = next
+        next.addListener(listener)
+        shown?.let {
+            publishMetadata(it)
+            publishState()
+        }
     }
 
     /** What is on screen now, or null when nothing is. */
