@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
@@ -18,9 +19,11 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import com.dallas.cabletv.BuildConfig
 import com.dallas.cabletv.data.AppUpdater
@@ -45,7 +48,17 @@ fun CompanionApp(onWatchOnPhone: () -> Unit) {
 
     BackHandler(enabled = route != ROUTE_TVS) { route = ROUTE_TVS }
 
-    // Before the phone starts watching, look for a newer build. A slow or failed check never blocks watching.
+    // The look for a newer build starts as soon as the app opens, so Watch rarely has to wait for it.
+    // A slow or failed check never blocks watching: it resolves to "no build" within a few seconds.
+    val launchCheck = remember { CompletableDeferred<AppUpdater.Release?>() }
+    LaunchedEffect(Unit) {
+        // A debug build is signed with another key, so there is nothing to offer it.
+        val found = if (BuildConfig.DEBUG) null else withContext(Dispatchers.IO) {
+            runCatching { AppUpdater.latest(BuildConfig.VERSION_CODE, callTimeoutSeconds = UPDATE_CHECK_SECONDS) }.getOrNull()
+        }
+        launchCheck.complete(found)
+    }
+
     var checkingUpdate by remember { mutableStateOf(false) }
     var offeredUpdate by remember { mutableStateOf<AppUpdater.Release?>(null) }
     var installing by remember { mutableStateOf(false) }
@@ -53,16 +66,10 @@ fun CompanionApp(onWatchOnPhone: () -> Unit) {
 
     fun checkThenWatch() {
         if (checkingUpdate) return
-        // A debug build is signed with another key, so there is nothing to offer it.
-        if (BuildConfig.DEBUG) {
-            onWatchOnPhone()
-            return
-        }
         checkingUpdate = true
         scope.launch {
-            val found = withContext(Dispatchers.IO) {
-                runCatching { AppUpdater.latest(BuildConfig.VERSION_CODE, callTimeoutSeconds = UPDATE_CHECK_SECONDS) }.getOrNull()
-            }
+            // Usually the launch check is already done and this returns at once.
+            val found = withTimeoutOrNull(UPDATE_CHECK_SECONDS * 1000) { launchCheck.await() }
             checkingUpdate = false
             if (found == null) onWatchOnPhone() else {
                 updateNote = null

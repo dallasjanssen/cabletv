@@ -64,21 +64,30 @@ object AppUpdater {
         }
     }
 
-    /** Downloads the APK into [dir] and returns the file. */
+    /**
+     * Downloads the APK into [dir] and returns the file. The bytes go to a partial file first, and
+     * only a complete download replaces the APK, so the installer never sees a half-written build.
+     */
     fun download(release: Release, dir: File): File {
         dir.mkdirs()
         val file = File(dir, "cabletv-update.apk")
-        file.delete()
+        val partial = File(dir, "cabletv-update.apk.part")
+        partial.delete()
         val req = Request.Builder().url(release.apkUrl).header("User-Agent", "CableTV/1.0").build()
         http.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) error("Download returned HTTP ${resp.code}")
             val body = resp.body ?: error("Empty download")
-            file.outputStream().use { out -> body.byteStream().copyTo(out) }
+            partial.outputStream().use { out -> body.byteStream().copyTo(out) }
             val expected = body.contentLength()
-            if (expected > 0L && file.length() != expected) {
-                file.delete()
+            if (expected > 0L && partial.length() != expected) {
+                partial.delete()
                 throw Exception("The download was incomplete.")
             }
+        }
+        file.delete()
+        if (!partial.renameTo(file)) {
+            partial.delete()
+            throw Exception("The update could not be saved.")
         }
         return file
     }

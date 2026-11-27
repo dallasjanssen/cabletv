@@ -808,7 +808,13 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
     // ------------------------------------------------------------ Updates
     var update by remember { mutableStateOf<AppUpdater.Release?>(null) }
     var updateMessage by remember { mutableStateOf<String?>(null) }
-    var updateBusy by remember { mutableStateOf(false) }
+    // Checking and installing have their own flags. A check that finishes during a download must
+    // not re-enable Install, or a second press would start a second download over the first.
+    var updateChecking by remember { mutableStateOf(false) }
+    var updateInstalling by remember { mutableStateOf(false) }
+    // The build waiting for the install permission. Android sends the person to a settings screen
+    // for that, and the install continues when they come back.
+    var pendingInstall by remember { mutableStateOf<AppUpdater.Release?>(null) }
     // A build found when the app opened, offered on screen until Install or Later.
     var updatePrompt by remember { mutableStateOf<AppUpdater.Release?>(null) }
 
@@ -820,13 +826,14 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
             if (manual) updateMessage = "This is a debug build. Install the release build once to get updates."
             return
         }
-        updateBusy = true
+        updateChecking = true
         scope.launch {
             val result = withContext(Dispatchers.IO) { runCatching { AppUpdater.latest(BuildConfig.VERSION_CODE) } }
-            updateBusy = false
+            updateChecking = false
             result
                 .onSuccess { found ->
-                    update = found
+                    // A check that runs while a download is going keeps the build being installed.
+                    if (!updateInstalling) update = found
                     if (found != null && !manual) updatePrompt = found
                     updateMessage = when {
                         found != null -> null
@@ -841,23 +848,28 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
     // Downloads the build and opens the system installer. Android asks the person to confirm.
     // [onOpened] runs once the installer is on screen.
     fun installUpdate(release: AppUpdater.Release, onOpened: () -> Unit = {}) {
+        // One download at a time. A press while one is running does nothing.
+        if (updateInstalling) return
         if (!context.packageManager.canRequestPackageInstalls()) {
+            pendingInstall = release
             updateMessage = try {
                 context.startActivity(
                     Intent(AndroidSettings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${context.packageName}"))
                         .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 )
-                "Allow installs from this app on the next screen, then press Install again."
+                "Allow installs from this app on the next screen. The update continues when you come back."
             } catch (e: Exception) {
+                pendingInstall = null
                 "This TV did not open the setting. In Android settings, allow Cable TV to install unknown apps, then press Install again."
             }
             return
         }
-        updateBusy = true
+        pendingInstall = null
+        updateInstalling = true
         updateMessage = "Downloading build ${release.versionCode}"
         scope.launch {
             val result = withContext(Dispatchers.IO) { runCatching { AppUpdater.download(release, File(context.cacheDir, "updates")) } }
-            updateBusy = false
+            updateInstalling = false
             result
                 .onSuccess { apk ->
                     updateMessage = null
@@ -914,6 +926,13 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
                 if (updateCheckedAt == 0L || now - updateCheckedAt >= UPDATE_RECHECK_MS) {
                     updateCheckedAt = now
                     checkForUpdate(manual = false)
+                }
+            }
+            // Back from the install-permission screen: carry on with the install the person asked for.
+            if (event == Lifecycle.Event.ON_RESUME) {
+                val waiting = pendingInstall
+                if (waiting != null && context.packageManager.canRequestPackageInstalls()) {
+                    installUpdate(waiting) { updatePrompt = null }
                 }
             }
         }
@@ -1460,7 +1479,8 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
                     },
                     update = update,
                     updateMessage = updateMessage,
-                    updateBusy = updateBusy,
+                    updateChecking = updateChecking,
+                    updateInstalling = updateInstalling,
                     onCheckUpdate = { checkForUpdate(manual = true) },
                     onInstallUpdate = { installUpdate(it) },
                     lastCrash = lastCrash,
@@ -1592,7 +1612,7 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
             UpdatePrompt(
                 release = release,
                 message = updateMessage,
-                busy = updateBusy,
+                busy = updateInstalling,
                 onInstall = { installUpdate(release) { updatePrompt = null } },
                 onLater = {
                     updatePrompt = null

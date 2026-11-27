@@ -238,7 +238,8 @@ fun SettingsScreen(
     onRemovePin: () -> Unit,
     update: AppUpdater.Release?,
     updateMessage: String?,
-    updateBusy: Boolean,
+    updateChecking: Boolean,
+    updateInstalling: Boolean,
     onCheckUpdate: () -> Unit,
     onInstallUpdate: (AppUpdater.Release) -> Unit,
     lastCrash: String?,
@@ -574,7 +575,7 @@ fun SettingsScreen(
                     onRestore = { if (!backupBusy) restoreBackup.launch(arrayOf("application/json", "text/plain", "*/*")) },
                     onRestoreLink = { restoreFromLink(it) }
                 )
-                SettingsPane.Updates -> UpdatesPane(update, updateMessage, updateBusy, onCheckUpdate, onInstallUpdate, lastCrash, onClearCrash)
+                SettingsPane.Updates -> UpdatesPane(update, updateMessage, updateChecking, updateInstalling, onCheckUpdate, onInstallUpdate, lastCrash, onClearCrash)
             }
         }
 
@@ -1405,7 +1406,8 @@ private fun expiryLabel(ms: Long): String =
 private fun UpdatesPane(
     update: AppUpdater.Release?,
     message: String?,
-    busy: Boolean,
+    checking: Boolean,
+    installing: Boolean,
     onCheck: () -> Unit,
     onInstall: (AppUpdater.Release) -> Unit,
     lastCrash: String?,
@@ -1419,8 +1421,15 @@ private fun UpdatesPane(
     }
     Spacer(Modifier.height(14.dp))
     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-        if (update != null) PillButton("Install build ${update.versionCode}", { onInstall(update) }, icon = TvIcons.Download, enabled = !busy)
-        PillButton(if (busy) "Checking" else "Check for updates", onCheck, enabled = !busy)
+        if (update != null) {
+            PillButton(
+                if (installing) "Downloading" else "Install build ${update.versionCode}",
+                { onInstall(update) },
+                icon = TvIcons.Download,
+                enabled = !installing
+            )
+        }
+        PillButton(if (checking) "Checking" else "Check for updates", onCheck, enabled = !checking)
     }
     Message(message)
     if (lastCrash != null) {
