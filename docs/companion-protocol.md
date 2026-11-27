@@ -164,8 +164,9 @@ channels after a login change. `saved` carries the messages the TV would show, s
 
 ### Sync
 
-Sync copies chosen parts from one TV to another. The phone exports from one and imports into the
-other. Each part is a key under `sections`:
+Sync copies chosen parts from one place to another. A place is a paired TV or the phone itself. The
+phone exports from a TV and imports into a TV, and it can also keep its own copy, so it can be copied
+from as well. Each part is a key under `sections`:
 
 ```json
 {"format": 1, "source_tv": "Living Room TV", "sections": {
@@ -200,6 +201,12 @@ other. Each part is a key under `sections`:
 A phone can keep a copy of a TV's setup: it asks for `export_sync` with every section and stores the
 sync file encrypted on the phone, one copy per TV. Restoring sends that file back with `import_sync`.
 No new message is needed for this, and the TV keeps nothing extra.
+
+The phone also has one copy of its own, kept under the id `this-phone`, separate from the per-TV
+copies. Copying to the phone asks the TV for the chosen sections with `export_sync` and merges them
+into that copy: a section that was chosen is replaced, and a section that was not keeps its older
+value. Copying from the phone sends only the sections the copy holds, with `import_sync`, after the
+same review as any other sync. A copy kept on the phone is always encrypted.
 
 Every sync, including a restore, reads what the target TV has for the same sections first, with
 `export_sync`. Settings that exist on both sides with different values are shown to the person, who
@@ -332,7 +339,7 @@ before anything is sent (`BAD_CODE`).
 - **My TVs** lists paired TVs, marking which are on the network now, and TVs found on the network
   that are not paired yet. Tapping an unpaired one pairs it. A paired one opens its screen.
 - A TV's screen has **Remote** and **Settings**. A **Sync** screen sits beside My TVs, because it
-  involves two TVs.
+  involves a TV and another place to copy to or from.
 - **Remote**: what is playing at the top. Power, volume and Home need the Android TV remote, offered
   as "Set up power and volume" until it is paired. The D-pad, OK, Back, Guide, Info, Last, channel
   up and down, play/pause and the number pad go through the Android TV remote when it is
@@ -342,8 +349,10 @@ before anything is sent (`BAD_CODE`).
 - **Settings**: the sections from `get_settings`, with save buttons per section and the TV's
   messages shown after saving. Ask for the PIN when `pin_set`, and keep it in memory for that TV
   until the app closes.
-- **Sync**: pick the TV to copy from and the TV to copy to, tick Logins, Channel customizations,
-  Favorites and Parental lock, then Copy. Show what the target TV answered.
+- **Sync**: pick where to copy from and where to copy to. Each list offers every paired TV and
+  **This phone**. The phone can be either end, but not both. Tick Logins, Channel customizations,
+  Favorites, Parental lock and Channel lineup, then Copy. Show what the target answered. This phone
+  shows when its copy was saved, and it cannot be copied from until a copy exists.
 
 ## Rules for all parts
 

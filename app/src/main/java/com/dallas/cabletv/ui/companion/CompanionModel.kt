@@ -11,7 +11,12 @@ import com.dallas.cabletv.data.companion.client.CompanionException
 import com.dallas.cabletv.data.companion.client.LinkConnector
 import com.dallas.cabletv.data.companion.client.PairedTv
 import com.dallas.cabletv.data.companion.client.PairedTvStore
+import com.dallas.cabletv.data.companion.client.PHONE_SYNC_ID
+import com.dallas.cabletv.data.companion.client.TvCopy
 import com.dallas.cabletv.data.companion.client.TvCopyStore
+import com.dallas.cabletv.data.companion.client.mergedPhoneCopy
+import com.dallas.cabletv.data.companion.client.syncFileWithSections
+import com.dallas.cabletv.data.companion.client.syncSectionKeys
 import com.dallas.cabletv.data.companion.client.PinCancelledException
 import com.dallas.cabletv.data.companion.client.PinMemory
 import com.dallas.cabletv.data.companion.client.SyncRunner
@@ -271,6 +276,32 @@ class CompanionModel(context: Context, private val scope: CoroutineScope) {
         require(from.id != to.id) { "Choose two different TVs." }
         val data = withTv(from) { runner().exportFrom(from, it, sections) }
         return startSync(data, to, sections, "Copy to ${to.name}")
+    }
+
+    /**
+     * Copies [sections] from this phone's saved copy to [to]. Only the parts the copy holds are sent,
+     * and the same review as any other sync applies.
+     */
+    suspend fun syncFromPhone(to: PairedTv, sections: List<String>): List<String> {
+        require(sections.isNotEmpty()) { "Choose what to copy." }
+        val saved = copies.saved(PHONE_SYNC_ID)
+            ?: throw IllegalArgumentException("This phone has no copy yet. Copy from a TV to this phone first.")
+        val held = syncSectionKeys(saved.data)
+        val chosen = sections.filter { it in held }
+        require(chosen.isNotEmpty()) { "This phone's copy has none of the parts you chose." }
+        return startSync(syncFileWithSections(saved.data, chosen), to, chosen, "Copy from this phone to ${to.name}")
+    }
+
+    /**
+     * Copies [sections] from [from] and keeps them on this phone, encrypted. Sections not chosen keep
+     * the phone's older copy.
+     */
+    suspend fun syncToPhone(from: PairedTv, sections: List<String>): List<String> {
+        require(sections.isNotEmpty()) { "Choose what to copy." }
+        val exported = withTv(from) { runner().exportFrom(from, it, sections) }
+        val old = copies.saved(PHONE_SYNC_ID)?.data
+        copies.save(TvCopy(PHONE_SYNC_ID, "This phone", System.currentTimeMillis(), mergedPhoneCopy(old, exported)))
+        return listOf("Copy saved on this phone.")
     }
 
     /**

@@ -27,17 +27,24 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import com.dallas.cabletv.data.companion.client.PHONE_SYNC_ID
 import com.dallas.cabletv.data.companion.client.PairedTv
 import com.dallas.cabletv.data.companion.client.SyncChoice
 import com.dallas.cabletv.ui.Tv
 import com.dallas.cabletv.ui.TvType
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 
 /** What the last Copy did. */
 private data class SyncOutcome(val title: String, val lines: List<String>, val error: Boolean)
 
-/** Sync: copy chosen parts from one paired TV to another and show what the target said. */
+/**
+ * Sync: copy chosen parts between TVs, or between a TV and this phone. The phone keeps its own
+ * encrypted copy, so it can be copied from as well as to.
+ */
 @Composable
 fun SyncScreen(model: CompanionModel, onBack: () -> Unit) {
     val tvs by model.tvs.collectAsState()
@@ -54,13 +61,26 @@ fun SyncScreen(model: CompanionModel, onBack: () -> Unit) {
         onDispose { model.stopDiscovery() }
     }
 
-    // Start with two different TVs chosen, and drop a choice whose TV was removed.
+    // Start with a TV copied from and this phone copied to. Drop a choice whose TV was removed,
+    // and never let both ends be the same place.
     LaunchedEffect(tvs) {
-        if (tvs.none { it.id == fromId }) fromId = tvs.firstOrNull()?.id
-        if (tvs.none { it.id == toId } || toId == fromId) toId = tvs.firstOrNull { it.id != fromId }?.id
+        if (tvs.isEmpty()) return@LaunchedEffect
+        if (fromId != PHONE_SYNC_ID && tvs.none { it.id == fromId }) fromId = tvs.first().id
+        if (toId != PHONE_SYNC_ID && tvs.none { it.id == toId }) toId = PHONE_SYNC_ID
+        if (toId == fromId) toId = if (fromId == PHONE_SYNC_ID) tvs.first().id else PHONE_SYNC_ID
     }
+    val fromPhone = fromId == PHONE_SYNC_ID
+    val toPhone = toId == PHONE_SYNC_ID
     val from = tvs.firstOrNull { it.id == fromId }
     val to = tvs.firstOrNull { it.id == toId }
+    // Read again after each Copy, so the phone's line shows the copy that was just saved.
+    val phoneCopy = remember(outcome) { model.copies.saved(PHONE_SYNC_ID) }
+    val savedAt = phoneCopy?.let { SimpleDateFormat("d MMM yyyy, h:mm a", Locale.getDefault()).format(Date(it.savedAtMs)) }
+    val phoneNote = if (savedAt != null) "Copy saved $savedAt" else "No copy yet. Copy from a TV to this phone first."
+
+    val ready = fromId != null && toId != null && fromId != toId &&
+        (fromPhone || from != null) && (toPhone || to != null) &&
+        (!fromPhone || phoneCopy != null) && picks.isNotEmpty() && !busy
 
     Column(Modifier.fillMaxSize()) {
         Row(Modifier.fillMaxWidth().padding(start = 4.dp, top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -71,14 +91,30 @@ fun SyncScreen(model: CompanionModel, onBack: () -> Unit) {
             Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            if (tvs.size < 2) {
-                SectionCard("Sync needs two TVs") {
-                    Text("Pair at least two TVs, then come back to copy settings between them.", style = TvType.Body, color = Tv.Ink2)
+            if (tvs.isEmpty()) {
+                SectionCard("Sync needs a TV") {
+                    Text("Pair a TV, then come back to copy settings to or from it, or to and from this phone.", style = TvType.Body, color = Tv.Ink2)
                 }
                 return@Column
             }
-            TvChoice("Copy from", tvs, fromId, other = toId) { fromId = it; outcome = null }
-            TvChoice("Copy to", tvs, toId, other = fromId) { toId = it; outcome = null }
+            EndpointChoice(
+                title = "Copy from",
+                tvs = tvs,
+                selected = fromId,
+                other = toId,
+                phoneNote = phoneNote,
+                phoneEnabled = phoneCopy != null,
+                onSelect = { fromId = it; outcome = null }
+            )
+            EndpointChoice(
+                title = "Copy to",
+                tvs = tvs,
+                selected = toId,
+                other = fromId,
+                phoneNote = phoneNote,
+                phoneEnabled = true,
+                onSelect = { toId = it; outcome = null }
+            )
 
             SectionCard("What to copy") {
                 for (choice in SyncChoice.ALL) {
@@ -101,7 +137,7 @@ fun SyncScreen(model: CompanionModel, onBack: () -> Unit) {
                     }
                 }
                 Text(
-                    "Logins include passwords. They travel encrypted from one TV to the other through this phone, which keeps nothing.",
+                    "Logins include passwords. They travel encrypted through this phone. A copy kept on this phone stays encrypted there too.",
                     style = TvType.Small,
                     color = Tv.Ink2
                 )
@@ -110,15 +146,28 @@ fun SyncScreen(model: CompanionModel, onBack: () -> Unit) {
             PrimaryButton(
                 if (busy) "Copying..." else "Copy",
                 onClick = {
-                    val source = from ?: return@PrimaryButton
-                    val target = to ?: return@PrimaryButton
                     val sections = SyncChoice.ALL.map { it.key }.filter { it in picks }
                     busy = true
                     outcome = null
                     scope.launch {
                         outcome = try {
-                            val messages = model.sync(source, target, sections)
-                            val title = if (model.syncReview.value != null) "Review the differences for ${target.name}." else "Copied to ${target.name}."
+                            val messages: List<String>
+                            val title: String
+                            when {
+                                fromPhone && to != null -> {
+                                    messages = model.syncFromPhone(to, sections)
+                                    title = "Copied from this phone to ${to.name}."
+                                }
+                                toPhone && from != null -> {
+                                    messages = model.syncToPhone(from, sections)
+                                    title = "Copied from ${from.name} to this phone."
+                                }
+                                from != null && to != null -> {
+                                    messages = model.sync(from, to, sections)
+                                    title = if (model.syncReview.value != null) "Review the differences for ${to.name}." else "Copied to ${to.name}."
+                                }
+                                else -> error("Choose two different places.")
+                            }
                             SyncOutcome(title, messages, error = false)
                         } catch (e: CancellationException) {
                             throw e
@@ -129,7 +178,7 @@ fun SyncScreen(model: CompanionModel, onBack: () -> Unit) {
                     }
                 },
                 modifier = Modifier.fillMaxWidth(),
-                enabled = !busy && from != null && to != null && from.id != to.id && picks.isNotEmpty()
+                enabled = ready
             )
 
             outcome?.let { o ->
@@ -142,29 +191,60 @@ fun SyncScreen(model: CompanionModel, onBack: () -> Unit) {
     }
 }
 
-/** A list of TVs to pick one from. The TV chosen in the other list cannot be picked here. */
+/**
+ * The places to pick from: each paired TV, then this phone. The place chosen in the other list
+ * cannot be picked here. [phoneEnabled] is false when the phone has no copy to send from.
+ */
 @Composable
-private fun TvChoice(title: String, tvs: List<PairedTv>, selected: String?, other: String?, onSelect: (String) -> Unit) {
+private fun EndpointChoice(
+    title: String,
+    tvs: List<PairedTv>,
+    selected: String?,
+    other: String?,
+    phoneNote: String,
+    phoneEnabled: Boolean,
+    onSelect: (String) -> Unit
+) {
     SectionCard(title) {
         for (tv in tvs) {
-            val blocked = tv.id == other
-            Row(
-                Modifier.fillMaxWidth().clickable(enabled = !blocked) { onSelect(tv.id) },
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                RadioButton(
-                    selected = tv.id == selected,
-                    onClick = { onSelect(tv.id) },
-                    enabled = !blocked,
-                    colors = RadioButtonDefaults.colors(
-                        selectedColor = Tv.Accent,
-                        unselectedColor = Tv.Ink3,
-                        disabledSelectedColor = Tv.Ink3,
-                        disabledUnselectedColor = Tv.Surface3
-                    )
-                )
-                Text(tv.name, style = TvType.Body, color = if (blocked) Tv.Ink3 else Tv.Ink)
-            }
+            EndpointRow(
+                name = tv.name,
+                note = null,
+                selected = tv.id == selected,
+                blocked = tv.id == other,
+                onClick = { onSelect(tv.id) }
+            )
+        }
+        EndpointRow(
+            name = "This phone",
+            note = phoneNote,
+            selected = selected == PHONE_SYNC_ID,
+            blocked = !phoneEnabled || other == PHONE_SYNC_ID,
+            onClick = { onSelect(PHONE_SYNC_ID) }
+        )
+    }
+}
+
+@Composable
+private fun EndpointRow(name: String, note: String?, selected: Boolean, blocked: Boolean, onClick: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().clickable(enabled = !blocked, onClick = onClick),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        RadioButton(
+            selected = selected,
+            onClick = onClick,
+            enabled = !blocked,
+            colors = RadioButtonDefaults.colors(
+                selectedColor = Tv.Accent,
+                unselectedColor = Tv.Ink3,
+                disabledSelectedColor = Tv.Ink3,
+                disabledUnselectedColor = Tv.Surface3
+            )
+        )
+        Column {
+            Text(name, style = TvType.Body, color = if (blocked) Tv.Ink3 else Tv.Ink)
+            if (note != null) Text(note, style = TvType.Small, color = Tv.Ink2)
         }
     }
 }
