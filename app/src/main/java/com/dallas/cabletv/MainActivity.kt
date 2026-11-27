@@ -30,6 +30,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         CrashLog.install(this)
+        CrashLog.recordExitReasons(this)
         DebugLog.install(this)
         // Rebuilding the screen, for example after a restore, does not play the opening link again.
         if (savedInstanceState == null) link = channelLink(intent)
