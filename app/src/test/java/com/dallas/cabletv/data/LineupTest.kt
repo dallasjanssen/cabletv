@@ -195,6 +195,37 @@ class LineupTest {
     }
 
     @Test
+    fun sendsChannelsThatAnyProfileStillShows() {
+        val channels = listOf(
+            ch("uk", "UK| BBC One", "News"),
+            ch("ukr", "UKRAINE NEWS", "News"),
+            ch("kids", "Cartoon Hour", "Kids"),
+            ch("sport", "Sports Central", "Sports")
+        )
+        // The first profile hides UK and Kids, the second hides only Kids.
+        val out = channelsVisibleToAnyProfile(channels, listOf("UK,KIDS", "KIDS"))
+        assertEquals(listOf("uk", "ukr", "sport"), out.map { it.id })
+    }
+
+    @Test
+    fun dropsChannelsEveryProfileHides() {
+        val channels = listOf(
+            ch("uk", "UK| BBC One", "News"),
+            ch("ukr", "UKRAINE NEWS", "News"),
+            ch("kids", "Cartoon Hour", "Kids")
+        )
+        val out = channelsVisibleToAnyProfile(channels, listOf("UK,KIDS", "uk, kids"))
+        assertEquals(listOf("ukr"), out.map { it.id })
+    }
+
+    @Test
+    fun keepsEveryChannelWhenNothingIsHiddenOrNoProfileExists() {
+        val channels = listOf(ch("a", "ESPN"), ch("b", "CNN"), ch("a", "ESPN"))
+        assertEquals(listOf("a", "b"), channelsVisibleToAnyProfile(channels, listOf("", "")).map { it.id })
+        assertEquals(3, channelsVisibleToAnyProfile(channels, emptyList()).size)
+    }
+
+    @Test
     fun parsesModelAnswerAndKeepsOnlyTrustedNumbers() {
         val text = """
             Here you go:

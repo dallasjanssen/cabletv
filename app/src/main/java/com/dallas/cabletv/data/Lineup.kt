@@ -196,6 +196,22 @@ fun channelsNeedingModel(channels: List<LiveChannel>, doc: LineupDoc): List<Live
     }
 }
 
+/**
+ * The channels worth sending to the model: those at least one profile still shows. A channel hidden
+ * by country or category in every profile's list is left out, since nobody will see it in the guide.
+ * [hiddenLists] holds each profile's saved hidden value, comma separated, the same form as Settings.
+ * An empty list of hidden values keeps every channel.
+ */
+fun channelsVisibleToAnyProfile(channels: List<LiveChannel>, hiddenLists: List<String>): List<LiveChannel> {
+    if (hiddenLists.isEmpty()) return channels
+    val termSets = hiddenLists.map { raw ->
+        raw.split(',').map { it.trim().uppercase() }.filter { it.isNotEmpty() }
+    }
+    return channels
+        .distinctBy { it.id }
+        .filter { ch -> termSets.any { terms -> !isHidden(ch, terms) } }
+}
+
 private val sdRe = Regex("(^|[^A-Za-z0-9])SD([^A-Za-z0-9]|$)")
 private val hdRe = Regex("(^|[^A-Za-z0-9])(HD|FHD|UHD|4K)([^A-Za-z0-9]|$)", RegexOption.IGNORE_CASE)
 

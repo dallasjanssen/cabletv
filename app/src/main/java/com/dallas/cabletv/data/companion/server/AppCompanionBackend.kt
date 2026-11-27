@@ -11,6 +11,7 @@ import com.dallas.cabletv.data.DebugLog
 import com.dallas.cabletv.data.LineupBuildStatus
 import com.dallas.cabletv.data.MODEL_BATCH_SIZE
 import com.dallas.cabletv.data.channelsNeedingModel
+import com.dallas.cabletv.data.channelsVisibleToAnyProfile
 import com.dallas.cabletv.data.friendlyError
 import com.dallas.cabletv.data.lineupSummaryJson
 import com.dallas.cabletv.data.openRouterAsk
@@ -241,8 +242,14 @@ class AppCompanionBackend(
         }
         thread(name = "lineup-build") {
             try {
-                val channels = ChannelSource.loadReport(settings).channels
-                if (channels.isEmpty()) error("No channels loaded. Check the live TV login.")
+                val loaded = ChannelSource.loadReport(settings).channels
+                if (loaded.isEmpty()) error("No channels loaded. Check the live TV login.")
+                // Only send channels that some profile still shows in the guide. Each profile's own
+                // hidden list applies, falling back to the shared one, as the app does when it shows them.
+                val hiddenLists = profileStore.profiles()
+                    .map { p -> UserStateStore(context, p.id).hiddenFilters() ?: settings.hiddenFilters }
+                    .ifEmpty { listOf(settings.hiddenFilters) }
+                val channels = channelsVisibleToAnyProfile(loaded, hiddenLists)
                 val batches = (channelsNeedingModel(channels, doc).size + MODEL_BATCH_SIZE - 1) / MODEL_BATCH_SIZE
                 LineupBuildStatus.setTotal(batches)
                 val updated = runModelPass(channels, doc, System.currentTimeMillis()) { prompt ->
