@@ -697,9 +697,11 @@ private fun GuideDetails(ch: LiveChannel, p: Program?, now: Long, narrow: Boolea
             Text(timeLeft(p, now), style = TvType.Small, color = Tv.Ink2, maxLines = 1)
         }
     }
-    if (p != null && p.desc.isNotBlank()) {
+    // The description is read from the guide database for this one programme, not kept with the schedule.
+    val desc = remember(ch.id, p?.start) { p?.let { EpgCache.descriptionFor(ch.epgId, ch.name, it.start) }.orEmpty() }
+    if (p != null && desc.isNotBlank()) {
         Spacer(Modifier.height(6.dp))
-        Text(p.desc, style = TvType.Small, color = Tv.Ink2, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 560.dp))
+        Text(desc, style = TvType.Small, color = Tv.Ink2, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 560.dp))
     } else if (p == null) {
         Spacer(Modifier.height(6.dp))
         Text("No guide information for this channel.", style = TvType.Small, color = Tv.Ink3)

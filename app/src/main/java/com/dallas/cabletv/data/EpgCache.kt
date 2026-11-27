@@ -1,36 +1,32 @@
 package com.dallas.cabletv.data
 
+import android.content.Context
+import android.database.sqlite.SQLiteDatabase
+import android.database.sqlite.SQLiteConstraintException
+import android.database.sqlite.SQLiteException
 import android.util.Xml
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.xmlpull.v1.XmlPullParser
-import java.io.BufferedInputStream
-import java.io.BufferedOutputStream
-import java.io.DataInput
-import java.io.DataInputStream
-import java.io.DataOutput
-import java.io.DataOutputStream
 import java.io.File
-import java.io.FileInputStream
-import java.io.FileOutputStream
 import java.io.InputStream
-import java.net.URLEncoder
 import java.time.DateTimeException
 import java.time.LocalDateTime
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.GZIPInputStream
-import java.util.zip.GZIPOutputStream
 
 /**
- * The full programme schedule from an XMLTV feed. The feed comes from the Xtream
- * login, from the guide link inside an M3U playlist, or from a Guide URL. Programmes
- * from about two days behind to two days ahead are kept, so catch-up has something
- * to show. Channels are matched by their epg_channel_id or the playlist's tvg-id,
- * ignoring case and punctuation. A channel name can also match the guide's display name.
+ * The programme schedule from XMLTV feeds, kept in the guide database (see [GuideDatabase]). The feeds
+ * come from the Xtream login, the guide link inside an M3U playlist, or a Guide URL. Programmes from
+ * about two days behind to two days ahead are kept, so catch-up has something to show. Channels are
+ * matched by their epg_channel_id or the playlist's tvg-id, ignoring case and punctuation. A channel
+ * name can also match the guide's display name.
+ *
+ * Listings are read from the database when they are needed, so a screen shows only what it asks for.
+ * Call [open] once at startup. Until then every read gives nothing.
  */
 object EpgCache {
 
@@ -40,164 +36,175 @@ object EpgCache {
     /** Two days behind, so catch-up has listings to play. */
     const val BEHIND_MS = 48 * 3_600_000L
 
-    private val lock = Any()
-    private var programs: Map<String, List<Program>> = emptyMap()
-    private var aliases: Map<String, String> = emptyMap()
-    private val refreshGeneration = AtomicInteger()
+    /** Serializes downloads and their writes. Reads never wait for it, because the database is in WAL mode. */
+    private val writeLock = Any()
+    private val memoLock = Any()
+
+    @Volatile
+    private var store: GuideDatabase? = null
+
+    /** Now and next for each channel, per minute, so a screen that asks again does not reread the database. */
+    private val nowNextMemo = object : LinkedHashMap<String, NowNext?>(256, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, NowNext?>?): Boolean =
+            size > MEMO_LIMIT
+    }
 
     private val http = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(180, TimeUnit.SECONDS)
         .build()
 
-    /** Downloads the feed from an Xtream login and replaces the cache. Runs on a background thread. */
-    fun refresh(server: String, user: String, pass: String) {
-        val base = normalizeXtreamServerUrl(server)
-        refreshUrl("$base/xmltv.php?username=${enc(user)}&password=${enc(pass)}")
+    /** Opens the guide database. Call once at startup, before the guide is read. */
+    fun open(context: Context) {
+        val app = context.applicationContext
+        // The copy kept as a file before the database existed is no longer read.
+        File(app.cacheDir, "guide/listings.bin").delete()
+        synchronized(writeLock) {
+            if (store == null) store = GuideDatabase(app)
+        }
+    }
+
+    /** Removes every saved listing. Used when no live login is set, so the saved guide belongs to nobody. */
+    fun clear() {
+        synchronized(writeLock) {
+            val db = store?.writableDatabase ?: return
+            db.beginTransaction()
+            try {
+                db.execSQL("DELETE FROM program")
+                db.execSQL("DELETE FROM alias")
+                db.execSQL("DELETE FROM meta")
+                db.setTransactionSuccessful()
+            } finally {
+                db.endTransaction()
+            }
+        }
+        clearMemo()
     }
 
     /**
-     * Downloads every guide and keeps them together. One feed failing leaves the others in place.
+     * Downloads every guide and replaces the saved listings with what loaded. [key] says which logins the
+     * feeds belong to (see [guideCacheKey]). A feed that fails is left out and reported. A feed cut off part
+     * way is used, and its channels keep their earlier listings only when [key] is the same logins as before.
      * Returns the addresses that did not load.
      */
-    fun refreshAll(urls: List<String>): List<String> {
-        val generation = refreshGeneration.incrementAndGet()
-        val feeds = mutableListOf<Map<String, List<Program>>>()
-        val names = mutableListOf<Pair<String, String>>()
-        val failed = mutableListOf<String>()
-        var cutShort = false
-        for (url in urls.distinct()) {
-            runCatching {
-                val req = Request.Builder().url(url).header("User-Agent", PLAYER_USER_AGENT).build()
-                http.newCall(req).execute().use { resp ->
-                    if (!resp.isSuccessful) error("XMLTV returned HTTP ${resp.code}")
-                    val body = resp.body ?: error("Empty XMLTV response")
-                    val parsed = parse(body.byteStream())
-                    feeds += parsed.programs
-                    names += parsed.names
-                    // A feed cut off part way is used, but reported, and does not wipe what it did not reach.
-                    if (!parsed.complete) {
-                        cutShort = true
-                        failed += url
+    fun refreshAll(urls: List<String>, key: String): List<String> {
+        val unique = urls.distinct()
+        val s = store ?: return unique
+        synchronized(writeLock) {
+            val db = s.writableDatabase
+            val now = System.currentTimeMillis()
+            val from = now - BEHIND_MS
+            val to = now + AHEAD_MS
+            val names = mutableListOf<Pair<String, String>>()
+            val failed = mutableListOf<String>()
+            var cutShort = false
+            val sameLogins = meta(db, "key") == key
+            db.beginTransaction()
+            try {
+                db.execSQL("DELETE FROM staged")
+                val stage = Stager(db)
+                try {
+                    for (url in unique) {
+                        runCatching {
+                            val req = Request.Builder().url(url).header("User-Agent", PLAYER_USER_AGENT).build()
+                            http.newCall(req).execute().use { resp ->
+                                if (!resp.isSuccessful) error("XMLTV returned HTTP ${resp.code}")
+                                val body = resp.body ?: error("Empty XMLTV response")
+                                stageFeed(body.byteStream(), from, to, stage, names)
+                            }
+                        }.onSuccess { complete ->
+                            if (!complete) {
+                                cutShort = true
+                                failed += url
+                            }
+                        }.onFailure { failed += url }
                     }
+                } finally {
+                    stage.close()
                 }
-            }.onFailure { failed += url }
-        }
-        // Two feeds often carry the same listings, so each show is kept once.
-        val fresh = mergeSchedules(feeds)
-        // After a cut off feed, channels it did not reach keep their earlier listings.
-        val stored = if (cutShort) synchronized(lock) { programs } + fresh else fresh
-        if (stored.isNotEmpty() && generation == refreshGeneration.get()) {
-            val keys = buildEpgAliases(stored.keys, names)
-            synchronized(lock) {
-                if (generation == refreshGeneration.get()) {
-                    // Kept listings keep their display names too. New names win.
-                    aliases = if (cutShort) aliases.filterValues { it in stored } + keys else keys
-                    programs = stored
+                if (stage.count > 0) {
+                    commit(
+                        db,
+                        merge = sameLogins && cutShort,
+                        names = names,
+                        key = key,
+                        from = from,
+                        to = to,
+                        stampSaved = failed.size < unique.size
+                    )
+                    db.setTransactionSuccessful()
                 }
+            } finally {
+                db.endTransaction()
             }
-        }
-        return failed
-    }
-
-    /** Downloads any XMLTV feed by URL and replaces the cache. Runs on a background thread. */
-    fun refreshUrl(url: String) {
-        val req = Request.Builder().url(url).header("User-Agent", PLAYER_USER_AGENT).build()
-        http.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) error("XMLTV returned HTTP ${resp.code}")
-            val body = resp.body ?: error("Empty XMLTV response")
-            load(body.byteStream())
+            clearMemo()
+            return failed
         }
     }
 
     /**
-     * Writes the listings in memory to [file], so the next start can show them before it downloads.
-     * [key] says which logins they came from (see [guideCacheKey]). The copy is written to a temp
-     * file first, so a write that is cut off never replaces a good copy.
+     * When the saved listings were last downloaded in full for these logins, or null when there are none.
+     * The app shows them straight away and waits before the next download.
      */
-    fun saveTo(file: File, key: String) {
-        val (saved, names) = synchronized(lock) { programs to aliases }
-        if (saved.isEmpty()) return
-        val dir = file.parentFile ?: return
-        dir.mkdirs()
-        val tmp = File(dir, file.name + ".tmp")
-        DataOutputStream(BufferedOutputStream(GZIPOutputStream(FileOutputStream(tmp)), 64 * 1024)).use { out ->
-            writeSavedGuide(out, key, System.currentTimeMillis(), saved, names)
-        }
-        if (!tmp.renameTo(file)) {
-            file.delete()
-            if (!tmp.renameTo(file)) tmp.delete()
-        }
+    fun savedAt(key: String): Long? = read(null) { db ->
+        if (meta(db, "key") != key || !hasAnyProgram(db)) return@read null
+        meta(db, "saved_at")?.toLongOrNull()
     }
 
-    /**
-     * Loads listings saved by [saveTo] for the same [key]. Nothing changes when listings are already
-     * in memory, or the file is missing, damaged, or was saved for other logins. Returns when the
-     * copy was saved, or null when nothing was loaded.
-     */
-    fun restoreFrom(file: File, key: String): Long? {
-        if (!file.exists()) return null
-        val saved = try {
-            DataInputStream(BufferedInputStream(GZIPInputStream(FileInputStream(file)), 64 * 1024)).use {
-                readSavedGuide(it, key, System.currentTimeMillis())
-            }
-        } catch (e: Exception) {
-            null
-        } ?: return null
-        if (saved.programs.isEmpty()) return null
-        synchronized(lock) {
-            if (programs.isNotEmpty()) return null
-            programs = saved.programs
-            aliases = saved.aliases
-        }
-        return saved.savedAt
-    }
-
-    /** Reads an XMLTV feed and replaces the cache with it. */
-    fun load(input: InputStream) {
-        val parsed = parse(input)
-        synchronized(lock) {
-            programs = parsed.programs
-            aliases = buildEpgAliases(parsed.programs.keys, parsed.names)
-        }
-    }
-
-    /** Now and next for a channel from the full schedule, or null when the feed has nothing for it. */
+    /** Now and next for a channel from the saved schedule, or null when the guide has nothing for it. */
     fun nowNext(epgId: String?, name: String? = null): NowNext? {
-        val list = schedule(epgId, name)
-        if (list.isEmpty()) return null
         val now = System.currentTimeMillis()
-        val current = list.firstOrNull { now >= it.start && now < it.end }
-        val next = list.firstOrNull { it.start > now }
-        if (current == null && next == null) return null
-        return NowNext(current, next)
+        val memoKey = "${epgId.orEmpty()}\u0000${name.orEmpty()}\u0000${now / 60_000L}"
+        synchronized(memoLock) {
+            if (nowNextMemo.containsKey(memoKey)) return nowNextMemo[memoKey]
+        }
+        val answer = read(null) { db -> nowNextIn(db, epgId, name, now) }
+        synchronized(memoLock) { nowNextMemo[memoKey] = answer }
+        return answer
     }
 
     /**
-     * Every programme kept for a channel, oldest first. Empty when the feed has nothing for it.
-     * [name] is used when the id is missing, or when the id's listings do not cover now and the
-     * guide's display name does.
+     * Every programme kept for a channel in the window around now, oldest first. Empty when the guide has
+     * nothing for it. [name] is used when the id is missing, or when the id's listings do not cover now and
+     * the guide's display name does. Descriptions are left out unless [withDesc] is set, since most screens
+     * need only titles and times.
      */
-    fun schedule(epgId: String?, name: String? = null): List<Program> {
+    fun schedule(epgId: String?, name: String? = null, withDesc: Boolean = false): List<Program> {
         val now = System.currentTimeMillis()
-        return synchronized(lock) { chooseListings(listFor(epgId), listFor(name), now) }
+        return read(emptyList()) { db -> chosenListings(db, epgId, name, now, withDesc)?.rows.orEmpty() }
     }
 
-    /** True once a feed has been loaded, so screens can tell "no data yet" from "no data for this channel". */
-    fun hasData(): Boolean = synchronized(lock) { programs.isNotEmpty() }
+    /** The description of the programme that starts at [start] on this channel, or empty when there is none. */
+    fun descriptionFor(epgId: String?, name: String?, start: Long): String = read("") { db ->
+        listOfNotNull(keyFor(db, epgId), keyFor(db, name))
+            .firstNotNullOfOrNull { key -> descriptionOf(db, key, start)?.takeIf { it.isNotEmpty() } }
+            .orEmpty()
+    }
 
     /**
      * Shows on now or later whose titles contain [query], ignoring case, accents and punctuation.
-     * Soonest first. [keys], when given, limits the search to those guide channels.
+     * Soonest first. [keys], when given, limits the search to those guide channels. The titles are read
+     * from the database one at a time, so only the hits are kept.
      */
     fun programmesMatching(
         query: String,
         nowMs: Long = System.currentTimeMillis(),
         limit: Int = 30,
         keys: Set<String>? = null
-    ): List<Pair<String, Program>> {
-        val schedule = synchronized(lock) { programs }
-        return matchProgrammes(schedule, query, nowMs, limit, keys)
+    ): List<Pair<String, Program>> = read(emptyList()) { db ->
+        val matcher = SearchMatcher(query)
+        if (matcher.folded.length < 2 || limit <= 0) return@read emptyList()
+        val hits = ArrayList<Pair<String, Program>>()
+        db.rawQuery("SELECT ch, start, stop, title FROM program WHERE stop > ? ORDER BY start", arrayOf(nowMs.toString())).use { c ->
+            while (c.moveToNext()) {
+                val ch = c.getString(0)
+                if (keys != null && ch !in keys) continue
+                val title = c.getString(3)
+                if (matcher.matches(title)) hits += ch to Program(title, c.getLong(1), c.getLong(2))
+                if (hits.size >= limit) break
+            }
+        }
+        hits
     }
 
     /**
@@ -205,67 +212,194 @@ object EpgCache {
      * Search uses it, so a show is found on the same channels the guide shows it on.
      */
     fun scheduleKey(epgId: String?, name: String? = null, now: Long = System.currentTimeMillis()): String? =
-        synchronized(lock) {
-            val idKey = keyFor(epgId)
-            val nameKey = keyFor(name)
-            val byId = idKey?.let { programs[it] }.orEmpty()
-            val byName = nameKey?.let { programs[it] }.orEmpty()
-            val chosen = chooseListings(byId, byName, now)
-            when {
-                chosen.isEmpty() -> null
-                chosen === byId -> idKey
-                else -> nameKey
-            }
-        }
+        read(null) { db -> chosenListings(db, epgId, name, now, false)?.takeIf { it.rows.isNotEmpty() }?.key }
 
     /**
      * Programmes that already aired on a channel inside [withinMs], newest first.
-     * The feed keeps about two days, so a longer archive still shows those two days.
+     * The guide keeps about two days, so a longer archive still shows those two days.
      */
     fun pastPrograms(epgId: String?, withinMs: Long = DAY_MS, name: String? = null): List<Program> {
-        val list = synchronized(lock) { listFor(epgId).ifEmpty { listFor(name) } }
-        return finishedWithin(list, System.currentTimeMillis(), withinMs)
+        val now = System.currentTimeMillis()
+        return read(emptyList()) { db ->
+            finishedWithin(chosenListings(db, epgId, name, now, false)?.rows.orEmpty(), now, withinMs)
+        }
     }
 
-    private fun listFor(key: String?): List<Program> = keyFor(key)?.let { programs[it] }.orEmpty()
+    // Database access
 
-    /** The id stored in the schedule for an id or display name, or null. Call while holding [lock]. */
-    private fun keyFor(key: String?): String? {
-        if (key.isNullOrBlank()) return null
-        if (programs.containsKey(key)) return key
-        val norm = normalizeEpgKey(key)
-        if (norm.isEmpty()) return null
-        return aliases[norm]
+    /** Runs [block] on the database, or returns [default] when it is not open or cannot be read. */
+    private inline fun <T> read(default: T, block: (SQLiteDatabase) -> T): T {
+        val s = store ?: return default
+        return try {
+            block(s.readableDatabase)
+        } catch (e: SQLiteException) {
+            DebugLog.log("guide", "Guide could not be read", e)
+            default
+        }
     }
 
-    private fun enc(value: String): String = URLEncoder.encode(value, "UTF-8").replace("+", "%20")
+    private fun clearMemo() {
+        synchronized(memoLock) { nowNextMemo.clear() }
+    }
 
     /**
-     * Reads XMLTV with a streaming parser, keeping only the window around now. A gzip body is inflated first.
-     * A feed that breaks part way (a cut off download, a bad character) keeps what was read before the break.
+     * Reads one feed into the staging table, keeping only the window from [from] to [to]. Returns false when
+     * the feed broke part way and what came before the break is kept. Throws when nothing was read.
      */
-    internal fun parse(input: InputStream): ParsedGuide {
-        val now = System.currentTimeMillis()
-        val from = now - BEHIND_MS
-        val to = now + AHEAD_MS
-        val out = HashMap<String, MutableList<Program>>()
-        val names = mutableListOf<Pair<String, String>>()
-        var complete = true
-        try {
-            readFeed(input, from, to, out, names)
+    private fun stageFeed(
+        input: InputStream,
+        from: Long,
+        to: Long,
+        stage: Stager,
+        names: MutableList<Pair<String, String>>
+    ): Boolean {
+        val before = stage.count
+        return try {
+            readFeed(input, from, to, names) { ch, p -> stage.add(ch, p) }
+            true
         } catch (e: Exception) {
-            if (out.isEmpty()) throw e
-            complete = false
+            if (stage.count == before) throw e
+            false
         }
-        return ParsedGuide(out.mapValues { (_, list) -> tidySchedule(list, from, to) }, names, complete)
     }
 
+    /**
+     * Moves the staged programmes into the schedule in one go. Stop times are filled in, the window is
+     * applied, and the channel names are rebuilt. With [merge], channels the staged feeds did not reach keep
+     * their saved programmes.
+     */
+    private fun commit(
+        db: SQLiteDatabase,
+        merge: Boolean,
+        names: List<Pair<String, String>>,
+        key: String,
+        from: Long,
+        to: Long,
+        stampSaved: Boolean
+    ) {
+        // A programme with no stop time ends when the next one on its channel starts, or half an hour later.
+        db.execSQL(
+            "UPDATE staged SET stop = COALESCE((SELECT MIN(s2.start) FROM staged AS s2 " +
+                "WHERE s2.ch = staged.ch AND s2.start > staged.start), staged.start + $OPEN_END_MS) WHERE stop <= 0"
+        )
+        db.execSQL("DELETE FROM staged WHERE stop <= ? OR start >= ?", arrayOf<Any>(from, to))
+        if (merge) {
+            db.execSQL("DELETE FROM program WHERE ch IN (SELECT DISTINCT ch FROM staged)")
+        } else {
+            db.execSQL("DELETE FROM program")
+        }
+        db.execSQL("INSERT INTO program (ch, start, stop, title, desc) SELECT ch, start, stop, title, desc FROM staged")
+        db.execSQL("DELETE FROM program WHERE stop <= ? OR start >= ?", arrayOf<Any>(from, to))
+        db.execSQL("DELETE FROM staged")
+
+        val ids = HashSet<String>()
+        db.rawQuery("SELECT DISTINCT ch FROM program", null).use { c ->
+            while (c.moveToNext()) ids += c.getString(0)
+        }
+        val aliases = buildEpgAliases(ids, names)
+        db.execSQL("DELETE FROM alias")
+        val insert = db.compileStatement("INSERT INTO alias (name, ch) VALUES (?, ?)")
+        try {
+            for ((name, ch) in aliases) {
+                insert.bindString(1, name)
+                insert.bindString(2, ch)
+                insert.executeInsert()
+            }
+        } finally {
+            insert.close()
+        }
+
+        db.execSQL("INSERT OR REPLACE INTO meta (k, v) VALUES ('key', ?)", arrayOf<Any>(key))
+        if (stampSaved) {
+            db.execSQL("INSERT OR REPLACE INTO meta (k, v) VALUES ('saved_at', ?)", arrayOf<Any>(System.currentTimeMillis().toString()))
+        }
+    }
+
+    private fun meta(db: SQLiteDatabase, k: String): String? =
+        db.rawQuery("SELECT v FROM meta WHERE k = ?", arrayOf(k)).use { c ->
+            if (c.moveToFirst()) c.getString(0) else null
+        }
+
+    private fun hasAnyProgram(db: SQLiteDatabase): Boolean =
+        db.rawQuery("SELECT 1 FROM program LIMIT 1", null).use { it.moveToFirst() }
+
+    private fun hasChannel(db: SQLiteDatabase, ch: String): Boolean =
+        db.rawQuery("SELECT 1 FROM program WHERE ch = ? LIMIT 1", arrayOf(ch)).use { it.moveToFirst() }
+
+    /** The id stored in the schedule for an id or display name, or null. */
+    private fun keyFor(db: SQLiteDatabase, key: String?): String? {
+        if (key.isNullOrBlank()) return null
+        if (hasChannel(db, key)) return key
+        val norm = normalizeEpgKey(key)
+        if (norm.isEmpty()) return null
+        return db.rawQuery("SELECT ch FROM alias WHERE name = ?", arrayOf(norm)).use { c ->
+            if (c.moveToFirst()) c.getString(0) else null
+        }
+    }
+
+    /** The programmes of one guide channel in the window around [now]. Descriptions only when [withDesc]. */
+    private fun windowRows(db: SQLiteDatabase, key: String, now: Long, withDesc: Boolean): List<Program> {
+        val sql = if (withDesc) {
+            "SELECT start, stop, title, desc FROM program WHERE ch = ? AND stop > ? AND start < ? ORDER BY start"
+        } else {
+            "SELECT start, stop, title FROM program WHERE ch = ? AND stop > ? AND start < ? ORDER BY start"
+        }
+        val args = arrayOf(key, (now - BEHIND_MS).toString(), (now + AHEAD_MS).toString())
+        return db.rawQuery(sql, args).use { c ->
+            val out = ArrayList<Program>(c.count)
+            while (c.moveToNext()) {
+                out += Program(c.getString(2), c.getLong(0), c.getLong(1), if (withDesc) c.getString(3) else "")
+            }
+            out
+        }
+    }
+
+    private fun descriptionOf(db: SQLiteDatabase, key: String, start: Long): String? =
+        db.rawQuery("SELECT desc FROM program WHERE ch = ? AND start = ?", arrayOf(key, start.toString())).use { c ->
+            if (c.moveToFirst()) c.getString(0) else null
+        }
+
+    /** The guide channel whose listings a channel uses, with those listings for the window around now. */
+    private class Chosen(val key: String, val rows: List<Program>)
+
+    /** Picks the id's listings, or the display name's, by the rule in [chooseListings]. */
+    private fun chosenListings(db: SQLiteDatabase, epgId: String?, name: String?, now: Long, withDesc: Boolean): Chosen? {
+        val idKey = keyFor(db, epgId)
+        val nameKey = keyFor(db, name)
+        val byId = idKey?.let { windowRows(db, it, now, withDesc) }.orEmpty()
+        val byName = nameKey?.let { windowRows(db, it, now, withDesc) }.orEmpty()
+        val useId = chooseListings(byId, byName, now) === byId
+        val key = (if (useId) idKey else nameKey) ?: return null
+        return Chosen(key, if (useId) byId else byName)
+    }
+
+    private fun nowNextIn(db: SQLiteDatabase, epgId: String?, name: String?, now: Long): NowNext? {
+        val chosen = chosenListings(db, epgId, name, now, false) ?: return null
+        val list = chosen.rows
+        val current = list.firstOrNull { now >= it.start && now < it.end }
+        val next = list.firstOrNull { it.start > now }
+        if (current == null && next == null) return null
+        return NowNext(
+            current?.let { withDescription(db, chosen.key, it) },
+            next?.let { withDescription(db, chosen.key, it) }
+        )
+    }
+
+    private fun withDescription(db: SQLiteDatabase, key: String, p: Program): Program {
+        val text = descriptionOf(db, key, p.start) ?: return p
+        return p.copy(desc = text)
+    }
+
+    /**
+     * Streams an XMLTV feed, calling [sink] for each programme in the window. A gzip body is inflated first.
+     * A feed that breaks part way (a cut off download, a bad character) keeps what was read before the break.
+     */
     private fun readFeed(
         input: InputStream,
         from: Long,
         to: Long,
-        out: HashMap<String, MutableList<Program>>,
-        names: MutableList<Pair<String, String>>
+        names: MutableList<Pair<String, String>>,
+        sink: (String, Program) -> Unit
     ) {
         val parser = Xml.newPullParser()
         parser.setInput(ungzipIfNeeded(input), null)
@@ -323,11 +457,10 @@ object EpgCache {
                     "channel" -> inChannel = false
                     "programme" -> {
                         val ch = channel
-                        // A programme with no stop time is kept for now. tidySchedule gives it one.
+                        // A programme with no stop time is kept for now. The commit gives it one.
                         val open = stop <= 0L && start > from - OPEN_END_SLACK_MS
                         if (ch != null && start > 0L && start < to && (stop > from || open)) {
-                            out.getOrPut(ch) { mutableListOf() }
-                                .add(Program(title.trim(), start, if (open) 0L else stop, clipDesc(desc)))
+                            sink(ch, Program(title.trim(), start, if (open) 0L else stop, clipDesc(desc)))
                         }
                         channel = null
                     }
@@ -336,10 +469,48 @@ object EpgCache {
             event = parser.next()
         }
     }
+
+    /** Writes programmes into the staging table. One row per channel and start time; the better copy stays. */
+    private class Stager(private val db: SQLiteDatabase) {
+        private val insert = db.compileStatement("INSERT INTO staged (ch, start, stop, title, desc) VALUES (?, ?, ?, ?, ?)")
+
+        /** Programmes kept so far, across every feed of this download. */
+        var count = 0L
+            private set
+
+        fun add(ch: String, p: Program) {
+            insert.bindString(1, ch)
+            insert.bindLong(2, p.start)
+            insert.bindLong(3, p.end)
+            insert.bindString(4, p.title)
+            insert.bindString(5, p.desc)
+            try {
+                insert.executeInsert()
+                count++
+                return
+            } catch (e: SQLiteConstraintException) {
+                // The same show is already kept, from an earlier feed or an earlier entry. Keep the better copy.
+            }
+            db.rawQuery("SELECT stop, desc FROM staged WHERE ch = ? AND start = ?", arrayOf(ch, p.start.toString())).use { c ->
+                if (!c.moveToFirst()) return
+                if (!betterProgram(Program("", p.start, c.getLong(0), c.getString(1)), p)) return
+            }
+            db.execSQL(
+                "UPDATE staged SET stop = ?, title = ?, desc = ? WHERE ch = ? AND start = ?",
+                arrayOf<Any>(p.end, p.title, p.desc, ch, p.start)
+            )
+        }
+
+        fun close() {
+            insert.close()
+        }
+    }
 }
 
 /** Longest programme description kept, in characters. */
 private const val MAX_DESC = 400
+/** The most now-and-next answers kept in memory. Each one is small. */
+private const val MEMO_LIMIT = 2_000
 /** A programme with no stop time and no next programme is given half an hour. */
 private const val OPEN_END_MS = 30 * 60_000L
 /** How far before the kept window a programme with no stop time may start and still be read. */
@@ -351,140 +522,16 @@ internal fun clipDesc(raw: String): String {
 }
 
 /**
- * One programme per start time, sorted. Two programmes on one channel cannot start at the same
- * instant, so a repeat is a duplicate. The one with a description is kept, then the one with a stop time.
+ * Whether [incoming] should replace [kept] when both start at the same time on one channel. A copy with a
+ * description beats one without, and then a copy with a stop time beats one without.
  */
-internal fun dedupeByStart(list: List<Program>): List<Program> {
-    if (list.size < 2) return list
-    val out = ArrayList<Program>(list.size)
-    for (p in list.sortedBy { it.start }) {
-        val last = out.lastOrNull()
-        if (last == null || last.start != p.start) {
-            out += p
-            continue
-        }
-        val better = (last.desc.isBlank() && p.desc.isNotBlank()) ||
-            (last.desc.isBlank() == p.desc.isBlank() && last.end <= 0L && p.end > 0L)
-        if (better) out[out.lastIndex] = p
-    }
-    return out
-}
-
-/** Gives a programme with no stop time (end 0) the next programme's start, or half an hour. [sorted] has one programme per start. */
-internal fun fillMissingStops(sorted: List<Program>): List<Program> {
-    if (sorted.none { it.end <= 0L }) return sorted
-    return sorted.mapIndexed { i, p ->
-        if (p.end > 0L) p else p.copy(end = sorted.getOrNull(i + 1)?.start ?: (p.start + OPEN_END_MS))
-    }
-}
-
-/** A channel's programmes from one feed: no duplicates, every stop time filled in, inside [from] to [to]. */
-internal fun tidySchedule(list: List<Program>, from: Long, to: Long): List<Program> =
-    fillMissingStops(dedupeByStart(list)).filter { it.end > from && it.start < to }
-
-/** Joins several feeds by channel id. A show that two feeds both carry is kept once. */
-internal fun mergeSchedules(feeds: List<Map<String, List<Program>>>): Map<String, List<Program>> {
-    if (feeds.size == 1) return feeds[0]
-    val merged = LinkedHashMap<String, MutableList<Program>>()
-    for (feed in feeds) {
-        for ((id, list) in feed) merged.getOrPut(id) { mutableListOf() }.addAll(list)
-    }
-    return merged.mapValues { (_, list) -> dedupeByStart(list) }
-}
-
-/** Bumped when the saved format changes, so an older file is ignored instead of misread. */
-private const val SAVED_GUIDE_VERSION = 1
-/** writeUTF takes at most 65535 bytes, and a character can take three. */
-private const val MAX_SAVED_CHARS = 20_000
-
-/** Listings read back from the device. */
-internal class SavedGuide(val savedAt: Long, val programs: Map<String, List<Program>>, val aliases: Map<String, String>)
+internal fun betterProgram(kept: Program, incoming: Program): Boolean =
+    (kept.desc.isBlank() && incoming.desc.isNotBlank()) ||
+        (kept.desc.isBlank() == incoming.desc.isBlank() && kept.end <= 0L && incoming.end > 0L)
 
 /**
- * Which logins and guide links a saved copy belongs to. A hash, so the file never holds the links,
- * which can carry the Xtream password.
+ * Letters and digits only, so `TNT.us` and `tnt us` can meet. Called for every channel, so it avoids a regex.
  */
-fun guideCacheKey(s: Settings): String {
-    val text = listOf(s.xtreamServer, s.xtreamUser, s.xtreamPass, s.m3uUrl, s.epgUrl).joinToString("\u0000")
-    val digest = java.security.MessageDigest.getInstance("SHA-256").digest(text.toByteArray(Charsets.UTF_8))
-    return digest.joinToString("") { String.format(Locale.US, "%02x", it) }
-}
-
-private fun savedText(s: String): String = if (s.length > MAX_SAVED_CHARS) s.take(MAX_SAVED_CHARS) else s
-
-internal fun writeSavedGuide(
-    out: DataOutput,
-    key: String,
-    savedAt: Long,
-    programs: Map<String, List<Program>>,
-    aliases: Map<String, String>
-) {
-    out.writeInt(SAVED_GUIDE_VERSION)
-    out.writeUTF(key)
-    out.writeLong(savedAt)
-    out.writeInt(programs.size)
-    for ((id, list) in programs) {
-        out.writeUTF(savedText(id))
-        out.writeInt(list.size)
-        for (p in list) {
-            out.writeUTF(savedText(p.title))
-            out.writeLong(p.start)
-            out.writeLong(p.end)
-            out.writeUTF(savedText(p.desc))
-        }
-    }
-    out.writeInt(aliases.size)
-    for ((name, id) in aliases) {
-        out.writeUTF(savedText(name))
-        out.writeUTF(savedText(id))
-    }
-}
-
-/**
- * Reads a copy written by [writeSavedGuide]. Null when it is another format or was saved for other
- * logins. Programmes that ended before the guide's window are dropped.
- */
-internal fun readSavedGuide(input: DataInput, key: String, nowMs: Long): SavedGuide? {
-    if (input.readInt() != SAVED_GUIDE_VERSION) return null
-    if (input.readUTF() != key) return null
-    val savedAt = input.readLong()
-    val from = nowMs - EpgCache.BEHIND_MS
-    val channels = input.readInt()
-    if (channels < 0) return null
-    val programs = HashMap<String, List<Program>>(minOf(channels, 20_000) * 2)
-    repeat(channels) {
-        val id = input.readUTF()
-        val count = input.readInt()
-        if (count < 0) return null
-        val list = ArrayList<Program>(minOf(count, 2_000))
-        repeat(count) {
-            val title = input.readUTF()
-            val start = input.readLong()
-            val end = input.readLong()
-            val desc = input.readUTF()
-            if (end > from && end > start) list += Program(title, start, end, desc)
-        }
-        if (list.isNotEmpty()) programs[id] = list
-    }
-    val aliasCount = input.readInt()
-    if (aliasCount < 0) return null
-    val aliases = HashMap<String, String>(minOf(aliasCount, 20_000) * 2)
-    repeat(aliasCount) {
-        val name = input.readUTF()
-        val id = input.readUTF()
-        if (id in programs) aliases[name] = id
-    }
-    return SavedGuide(savedAt, programs, aliases)
-}
-
-internal data class ParsedGuide(
-    val programs: Map<String, List<Program>>,
-    val names: List<Pair<String, String>>,
-    /** False when the feed broke part way and only what came before the break was read. */
-    val complete: Boolean = true
-)
-
-/** Letters and digits only, so `TNT.us` and `tnt us` can meet. Called for every channel, so it avoids a regex. */
 internal fun normalizeEpgKey(raw: String): String {
     val out = StringBuilder(raw.length)
     for (c in raw) {
@@ -577,4 +624,14 @@ internal fun ungzipIfNeeded(input: InputStream): InputStream {
     val b1 = src.read()
     src.reset()
     return if (b0 == 0x1f && b1 == 0x8b) GZIPInputStream(src) else src
+}
+
+/**
+ * Which logins and guide links a saved copy belongs to. A hash, so the database never holds the links,
+ * which can carry the Xtream password.
+ */
+fun guideCacheKey(s: Settings): String {
+    val text = listOf(s.xtreamServer, s.xtreamUser, s.xtreamPass, s.m3uUrl, s.epgUrl).joinToString("\u0000")
+    val digest = java.security.MessageDigest.getInstance("SHA-256").digest(text.toByteArray(Charsets.UTF_8))
+    return digest.joinToString("") { String.format(Locale.US, "%02x", it) }
 }

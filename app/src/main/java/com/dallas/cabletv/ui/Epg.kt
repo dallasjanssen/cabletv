@@ -96,9 +96,9 @@ class GuideData(private val scope: CoroutineScope) {
     }
 
     /** Every known programme for a channel, oldest first. */
-    fun schedule(ch: LiveChannel): List<Program> {
+    fun schedule(ch: LiveChannel, withDesc: Boolean = false): List<Program> {
         @Suppress("UNUSED_VARIABLE") val v = version
-        val full = EpgCache.schedule(ch.epgId, ch.name)
+        val full = EpgCache.schedule(ch.epgId, ch.name, withDesc)
         val now = System.currentTimeMillis()
         if (full.any { now >= it.start && now < it.end }) return full
         // The downloaded grid can miss the current hour. The provider's short listing fills that hole.

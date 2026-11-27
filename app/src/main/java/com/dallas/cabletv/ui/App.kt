@@ -289,7 +289,6 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
 
     // The full schedule is downloaded now, again when asked, and then hourly. A copy is kept on the
     // device, so the next start shows listings straight away.
-    val guideFile = remember { File(context.cacheDir, "guide/listings.bin") }
     var guideReload by remember { mutableIntStateOf(0) }
     var guideReloadSeen by remember { mutableIntStateOf(0) }
     var guideRefreshing by remember { mutableStateOf(false) }
@@ -309,14 +308,14 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
         if (!s.hasLiveSource) {
             guideRefreshing = false
             // No live login, so the saved listings belong to nobody.
-            withContext(Dispatchers.IO) { runCatching { guideFile.delete() } }
+            withContext(Dispatchers.IO) { runCatching { EpgCache.clear() } }
             return@LaunchedEffect
         }
         val key = guideCacheKey(s)
         // The saved copy shows straight away. When it is less than an hour old, the next download
         // waits until it is an hour old, as if the app had stayed open.
         if (!manual) {
-            val savedAt = withContext(Dispatchers.IO) { runCatching { EpgCache.restoreFrom(guideFile, key) }.getOrNull() }
+            val savedAt = withContext(Dispatchers.IO) { runCatching { EpgCache.savedAt(key) }.getOrNull() }
             if (savedAt != null) {
                 guide.scheduleUpdated()
                 val age = System.currentTimeMillis() - savedAt
@@ -328,9 +327,8 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
             val outcome = withContext(Dispatchers.IO) {
                 runCatching {
                     val urls = ChannelSource.guideUrls(s)
-                    val failed = if (urls.isEmpty()) emptyList() else EpgCache.refreshAll(urls)
-                    // Saved only when at least one guide loaded in full, so an old copy never looks new.
-                    if (failed.size < urls.size) runCatching { EpgCache.saveTo(guideFile, key) }
+                    // The database keeps the listings, and only records the save time when at least one guide loaded in full.
+                    val failed = if (urls.isEmpty()) emptyList() else EpgCache.refreshAll(urls, key)
                     urls.size to failed
                 }
             }
@@ -1066,7 +1064,7 @@ fun CableApp(store: SettingsStore, link: String? = null, onLinkHandled: () -> Un
         }
         companionHooks.openLink = { companionLink = it }
         companionHooks.vodCatalog = { shelves.movies to shelves.series }
-        companionHooks.programsOf = { guide.schedule(it) }
+        companionHooks.programsOf = { guide.schedule(it, withDesc = true) }
         companionHooks.openTitle = { companionTitle = it }
         companionHooks.showToast = showToast
     }

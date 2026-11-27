@@ -10,6 +10,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.dallas.cabletv.data.CHANNEL_LINK_SCHEME
 import com.dallas.cabletv.data.CrashLog
+import com.dallas.cabletv.data.EpgCache
 import com.dallas.cabletv.data.DebugLog
 import com.dallas.cabletv.data.SettingsStore
 import com.dallas.cabletv.data.companion.isTelevision
@@ -31,6 +32,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         CrashLog.install(this)
         CrashLog.recordExitReasons(this)
+        EpgCache.open(this)
         DebugLog.install(this)
         // Rebuilding the screen, for example after a restore, does not play the opening link again.
         if (savedInstanceState == null) link = channelLink(intent)

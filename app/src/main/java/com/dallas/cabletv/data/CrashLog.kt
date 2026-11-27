@@ -40,7 +40,7 @@ object CrashLog {
         Thread.setDefaultUncaughtExceptionHandler { thread, error ->
             runCatching {
                 val stamp = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date())
-                File(dir, FILE).writeText("Build ${BuildConfig.VERSION_CODE}, $stamp\n${redact(error.stackTraceToString().take(12_000))}")
+                File(dir, FILE).writeText("Build ${BuildConfig.VERSION_CODE}, $stamp\n${heapLine()}${redact(error.stackTraceToString().take(12_000))}")
                 File(dir, SEEN).delete()
             }
             previous?.uncaughtException(thread, error)
@@ -78,7 +78,7 @@ object CrashLog {
 
         val trace = problem.traceInputStream?.use { it.readBytes().toString(Charsets.UTF_8) }.orEmpty()
         val stamp = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date(problem.timestamp))
-        val text = "Build ${BuildConfig.VERSION_CODE}, $stamp\n" +
+        val text = "Build ${BuildConfig.VERSION_CODE}, $stamp\n" + heapLine() +
             "Not a Java error. The system ended the app: ${reasonName(problem.reason)}. ${problem.description.orEmpty()}\n\n" +
             redact(trace.take(12_000))
         File(dir, FILE).writeText(text)
@@ -100,6 +100,13 @@ object CrashLog {
         ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE -> "used too many resources"
         ApplicationExitInfo.REASON_INITIALIZATION_FAILURE -> "failed to start"
         else -> "exit code $reason"
+    }
+
+    /** How much of the app's memory was in use when the crash happened, so an out of memory error shows its size. */
+    private fun heapLine(): String {
+        val rt = Runtime.getRuntime()
+        val mb = 1024L * 1024L
+        return "Memory ${(rt.totalMemory() - rt.freeMemory()) / mb} MB in use of ${rt.maxMemory() / mb} MB\n"
     }
 
     /** The saved error, or null when the app has not crashed since it was cleared. */
